@@ -77,6 +77,9 @@ Cloud provider accounts are added from **➕ Add account**, each with its own
 proxy if it needs one. After entering a proxy, choose whether Cloudbot reaches
 that proxy using its default DNS behavior, IPv4 only, or IPv6 only. The latter
 two resolve the proxy hostname to the requested family before provider calls.
+Each account also has an inline **⚙️ Settings** screen for viewing its provider,
+proxy endpoint and family preference, and for renaming or changing/removing its
+proxy.
 
 ## Requirements
 

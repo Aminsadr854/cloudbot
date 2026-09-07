@@ -29,3 +29,6 @@ add provider accounts separately.
 
 Automatic server replacement is disabled by default because it can incur cloud
 charges.
+
+Each account exposes an inline settings screen that shows non-secret account
+details and provides safe controls for its display name and proxy.

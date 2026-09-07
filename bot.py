@@ -140,10 +140,50 @@ def kb_account(acc):
     b = InlineKeyboardBuilder()
     b.button(text="📋 سرورها", callback_data=f"srvs:{acc['id']}")
     b.button(text="➕ ساخت سرور", callback_data=f"new:{acc['id']}")
-    b.button(text="🌐 پروکسی", callback_data=f"prx:{acc['id']}")
+    b.button(text="⚙️ تنظیمات", callback_data=f"accset:{acc['id']}")
     b.button(text="🔑 حذف اکانت", callback_data=f"delacc:{acc['id']}")
     b.button(text="🔙 اکانت‌ها", callback_data="accounts")
     b.adjust(2, 2, 1)
+    return b.as_markup()
+
+
+def proxy_summary(proxy):
+    """Show a proxy endpoint without exposing its authentication details."""
+    if not proxy:
+        return "بدون پروکسی"
+    value = proxy.split("://", 1)[-1]
+    if "@" in value:
+        value = value.rsplit("@", 1)[1]
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return "پروکسی تنظیم شده"
+        port = value[end + 2:].split(":", 1)[0] if value[end + 1:end + 2] == ":" else ""
+        return f"{value[:end + 1]}:{port}" if port else value[:end + 1]
+    bits = value.split(":", 2)
+    return ":".join(bits[:2]) if len(bits) >= 2 else "پروکسی تنظیم شده"
+
+
+def account_settings_text(acc):
+    family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
+    return (
+        "⚙️ <b>تنظیمات اکانت</b>\n\n"
+        f"🏷 نام: <b>{html.escape(acc['label'])}</b>\n"
+        f"☁️ ارائه‌دهنده: {PROVIDER_LABEL.get(acc['provider'], acc['provider'])}\n"
+        f"🌐 پروکسی: <code>{html.escape(proxy_summary(acc['proxy']))}</code>\n"
+        f"🔌 مسیر اتصال پراکسی: <b>{family}</b>\n"
+        "🔐 توکن API: <i>ذخیره‌شده و رمزنگاری‌شده</i>"
+    )
+
+
+def kb_account_settings(acc):
+    b = InlineKeyboardBuilder()
+    b.button(text="✏️ تغییر نام", callback_data=f"accname:{acc['id']}")
+    b.button(text="🌐 تغییر پراکسی", callback_data=f"prx:{acc['id']}")
+    if acc["proxy"]:
+        b.button(text="🗑 حذف پراکسی", callback_data=f"accprxclear:{acc['id']}")
+    b.button(text="🔙 بازگشت", callback_data=f"acc:{acc['id']}")
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -179,12 +219,23 @@ async def cb_account(cb: CallbackQuery):
     if not acc:
         await cb.answer("یافت نشد", show_alert=True)
         return
-    prx = acc["proxy"].split(":")[0] + ":…" if acc["proxy"] else "بدون پروکسی"
+    prx = proxy_summary(acc["proxy"])
     family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
     await cb.message.edit_text(
         f"{PROVIDER_LABEL.get(acc['provider'])} <b>{html.escape(acc['label'])}</b>\n"
         f"🌐 پروکسی: <code>{html.escape(prx)}</code> · {family}",
         reply_markup=kb_account(acc))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("accset:"))
+async def cb_account_settings(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    acc = st.account(int(cb.data.split(":", 1)[1]))
+    if not acc:
+        await cb.answer("یافت نشد", show_alert=True)
+        return
+    await cb.message.edit_text(account_settings_text(acc), reply_markup=kb_account_settings(acc))
     await cb.answer()
 
 
@@ -305,6 +356,40 @@ async def add_noproxy(cb: CallbackQuery, state: FSMContext):
 # --------------------------------------------------------------------------
 # proxy change
 # --------------------------------------------------------------------------
+class AccountSettings(StatesGroup):
+    name = State()
+
+
+@dp.callback_query(F.data.startswith("accname:"))
+async def account_name_start(cb: CallbackQuery, state: FSMContext):
+    acc_id = int(cb.data.split(":", 1)[1])
+    acc = st.account(acc_id)
+    if not acc:
+        await cb.answer("یافت نشد", show_alert=True)
+        return
+    await state.set_state(AccountSettings.name)
+    await state.update_data(acc_id=acc_id)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔙 انصراف", callback_data=f"accset:{acc_id}")
+    await cb.message.edit_text(
+        f"نام جدید اکانت را بفرست.\n\nنام فعلی: <b>{html.escape(acc['label'])}</b>",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.message(AccountSettings.name)
+async def account_name_set(msg: Message, state: FSMContext):
+    label = (msg.text or "").strip()
+    if not label or len(label) > 80:
+        await msg.answer("نام باید بین ۱ تا ۸۰ کاراکتر باشد.")
+        return
+    data = await state.get_data()
+    await state.clear()
+    st.set_account_label(data["acc_id"], label)
+    acc = st.account(data["acc_id"])
+    await msg.answer("✅ نام اکانت به‌روز شد.", reply_markup=kb_account_settings(acc))
+
+
 class Proxy(StatesGroup):
     value = State()
     family = State()
@@ -366,6 +451,17 @@ async def prx_clear(cb: CallbackQuery, state: FSMContext):
     st.set_proxy(data["acc_id"], None, "default")
     await cb.message.edit_text("✅ پروکسی حذف شد.",
                                reply_markup=kb_account(st.account(data["acc_id"])))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("accprxclear:"))
+async def account_proxy_clear(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    acc_id = int(cb.data.split(":", 1)[1])
+    st.set_proxy(acc_id, None, "default")
+    acc = st.account(acc_id)
+    await cb.message.edit_text("✅ پروکسی حذف شد.\n\n" + account_settings_text(acc),
+                               reply_markup=kb_account_settings(acc))
     await cb.answer()
 
 

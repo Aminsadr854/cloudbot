@@ -85,6 +85,11 @@ class Store:
         self.con.commit()
         return n
 
+    def set_account_label(self, acc_id, label):
+        """Rename an account without rewriting its encrypted credentials."""
+        self.con.execute("UPDATE accounts SET label = ? WHERE id = ?", (label, acc_id))
+        self.con.commit()
+
     def set_proxy(self, acc_id, proxy, proxy_family="default"):
         """Set, change, or clear (proxy=None) an account's proxy preference."""
         self.con.execute(
