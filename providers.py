@@ -11,9 +11,13 @@ delete servers, and the lookups needed to offer sane choices when creating one.
 Nothing is cached: a token or proxy can change between calls, so each call
 builds its own client.
 """
+import asyncio
+import ipaddress
 import logging
+import socket
 
 import aiohttp
+from yarl import URL
 
 try:
     from aiohttp_socks import ProxyConnector
@@ -35,6 +39,7 @@ def proxy_url(proxy: str | None) -> str | None:
       scheme://host:port:user:pass   (scheme = http/https/socks5/socks4)
       scheme://user:pass@host:port
       host:port:user:pass            (assumed http - the format the user gives)
+      [ipv6]:port:user:pass          (IPv6 literals must be bracketed)
       host:port
 
     A bare host:port:user:pass is treated as HTTP because that is what the user
@@ -49,15 +54,61 @@ def proxy_url(proxy: str | None) -> str | None:
     # already in url auth form?
     if "@" in proxy:
         return f"{scheme}://{proxy}"
-    parts = proxy.split(":")
-    if len(parts) == 4:
-        host, port, user, pw = parts
-        return f"{scheme}://{user}:{pw}@{host}:{port}"
-    if len(parts) == 2:
-        host, port = parts
-        return f"{scheme}://{host}:{port}"
+    if proxy.startswith("["):
+        end = proxy.find("]")
+        if end < 0 or len(proxy) <= end + 2 or proxy[end + 1] != ":":
+            raise ValueError("IPv6 proxy hosts must look like [2001:db8::1]:port")
+        host = proxy[:end + 1]
+        rest = proxy[end + 2:].split(":", 2)
+        if len(rest) == 3:
+            port, user, pw = rest
+            return f"{scheme}://{user}:{pw}@{host}:{port}"
+        if len(rest) == 1:
+            return f"{scheme}://{host}:{rest[0]}"
+    else:
+        parts = proxy.split(":", 3)
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            return f"{scheme}://{user}:{pw}@{host}:{port}"
+        if len(parts) == 2:
+            host, port = parts
+            return f"{scheme}://{host}:{port}"
     raise ValueError("proxy must be host:port or host:port:user:pass "
-                     "(optionally prefixed with socks5://)")
+                     "(optionally prefixed with socks5://; bracket IPv6 hosts)")
+
+
+async def proxy_for_family(proxy: str | None, family: str = "default") -> str | None:
+    """Resolve a proxy hostname to the requested address family.
+
+    The provider API still travels through the same proxy.  Only the TCP
+    connection from Cloudbot to that proxy is pinned to IPv4 or IPv6.  This is
+    important for dual-stack proxy hostnames whose two addresses behave
+    differently from the server running Cloudbot.
+    """
+    if not proxy or family == "default":
+        return proxy
+    if family not in ("ipv4", "ipv6"):
+        raise ProviderError("proxy family must be default, ipv4, or ipv6")
+    parsed = URL(proxy)
+    host = parsed.host
+    if not host:
+        raise ProviderError("proxy URL has no host")
+    wanted = socket.AF_INET if family == "ipv4" else socket.AF_INET6
+    try:
+        literal = ipaddress.ip_address(host)
+        if literal.version != (4 if family == "ipv4" else 6):
+            raise ProviderError(f"proxy is {literal.version == 4 and 'IPv4' or 'IPv6'}, not {family.upper()}")
+        return proxy
+    except ValueError:
+        pass
+    try:
+        rows = await asyncio.get_running_loop().getaddrinfo(
+            host, parsed.port, family=wanted, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        raise ProviderError(f"proxy host has no {family.upper()} address: {host}") from e
+    if not rows:
+        raise ProviderError(f"proxy host has no {family.upper()} address: {host}")
+    return str(parsed.with_host(rows[0][4][0]))
 
 
 class ProviderError(Exception):
@@ -69,6 +120,7 @@ class Provider:
         self.provider = account["provider"]
         self.token = account["token"]
         self.proxy = proxy_url(account.get("proxy"))
+        self.proxy_family = account.get("proxy_family", "default")
 
     def _base(self):
         return {"linode": LINODE, "vultr": VULTR, "hetzner": HETZNER}[self.provider]
@@ -78,7 +130,8 @@ class Provider:
                    "Content-Type": "application/json"}
         timeout = aiohttp.ClientTimeout(total=45)
         url = self._base() + path
-        is_socks = bool(self.proxy) and self.proxy.startswith(("socks5", "socks4"))
+        proxy = await proxy_for_family(self.proxy, self.proxy_family)
+        is_socks = bool(proxy) and proxy.startswith(("socks5", "socks4"))
 
         try:
             if is_socks:
@@ -86,7 +139,7 @@ class Provider:
                 # HTTP-proxy only); it has to be the session's connector.
                 if ProxyConnector is None:
                     raise ProviderError("SOCKS proxy needs aiohttp-socks installed")
-                conn = ProxyConnector.from_url(self.proxy)
+                conn = ProxyConnector.from_url(proxy)
                 async with aiohttp.ClientSession(timeout=timeout, connector=conn) as s:
                     async with s.request(method, url, headers=headers, **kw) as r:
                         text = await r.text()
@@ -96,7 +149,7 @@ class Provider:
             else:
                 async with aiohttp.ClientSession(timeout=timeout) as s:
                     async with s.request(method, url, headers=headers,
-                                         proxy=self.proxy or None, **kw) as r:
+                                         proxy=proxy or None, **kw) as r:
                         text = await r.text()
                         if r.status >= 400:
                             raise ProviderError(f"HTTP {r.status}: {text[:300]}")
@@ -107,7 +160,7 @@ class Provider:
             # Surface the concrete transport failure (proxy refused, TLS, DNS)
             # instead of a generic "connection failed".
             log.warning("request %s %s via proxy=%s failed: %s",
-                        method, path, self.proxy, e)
+                        method, path, proxy, e)
             raise ProviderError(f"{type(e).__name__}: {str(e)[:250]}")
 
     # -- connectivity check (also validates token + proxy together) ------

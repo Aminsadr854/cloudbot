@@ -74,7 +74,9 @@ Then open the bot, send `/start`, and fill in **⚙️ Settings**:
 | 🌐 Cloudflare token | an API token that can edit DNS in your zones. |
 
 Cloud provider accounts are added from **➕ Add account**, each with its own
-proxy if it needs one.
+proxy if it needs one. After entering a proxy, choose whether Cloudbot reaches
+that proxy using its default DNS behavior, IPv4 only, or IPv6 only. The latter
+two resolve the proxy hostname to the requested family before provider calls.
 
 ## Requirements
 

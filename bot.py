@@ -91,6 +91,7 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 PROVIDER_LABEL = {"linode": "🟢 Linode", "vultr": "🔵 Vultr", "hetzner": "🔴 Hetzner"}
+PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
 
 
 def gen_password(n=20):
@@ -179,9 +180,10 @@ async def cb_account(cb: CallbackQuery):
         await cb.answer("یافت نشد", show_alert=True)
         return
     prx = acc["proxy"].split(":")[0] + ":…" if acc["proxy"] else "بدون پروکسی"
+    family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
     await cb.message.edit_text(
         f"{PROVIDER_LABEL.get(acc['provider'])} <b>{html.escape(acc['label'])}</b>\n"
-        f"🌐 پروکسی: <code>{html.escape(prx)}</code>",
+        f"🌐 پروکسی: <code>{html.escape(prx)}</code> · {family}",
         reply_markup=kb_account(acc))
     await cb.answer()
 
@@ -194,6 +196,16 @@ class Add(StatesGroup):
     label = State()
     token = State()
     proxy = State()
+    proxy_family = State()
+
+
+def kb_proxy_family(prefix: str):
+    b = InlineKeyboardBuilder()
+    b.button(text="پیش‌فرض", callback_data=f"{prefix}:default")
+    b.button(text="IPv4", callback_data=f"{prefix}:ipv4")
+    b.button(text="IPv6", callback_data=f"{prefix}:ipv6")
+    b.adjust(3)
+    return b.as_markup()
 
 
 @dp.callback_query(F.data == "add_acc")
@@ -239,9 +251,10 @@ async def add_token(msg: Message, state: FSMContext):
         "یا اگر لازم نیست، دکمهٔ زیر را بزن.", reply_markup=b.as_markup())
 
 
-async def _finish_add(data, proxy, answer):
+async def _finish_add(data, proxy, proxy_family, answer):
     try:
-        acc = {"provider": data["provider"], "token": data["token"], "proxy": proxy}
+        acc = {"provider": data["provider"], "token": data["token"], "proxy": proxy,
+               "proxy_family": proxy_family}
         who = await providers.Provider(acc).whoami()
     except Exception as e:
         log.exception("add-account validation failed (provider=%s proxy=%s)",
@@ -250,7 +263,7 @@ async def _finish_add(data, proxy, answer):
                      "اگر پروکسی از نوع SOCKS است، جلوش <code>socks5://</code> بگذار. "
                      "وگرنه توکن را بررسی کن.")
         return
-    st.add_account(data["label"], data["provider"], data["token"], proxy)
+    st.add_account(data["label"], data["provider"], data["token"], proxy, proxy_family)
     await answer(f"✅ اکانت <b>{html.escape(data['label'])}</b> اضافه شد.\n"
                  f"شناسایی شد: <code>{html.escape(str(who))}</code>")
 
@@ -263,11 +276,20 @@ async def add_proxy(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("❌ قالب پروکسی نادرست است. host:port:username:password")
         return
+    await state.update_data(proxy=proxy)
+    await state.set_state(Add.proxy_family)
+    await msg.answer("اتصال به پراکسی با کدام IP برقرار شود؟", reply_markup=kb_proxy_family("addfam"))
+
+
+@dp.callback_query(Add.proxy_family, F.data.startswith("addfam:"))
+async def add_proxy_family(cb: CallbackQuery, state: FSMContext):
+    family = cb.data.split(":", 1)[1]
     data = await state.get_data()
     await state.clear()
-    note = await msg.answer("در حال تست اتصال…")
-    await _finish_add(data, proxy, note.edit_text)
-    await msg.answer("منو:", reply_markup=kb_main())
+    await cb.message.edit_text("در حال تست اتصال…")
+    await _finish_add(data, data["proxy"], family, cb.message.edit_text)
+    await cb.message.answer("منو:", reply_markup=kb_main())
+    await cb.answer()
 
 
 @dp.callback_query(Add.proxy, F.data == "noproxy")
@@ -275,7 +297,7 @@ async def add_noproxy(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     await cb.message.edit_text("در حال تست اتصال…")
-    await _finish_add(data, None, cb.message.edit_text)
+    await _finish_add(data, None, "default", cb.message.edit_text)
     await cb.message.answer("منو:", reply_markup=kb_main())
     await cb.answer()
 
@@ -285,6 +307,7 @@ async def add_noproxy(cb: CallbackQuery, state: FSMContext):
 # --------------------------------------------------------------------------
 class Proxy(StatesGroup):
     value = State()
+    family = State()
 
 
 @dp.callback_query(F.data.startswith("prx:"))
@@ -310,17 +333,37 @@ async def prx_set(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("❌ قالب نادرست. host:port:username:password")
         return
+    await state.update_data(proxy=proxy)
+    await state.set_state(Proxy.family)
+    await msg.answer("اتصال به پراکسی با کدام IP برقرار شود؟", reply_markup=kb_proxy_family("prxfam"))
+
+
+@dp.callback_query(Proxy.family, F.data.startswith("prxfam:"))
+async def prx_family(cb: CallbackQuery, state: FSMContext):
+    family = cb.data.split(":", 1)[1]
     data = await state.get_data()
+    account = st.account(data["acc_id"])
+    await cb.message.edit_text("در حال تست اتصال…")
+    try:
+        await providers.Provider({**account, "proxy": data["proxy"], "proxy_family": family}).whoami()
+    except Exception as e:
+        await cb.message.edit_text(
+            f"❌ اتصال ناموفق بود:\n<code>{html.escape(str(e)[:350])}</code>\n\n"
+            "یک خانوادهٔ IP دیگر انتخاب کن یا با /start دوباره تلاش کن.",
+            reply_markup=kb_proxy_family("prxfam"))
+        await cb.answer()
+        return
     await state.clear()
-    st.set_proxy(data["acc_id"], proxy)
-    await msg.answer("✅ پروکسی به‌روز شد.", reply_markup=kb_account(st.account(data["acc_id"])))
+    st.set_proxy(data["acc_id"], data["proxy"], family)
+    await cb.message.edit_text("✅ پروکسی به‌روز شد.", reply_markup=kb_account(st.account(data["acc_id"])))
+    await cb.answer()
 
 
 @dp.callback_query(Proxy.value, F.data == "prx_clear")
 async def prx_clear(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
-    st.set_proxy(data["acc_id"], None)
+    st.set_proxy(data["acc_id"], None, "default")
     await cb.message.edit_text("✅ پروکسی حذف شد.",
                                reply_markup=kb_account(st.account(data["acc_id"])))
     await cb.answer()
