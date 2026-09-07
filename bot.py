@@ -524,6 +524,9 @@ async def cb_server(cb: CallbackQuery):
         return
     b = InlineKeyboardBuilder()
     b.button(text="🔌 نود کردن در پنل", callback_data=f"node:{acc_id}:{srv_id}")
+    if acc["provider"] == "vultr":
+        b.button(text="🔄 افزودن IPv4 جدید", callback_data=f"v4add:{acc_id}:{srv_id}")
+        b.button(text="📌 افزودن Floating IP", callback_data=f"float:{acc_id}:{srv_id}")
     b.button(text="🗑 حذف سرور", callback_data=f"delsrv:{acc_id}:{srv_id}")
     b.button(text="🔙 سرورها", callback_data=f"srvs:{acc_id}")
     b.adjust(1)
@@ -533,6 +536,99 @@ async def cb_server(cb: CallbackQuery):
         f"🔢 پلن: <code>{s.get('plan')}</code>\n"
         f"📡 آی‌پی: <code>{s.get('ip')}</code>\n"
         f"وضعیت: <b>{s.get('status')}</b>", reply_markup=b.as_markup())
+    await cb.answer()
+
+
+def _vultr_ip_value(result):
+    """Read the allocated address from either documented Vultr response shape."""
+    data = result.get("ipv4", result)
+    return data.get("ip") or data.get("ip_address") or "در حال تخصیص"
+
+
+async def _vultr_action_context(acc_id, srv_id):
+    acc = st.account(int(acc_id))
+    if not acc or acc["provider"] != "vultr":
+        raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
+    server = await providers.Provider(acc).server(srv_id)
+    return acc, server
+
+
+@dp.callback_query(F.data.startswith("v4add:"))
+async def vultr_add_ipv4_prompt(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    try:
+        _, server = await _vultr_action_context(acc_id, srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ بله، IPv4 جدید اضافه کن", callback_data=f"v4add_ok:{acc_id}:{srv_id}")
+    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    await cb.message.edit_text(
+        "⚠️ <b>افزودن IPv4 جدید</b>\n\n"
+        f"برای <b>{html.escape(str(server['label']))}</b> یک IPv4 عمومی دیگر می‌سازد و سرور را ریبوت می‌کند.\n"
+        "آی‌پی اصلی Vultr جایگزین نمی‌شود؛ آی‌پی جدید به سرور اضافه خواهد شد.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("v4add_ok:"))
+async def vultr_add_ipv4(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    await cb.message.edit_text("⏳ در حال ساخت IPv4 و ریبوت سرور…")
+    try:
+        acc, _ = await _vultr_action_context(acc_id, srv_id)
+        result = await providers.Provider(acc).add_vultr_ipv4(srv_id)
+    except Exception as e:
+        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        f"✅ IPv4 جدید درخواست شد: <code>{html.escape(str(_vultr_ip_value(result)))}</code>\n\n"
+        "Vultr سرور را ریبوت می‌کند؛ چند دقیقه بعد از فهرست سرورها وضعیت را بررسی کن.",
+        reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("float:"))
+async def vultr_floating_ip_prompt(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    try:
+        _, server = await _vultr_action_context(acc_id, srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ بله، Floating IP بساز", callback_data=f"float_ok:{acc_id}:{srv_id}")
+    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    await cb.message.edit_text(
+        "⚠️ <b>افزودن Floating IP</b>\n\n"
+        f"یک Reserved IPv4 جدید در منطقهٔ <code>{html.escape(str(server['region']))}</code> می‌سازد و به این سرور وصل می‌کند.\n"
+        "این IP جداگانه قابل جابه‌جایی بین سرورهای همان منطقه است و ممکن است هزینهٔ Vultr داشته باشد.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("float_ok:"))
+async def vultr_floating_ip(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    await cb.message.edit_text("⏳ در حال ساخت و اتصال Floating IP…")
+    try:
+        acc, server = await _vultr_action_context(acc_id, srv_id)
+        reserved = await providers.Provider(acc).create_and_attach_vultr_floating_ip(
+            srv_id, server["region"], f"cloudbot-{server['label']}")
+    except Exception as e:
+        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        f"✅ Floating IP ساخته و متصل شد: <code>{html.escape(str(_vultr_ip_value(reserved)))}</code>\n"
+        f"شناسه: <code>{html.escape(str(reserved.get('id', '—')))}</code>",
+        reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
     await cb.answer()
 
 

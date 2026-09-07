@@ -9,6 +9,8 @@ webhook.
 - Stores and manages Linode, Vultr, and Hetzner accounts, including optional
   per-account HTTP or SOCKS proxies with default, IPv4-only, or IPv6-only
   proxy-host connection behavior; lists, creates, and deletes cloud servers.
+- Provides Vultr-only IP controls: add another public IPv4 (with reboot) or
+  create and attach a Reserved IPv4 floating IP.
 - Provisions a newly created server as a Pasarguard/Marzban panel node.
 - Builds and tracks GRE or paytun links and their port forwards.
 - Creates and changes Cloudflare DNS records, and can scan Cloudflare ranges

@@ -81,6 +81,11 @@ Each account also has an inline **⚙️ Settings** screen for viewing its provi
 proxy endpoint and family preference, and for renaming or changing/removing its
 proxy.
 
+For Vultr instances, the server screen can add a public IPv4 (Vultr reboots the
+instance) or create and attach a Reserved IPv4 floating IP. Vultr does not
+replace an existing primary IPv4 in place; the additional-address action keeps
+the original primary address.
+
 ## Requirements
 
 * Debian or Ubuntu with systemd, Python 3.10+

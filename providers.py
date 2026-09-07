@@ -363,3 +363,26 @@ class Provider:
         else:
             await self._req("DELETE", f"/servers/{server_id}")
         return True
+
+    # -- Vultr public IPs ------------------------------------------------
+    async def add_vultr_ipv4(self, server_id):
+        """Attach another public IPv4 to a Vultr instance and reboot it."""
+        if self.provider != "vultr":
+            raise ProviderError("additional public IPv4 is only available for Vultr")
+        return await self._req("POST", f"/instances/{server_id}/ipv4",
+                               json={"reboot": True})
+
+    async def create_and_attach_vultr_floating_ip(self, server_id, region, label):
+        """Create a Vultr Reserved IPv4 and attach it to the given instance."""
+        if self.provider != "vultr":
+            raise ProviderError("floating IP is only available for Vultr")
+        created = await self._req("POST", "/reserved-ips", json={
+            "region": region, "ip_type": "v4", "label": label[:128],
+        })
+        reserved = created.get("reserved_ip", created)
+        reserved_id = reserved.get("id")
+        if not reserved_id:
+            raise ProviderError("Vultr did not return the new floating IP ID")
+        await self._req("POST", f"/reserved-ips/{reserved_id}/attach",
+                        json={"instance_id": str(server_id)})
+        return reserved
