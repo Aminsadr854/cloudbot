@@ -1,0 +1,4 @@
+data/
+*.env
+assets/paytun
+__pycache__/

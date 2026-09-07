@@ -1,0 +1,312 @@
+"""
+Linode and Vultr, behind one interface.
+
+Every request goes through the account's own proxy when it has one, because the
+accounts may sit in different countries and a provider can refuse or mis-geo a
+call that arrives from the wrong place. The proxy is given as
+host:port:user:pass and turned into an authenticated HTTP proxy here.
+
+Only the handful of operations the bot exposes are implemented - list, create,
+delete servers, and the lookups needed to offer sane choices when creating one.
+Nothing is cached: a token or proxy can change between calls, so each call
+builds its own client.
+"""
+import logging
+
+import aiohttp
+
+try:
+    from aiohttp_socks import ProxyConnector
+except Exception:  # pragma: no cover
+    ProxyConnector = None
+
+log = logging.getLogger("cloudbot.providers")
+
+LINODE = "https://api.linode.com/v4"
+VULTR = "https://api.vultr.com/v2"
+HETZNER = "https://api.hetzner.cloud/v1"
+
+
+def proxy_url(proxy: str | None) -> str | None:
+    """
+    Turn the user's proxy string into a full proxy URL.
+
+    Accepts, in order of preference:
+      scheme://host:port:user:pass   (scheme = http/https/socks5/socks4)
+      scheme://user:pass@host:port
+      host:port:user:pass            (assumed http - the format the user gives)
+      host:port
+
+    A bare host:port:user:pass is treated as HTTP because that is what the user
+    was asked for; a SOCKS proxy can be selected by prefixing socks5://.
+    """
+    if not proxy:
+        return None
+    proxy = proxy.strip()
+    scheme = "http"
+    if "://" in proxy:
+        scheme, proxy = proxy.split("://", 1)
+    # already in url auth form?
+    if "@" in proxy:
+        return f"{scheme}://{proxy}"
+    parts = proxy.split(":")
+    if len(parts) == 4:
+        host, port, user, pw = parts
+        return f"{scheme}://{user}:{pw}@{host}:{port}"
+    if len(parts) == 2:
+        host, port = parts
+        return f"{scheme}://{host}:{port}"
+    raise ValueError("proxy must be host:port or host:port:user:pass "
+                     "(optionally prefixed with socks5://)")
+
+
+class ProviderError(Exception):
+    pass
+
+
+class Provider:
+    def __init__(self, account: dict):
+        self.provider = account["provider"]
+        self.token = account["token"]
+        self.proxy = proxy_url(account.get("proxy"))
+
+    def _base(self):
+        return {"linode": LINODE, "vultr": VULTR, "hetzner": HETZNER}[self.provider]
+
+    async def _req(self, method, path, **kw):
+        headers = {"Authorization": f"Bearer {self.token}",
+                   "Content-Type": "application/json"}
+        timeout = aiohttp.ClientTimeout(total=45)
+        url = self._base() + path
+        is_socks = bool(self.proxy) and self.proxy.startswith(("socks5", "socks4"))
+
+        try:
+            if is_socks:
+                # A SOCKS proxy cannot be passed as aiohttp's proxy= (that is
+                # HTTP-proxy only); it has to be the session's connector.
+                if ProxyConnector is None:
+                    raise ProviderError("SOCKS proxy needs aiohttp-socks installed")
+                conn = ProxyConnector.from_url(self.proxy)
+                async with aiohttp.ClientSession(timeout=timeout, connector=conn) as s:
+                    async with s.request(method, url, headers=headers, **kw) as r:
+                        text = await r.text()
+                        if r.status >= 400:
+                            raise ProviderError(f"HTTP {r.status}: {text[:300]}")
+                        return await r.json() if text.strip() else {}
+            else:
+                async with aiohttp.ClientSession(timeout=timeout) as s:
+                    async with s.request(method, url, headers=headers,
+                                         proxy=self.proxy or None, **kw) as r:
+                        text = await r.text()
+                        if r.status >= 400:
+                            raise ProviderError(f"HTTP {r.status}: {text[:300]}")
+                        return await r.json() if text.strip() else {}
+        except ProviderError:
+            raise
+        except Exception as e:
+            # Surface the concrete transport failure (proxy refused, TLS, DNS)
+            # instead of a generic "connection failed".
+            log.warning("request %s %s via proxy=%s failed: %s",
+                        method, path, self.proxy, e)
+            raise ProviderError(f"{type(e).__name__}: {str(e)[:250]}")
+
+    # -- connectivity check (also validates token + proxy together) ------
+    async def whoami(self):
+        if self.provider == "linode":
+            d = await self._req("GET", "/profile")
+            return d.get("username") or d.get("email") or "linode account"
+        if self.provider == "vultr":
+            d = await self._req("GET", "/account")
+            acc = d.get("account", d)
+            return acc.get("email") or acc.get("name") or "vultr account"
+        # hetzner: token is project-scoped, no account endpoint; a cheap call
+        # that any valid token can make doubles as the validation.
+        await self._req("GET", "/servers?per_page=1")
+        return "Hetzner project"
+
+    # -- list servers ----------------------------------------------------
+    async def list_servers(self):
+        if self.provider == "linode":
+            d = await self._req("GET", "/linode/instances?page_size=200")
+            out = []
+            for i in d.get("data", []):
+                out.append({
+                    "id": i["id"], "label": i.get("label"),
+                    "region": i.get("region"),
+                    "ip": (i.get("ipv4") or [None])[0],
+                    "status": i.get("status"),
+                    "plan": i.get("type"),
+                })
+            return out
+        if self.provider == "vultr":
+            d = await self._req("GET", "/instances?per_page=200")
+            out = []
+            for i in d.get("instances", []):
+                out.append({
+                    "id": i["id"], "label": i.get("label") or i.get("hostname"),
+                    "region": i.get("region"),
+                    "ip": i.get("main_ip") if i.get("main_ip", "0.0.0.0") != "0.0.0.0" else "(provisioning)",
+                    "status": i.get("status") + "/" + i.get("power_status", ""),
+                    "plan": i.get("plan"),
+                })
+            return out
+        # hetzner
+        d = await self._req("GET", "/servers?per_page=50")
+        out = []
+        for i in d.get("servers", []):
+            ipv4 = ((i.get("public_net") or {}).get("ipv4") or {}).get("ip")
+            out.append({
+                "id": i["id"], "label": i.get("name"),
+                "region": ((i.get("datacenter") or {}).get("location") or {}).get("name"),
+                "ip": ipv4 or "(provisioning)",
+                "status": i.get("status"),
+                "plan": (i.get("server_type") or {}).get("name"),
+            })
+        return out
+
+    async def server(self, server_id):
+        if self.provider == "linode":
+            i = await self._req("GET", f"/linode/instances/{server_id}")
+            return {"id": i["id"], "label": i.get("label"), "region": i.get("region"),
+                    "ip": (i.get("ipv4") or [None])[0], "status": i.get("status"),
+                    "plan": i.get("type")}
+        if self.provider == "vultr":
+            d = await self._req("GET", f"/instances/{server_id}")
+            i = d.get("instance", d)
+            return {"id": i["id"], "label": i.get("label"), "region": i.get("region"),
+                    "ip": i.get("main_ip"), "status": i.get("status"),
+                    "plan": i.get("plan"), "default_password": i.get("default_password")}
+        # hetzner
+        d = await self._req("GET", f"/servers/{server_id}")
+        i = d.get("server", d)
+        ipv4 = ((i.get("public_net") or {}).get("ipv4") or {}).get("ip")
+        return {"id": i["id"], "label": i.get("name"),
+                "region": ((i.get("datacenter") or {}).get("location") or {}).get("name"),
+                "ip": ipv4, "status": i.get("status"),
+                "plan": (i.get("server_type") or {}).get("name")}
+
+    # -- choices for creation --------------------------------------------
+    async def regions(self):
+        if self.provider == "linode":
+            d = await self._req("GET", "/regions?page_size=200")
+            return [(r["id"], r.get("label") or r["id"]) for r in d.get("data", [])]
+        if self.provider == "vultr":
+            d = await self._req("GET", "/regions?per_page=200")
+            return [(r["id"], f"{r.get('city','')} {r.get('country','')}".strip() or r["id"])
+                    for r in d.get("regions", [])]
+        # hetzner
+        d = await self._req("GET", "/locations?per_page=50")
+        return [(l["name"], f"{l.get('city','')} {l.get('country','')}".strip() or l["name"])
+                for l in d.get("locations", [])]
+
+    async def plans(self, region=None):
+        if self.provider == "linode":
+            d = await self._req("GET", "/linode/types?page_size=500")
+            out = []
+            for t in d.get("data", []):
+                price = (t.get("price") or {}).get("monthly")
+                out.append((t["id"], f"{t.get('label', t['id'])} - ${price}/mo"))
+            return out
+        if self.provider == "vultr":
+            path = f"/plans?per_page=500" + (f"&region={region}" if region else "")
+            d = await self._req("GET", path)
+            out = []
+            for p in d.get("plans", []):
+                out.append((p["id"], f"{p.get('vcpu_count')}vCPU {p.get('ram')}MB "
+                                     f"{p.get('disk')}GB - ${p.get('monthly_cost')}/mo"))
+            return out
+        # hetzner: server types; show only those available in the chosen location,
+        # and take the monthly price for that location.
+        d = await self._req("GET", "/server_types?per_page=100")
+        out = []
+        for t in d.get("server_types", []):
+            if t.get("deprecated"):
+                continue
+            price = ""
+            for pr in t.get("prices", []):
+                if not region or pr.get("location") == region:
+                    monthly = (pr.get("price_monthly") or {}).get("gross")
+                    if monthly:
+                        price = f" - €{float(monthly):.2f}/mo"
+                    break
+            else:
+                # not offered in this location
+                if region:
+                    continue
+            out.append((t["name"], f"{t['name']} · {t.get('cores')}vCPU "
+                                   f"{t.get('memory')}GB {t.get('disk')}GB{price}"))
+        return out
+
+    async def images(self):
+        if self.provider == "linode":
+            d = await self._req("GET", "/images?page_size=500")
+            imgs = [i for i in d.get("data", []) if i.get("is_public")]
+            # Prefer the mainstream distributions; the full list is huge.
+            pref = [i for i in imgs if any(x in i["id"] for x in
+                    ("ubuntu22.04", "ubuntu24.04", "debian12", "debian11"))]
+            chosen = pref or imgs
+            return [(i["id"], i.get("label") or i["id"]) for i in chosen[:40]]
+        if self.provider == "vultr":
+            d = await self._req("GET", "/os?per_page=500")
+            oss = d.get("os", [])
+            pref = [o for o in oss if any(x in o.get("name", "").lower()
+                    for x in ("ubuntu 22", "ubuntu 24", "debian 12", "debian 11"))]
+            chosen = pref or oss
+            return [(str(o["id"]), o.get("name")) for o in chosen[:40]]
+        # hetzner system images; the image "name" (e.g. ubuntu-22.04) is what
+        # create expects.
+        d = await self._req("GET", "/images?type=system&per_page=100")
+        imgs = d.get("images", [])
+        pref = [i for i in imgs if any(x in (i.get("name") or "")
+                for x in ("ubuntu-22.04", "ubuntu-24.04", "debian-12", "debian-11"))]
+        chosen = pref or imgs
+        return [(i.get("name") or str(i["id"]),
+                 i.get("description") or i.get("name")) for i in chosen[:40]]
+
+    # -- create ----------------------------------------------------------
+    async def create_server(self, label, region, plan, image, root_password):
+        """Returns {id, ip, label, root_password, default_password?}."""
+        if self.provider == "linode":
+            body = {
+                "label": label, "region": region, "type": plan, "image": image,
+                "root_pass": root_password,
+                "booted": True,
+            }
+            i = await self._req("POST", "/linode/instances", json=body)
+            return {"id": i["id"], "label": i.get("label"),
+                    "ip": (i.get("ipv4") or [None])[0], "region": i.get("region"),
+                    "plan": i.get("type"), "root_password": root_password}
+        if self.provider == "vultr":
+            body = {
+                "label": label, "region": region, "plan": plan, "os_id": int(image),
+                "hostname": label,
+            }
+            d = await self._req("POST", "/instances", json=body)
+            i = d.get("instance", d)
+            # Vultr sets the root password itself and returns it once, on creation.
+            return {"id": i["id"], "label": i.get("label"),
+                    "ip": i.get("main_ip") if i.get("main_ip", "0.0.0.0") != "0.0.0.0" else None,
+                    "region": i.get("region"), "plan": i.get("plan"),
+                    "root_password": i.get("default_password") or root_password}
+        # hetzner: with no ssh_keys attached, Hetzner generates a root password
+        # and returns it once in the create response - which is what node-it needs.
+        body = {
+            "name": label, "server_type": plan, "image": image,
+            "location": region, "start_after_create": True,
+        }
+        d = await self._req("POST", "/servers", json=body)
+        i = d.get("server", d)
+        ipv4 = ((i.get("public_net") or {}).get("ipv4") or {}).get("ip")
+        return {"id": i["id"], "label": i.get("name"), "ip": ipv4,
+                "region": ((i.get("datacenter") or {}).get("location") or {}).get("name"),
+                "plan": (i.get("server_type") or {}).get("name"),
+                "root_password": d.get("root_password") or root_password}
+
+    async def delete_server(self, server_id):
+        if self.provider == "linode":
+            await self._req("DELETE", f"/linode/instances/{server_id}")
+        elif self.provider == "vultr":
+            await self._req("DELETE", f"/instances/{server_id}")
+        else:
+            await self._req("DELETE", f"/servers/{server_id}")
+        return True
