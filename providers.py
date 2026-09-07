@@ -386,3 +386,31 @@ class Provider:
         await self._req("POST", f"/reserved-ips/{reserved_id}/attach",
                         json={"instance_id": str(server_id)})
         return reserved
+
+    async def vultr_floating_ips(self, server_id):
+        """List every Reserved IP currently attached to this Vultr instance."""
+        if self.provider != "vultr":
+            raise ProviderError("floating IP is only available for Vultr")
+        data = await self._req("GET", "/reserved-ips?per_page=500")
+        return [ip for ip in data.get("reserved_ips", [])
+                if str(ip.get("instance_id")) == str(server_id)]
+
+    async def vultr_floating_ip(self, reserved_ip_id):
+        if self.provider != "vultr":
+            raise ProviderError("floating IP is only available for Vultr")
+        data = await self._req("GET", f"/reserved-ips/{reserved_ip_id}")
+        return data.get("reserved_ip", data)
+
+    async def delete_vultr_floating_ip(self, reserved_ip_id):
+        """Permanently remove a Reserved IP (Vultr detaches it first)."""
+        if self.provider != "vultr":
+            raise ProviderError("floating IP is only available for Vultr")
+        await self._req("DELETE", f"/reserved-ips/{reserved_ip_id}")
+
+    async def vultr_power(self, server_id, action):
+        """Start, halt, or reboot a Vultr instance."""
+        if self.provider != "vultr":
+            raise ProviderError("power controls are only available for Vultr")
+        if action not in ("start", "halt", "reboot"):
+            raise ProviderError("unsupported Vultr power action")
+        await self._req("POST", f"/instances/{server_id}/{action}")

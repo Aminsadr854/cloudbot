@@ -62,3 +62,27 @@ class VultrIpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(p._req.await_args_list[1].args,
                          ("POST", "/reserved-ips/rip-1/attach"))
         self.assertEqual(p._req.await_args_list[1].kwargs["json"], {"instance_id": "instance-1"})
+
+    async def test_lists_only_floating_ips_for_requested_instance(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={"reserved_ips": [
+            {"id": "one", "instance_id": "instance-1"},
+            {"id": "two", "instance_id": "instance-2"},
+        ]})
+        self.assertEqual(await p.vultr_floating_ips("instance-1"),
+                         [{"id": "one", "instance_id": "instance-1"}])
+        p._req.assert_awaited_once_with("GET", "/reserved-ips?per_page=500")
+
+    async def test_power_and_delete_use_correct_vultr_endpoints(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={})
+        await p.vultr_power("instance-1", "reboot")
+        await p.delete_vultr_floating_ip("rip-1")
+        self.assertEqual(p._req.await_args_list[0].args, ("POST", "/instances/instance-1/reboot"))
+        self.assertEqual(p._req.await_args_list[1].args, ("DELETE", "/reserved-ips/rip-1"))
+
+    async def test_get_floating_ip_uses_its_id(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={"reserved_ip": {"id": "rip-1"}})
+        self.assertEqual(await p.vultr_floating_ip("rip-1"), {"id": "rip-1"})
+        p._req.assert_awaited_once_with("GET", "/reserved-ips/rip-1")

@@ -518,24 +518,38 @@ async def cb_server(cb: CallbackQuery):
     _, acc_id, srv_id = cb.data.split(":")
     acc = st.account(int(acc_id))
     try:
-        s = await providers.Provider(acc).server(srv_id)
+        prov = providers.Provider(acc)
+        s = await prov.server(srv_id)
+        floating_ips = await prov.vultr_floating_ips(srv_id) if acc["provider"] == "vultr" else []
     except Exception as e:
         await cb.answer(str(e)[:180], show_alert=True)
         return
     b = InlineKeyboardBuilder()
     b.button(text="🔌 نود کردن در پنل", callback_data=f"node:{acc_id}:{srv_id}")
     if acc["provider"] == "vultr":
-        b.button(text="🔄 افزودن IPv4 جدید", callback_data=f"v4add:{acc_id}:{srv_id}")
-        b.button(text="📌 افزودن Floating IP", callback_data=f"float:{acc_id}:{srv_id}")
+        b.button(text="🌐 مدیریت IPها", callback_data=f"ipman:{acc_id}:{srv_id}")
+        b.button(text="🔄 ریبوت", callback_data=f"power:reboot:{acc_id}:{srv_id}")
+        power_label = "⏹ خاموش کردن" if s.get("status") == "active" else "▶️ روشن کردن"
+        power_action = "halt" if s.get("status") == "active" else "start"
+        b.button(text=power_label, callback_data=f"power:{power_action}:{acc_id}:{srv_id}")
     b.button(text="🗑 حذف سرور", callback_data=f"delsrv:{acc_id}:{srv_id}")
     b.button(text="🔙 سرورها", callback_data=f"srvs:{acc_id}")
     b.adjust(1)
+    float_lines = ""
+    if acc["provider"] == "vultr":
+        if floating_ips:
+            shown = [f"• <code>{html.escape(str(ip.get('ip_address') or ip.get('ip')))}</code>"
+                     f" — {html.escape(str(ip.get('label') or 'بدون نام'))}"
+                     for ip in floating_ips]
+            float_lines = "\n📌 <b>Floating IPها:</b>\n" + "\n".join(shown)
+        else:
+            float_lines = "\n📌 <b>Floating IPها:</b> ندارد"
     await cb.message.edit_text(
         f"🖥 <b>{html.escape(str(s['label']))}</b>\n"
         f"🌍 منطقه: <code>{s.get('region')}</code>\n"
         f"🔢 پلن: <code>{s.get('plan')}</code>\n"
         f"📡 آی‌پی: <code>{s.get('ip')}</code>\n"
-        f"وضعیت: <b>{s.get('status')}</b>", reply_markup=b.as_markup())
+        f"وضعیت: <b>{s.get('status')}</b>{float_lines}", reply_markup=b.as_markup())
     await cb.answer()
 
 
@@ -551,6 +565,135 @@ async def _vultr_action_context(acc_id, srv_id):
         raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
     server = await providers.Provider(acc).server(srv_id)
     return acc, server
+
+
+def _floating_ip_value(ip):
+    return str(ip.get("ip_address") or ip.get("ip") or "—")
+
+
+@dp.callback_query(F.data.startswith("ipman:"))
+async def vultr_ip_manager(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    try:
+        acc, server = await _vultr_action_context(acc_id, srv_id)
+        floating_ips = await providers.Provider(acc).vultr_floating_ips(srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ IPv4 عمومی جدید", callback_data=f"v4add:{acc_id}:{srv_id}")
+    b.button(text="➕ Floating IP جدید", callback_data=f"float:{acc_id}:{srv_id}")
+    for ip in floating_ips:
+        # Both Vultr IDs are UUIDs; only send the Reserved-IP ID so the
+        # callback stays below Telegram's 64-byte callback-data limit.
+        b.button(text=f"🗑 حذف {_floating_ip_value(ip)}", callback_data=f"floatdel:{acc_id}:{ip['id']}")
+    b.button(text="🔄 تازه‌سازی", callback_data=f"ipman:{acc_id}:{srv_id}")
+    b.button(text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    if floating_ips:
+        listed = "\n".join(
+            f"• <code>{html.escape(_floating_ip_value(ip))}</code> — "
+            f"{html.escape(str(ip.get('label') or 'بدون نام'))}" for ip in floating_ips)
+    else:
+        listed = "ندارد"
+    await cb.message.edit_text(
+        "🌐 <b>مدیریت IPها</b>\n\n"
+        f"📡 IP اصلی: <code>{html.escape(str(server.get('ip')))}</code>\n\n"
+        f"📌 <b>Floating IPهای متصل ({len(floating_ips)}):</b>\n{listed}\n\n"
+        "برای ساخت Floating IP جدید، Vultr سقف حساب/منطقه را بررسی می‌کند.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+POWER_TEXT = {
+    "start": ("روشن کردن", "سرور شروع به روشن شدن می‌کند."),
+    "halt": ("خاموش کردن", "سرور خاموش می‌شود و اتصال‌های فعال قطع خواهند شد."),
+    "reboot": ("ریبوت", "سرور ریبوت می‌شود و اتصال‌های فعال قطع خواهند شد."),
+}
+
+
+@dp.callback_query(F.data.startswith("power:"))
+async def vultr_power_prompt(cb: CallbackQuery):
+    _, action, acc_id, srv_id = cb.data.split(":")
+    if action not in POWER_TEXT:
+        await cb.answer("عملیات نامعتبر", show_alert=True)
+        return
+    try:
+        _, server = await _vultr_action_context(acc_id, srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    label, warning = POWER_TEXT[action]
+    b = InlineKeyboardBuilder()
+    b.button(text=f"⚠️ بله، {label}", callback_data=f"powerok:{action}:{acc_id}:{srv_id}")
+    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    await cb.message.edit_text(
+        f"⚠️ <b>{label} سرور</b>\n\n{html.escape(str(server['label']))}\n\n{warning}",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("powerok:"))
+async def vultr_power_execute(cb: CallbackQuery):
+    _, action, acc_id, srv_id = cb.data.split(":")
+    if action not in POWER_TEXT:
+        await cb.answer("عملیات نامعتبر", show_alert=True)
+        return
+    label, _ = POWER_TEXT[action]
+    await cb.message.edit_text(f"⏳ در حال {label}…")
+    try:
+        acc, _ = await _vultr_action_context(acc_id, srv_id)
+        await providers.Provider(acc).vultr_power(srv_id, action)
+    except Exception as e:
+        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        f"✅ دستور {label} ارسال شد.", reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("floatdel:"))
+async def vultr_delete_floating_prompt(cb: CallbackQuery):
+    _, acc_id, reserved_id = cb.data.split(":")
+    try:
+        acc = st.account(int(acc_id))
+        if not acc or acc["provider"] != "vultr":
+            raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
+        floating = await providers.Provider(acc).vultr_floating_ip(reserved_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ بله، برای همیشه حذف کن", callback_data=f"floatdelok:{acc_id}:{reserved_id}")
+    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{floating.get('instance_id')}")
+    b.adjust(1)
+    await cb.message.edit_text(
+        "⚠️ <b>حذف Floating IP</b>\n\n"
+        f"<code>{html.escape(_floating_ip_value(floating))}</code> از Vultr حذف می‌شود؛ این عمل قابل بازگشت نیست.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("floatdelok:"))
+async def vultr_delete_floating(cb: CallbackQuery):
+    _, acc_id, reserved_id = cb.data.split(":")
+    await cb.message.edit_text("⏳ در حال حذف Floating IP…")
+    try:
+        acc = st.account(int(acc_id))
+        if not acc or acc["provider"] != "vultr":
+            raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
+        await providers.Provider(acc).delete_vultr_floating_ip(reserved_id)
+    except Exception as e:
+        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        "✅ Floating IP حذف شد.", reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 سرورها", callback_data=f"srvs:{acc_id}").as_markup())
+    await cb.answer()
 
 
 @dp.callback_query(F.data.startswith("v4add:"))

@@ -84,7 +84,9 @@ proxy.
 For Vultr instances, the server screen can add a public IPv4 (Vultr reboots the
 instance) or create and attach a Reserved IPv4 floating IP. Vultr does not
 replace an existing primary IPv4 in place; the additional-address action keeps
-the original primary address.
+the original primary address. The Vultr IP manager lists the floating IPs
+attached to that instance and can create or permanently remove them; it also
+offers confirmed start, stop, and reboot controls.
 
 ## Requirements
 
