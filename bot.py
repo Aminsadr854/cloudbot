@@ -568,7 +568,9 @@ async def _vultr_action_context(acc_id, srv_id):
 
 
 def _floating_ip_value(ip):
-    return str(ip.get("ip_address") or ip.get("ip") or "—")
+    # Vultr calls the address `subnet` for Reserved IP records, while other
+    # endpoints use `ip` or `ip_address`.
+    return str(ip.get("ip_address") or ip.get("ip") or ip.get("subnet") or "—")
 
 
 @dp.callback_query(F.data.startswith("ipman:"))
@@ -762,7 +764,7 @@ async def vultr_floating_ip(cb: CallbackQuery):
     try:
         acc, server = await _vultr_action_context(acc_id, srv_id)
         reserved = await providers.Provider(acc).create_and_attach_vultr_floating_ip(
-            srv_id, server["region"], f"cloudbot-{server['label']}")
+            srv_id, server["region"], f"cloudbot-{server['label'] or srv_id[:8]}")
     except Exception as e:
         await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
         await cb.answer()

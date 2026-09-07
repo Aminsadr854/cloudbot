@@ -83,6 +83,7 @@ class VultrIpTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_get_floating_ip_uses_its_id(self):
         p = self._provider()
-        p._req = AsyncMock(return_value={"reserved_ip": {"id": "rip-1"}})
-        self.assertEqual(await p.vultr_floating_ip("rip-1"), {"id": "rip-1"})
+        p._req = AsyncMock(return_value={"reserved_ip": {"id": "rip-1", "subnet": "198.51.100.20"}})
+        self.assertEqual(await p.vultr_floating_ip("rip-1"),
+                         {"id": "rip-1", "subnet": "198.51.100.20"})
         p._req.assert_awaited_once_with("GET", "/reserved-ips/rip-1")
