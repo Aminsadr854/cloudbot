@@ -538,7 +538,7 @@ async def cb_server(cb: CallbackQuery):
     float_lines = ""
     if acc["provider"] == "vultr":
         if floating_ips:
-            shown = [f"• <code>{html.escape(str(ip.get('ip_address') or ip.get('ip')))}</code>"
+            shown = [f"• <code>{html.escape(_floating_ip_value(ip))}</code>"
                      f" — {html.escape(str(ip.get('label') or 'بدون نام'))}"
                      for ip in floating_ips]
             float_lines = "\n📌 <b>Floating IPها:</b>\n" + "\n".join(shown)
