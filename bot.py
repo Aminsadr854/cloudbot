@@ -504,7 +504,8 @@ async def cb_servers(cb: CallbackQuery):
         return
     b = InlineKeyboardBuilder()
     for s in servers:
-        b.button(text=f"{s['label']} · {s['ip']} · {s['status']}",
+        where = providers.location_text(acc["provider"], s.get("region"), s.get("country"))
+        b.button(text=f"{s['label']} · {where} · {s['ip']} · {s['status']}",
                  callback_data=f"srv:{acc_id}:{s['id']}")
     b.button(text="🔙 بازگشت", callback_data=f"acc:{acc_id}")
     b.adjust(1)
@@ -546,7 +547,7 @@ async def cb_server(cb: CallbackQuery):
             float_lines = "\n📌 <b>Floating IPها:</b> ندارد"
     await cb.message.edit_text(
         f"🖥 <b>{html.escape(str(s['label']))}</b>\n"
-        f"🌍 منطقه: <code>{s.get('region')}</code>\n"
+        f"🌍 منطقه: <b>{html.escape(providers.location_text(acc['provider'], s.get('region'), s.get('country')))}</b>\n"
         f"🔢 پلن: <code>{s.get('plan')}</code>\n"
         f"📡 آی‌پی: <code>{s.get('ip')}</code>\n"
         f"وضعیت: <b>{s.get('status')}</b>{float_lines}", reply_markup=b.as_markup())
@@ -751,7 +752,7 @@ async def vultr_floating_ip_prompt(cb: CallbackQuery):
     b.adjust(1)
     await cb.message.edit_text(
         "⚠️ <b>افزودن Floating IP</b>\n\n"
-        f"یک Reserved IPv4 جدید در منطقهٔ <code>{html.escape(str(server['region']))}</code> می‌سازد و به این سرور وصل می‌کند.\n"
+        f"یک Reserved IPv4 جدید در منطقهٔ <b>{html.escape(providers.location_text(acc['provider'], server.get('region'), server.get('country')))}</b> می‌سازد و به این سرور وصل می‌کند.\n"
         "این IP جداگانه قابل جابه‌جایی بین سرورهای همان منطقه است و ممکن است هزینهٔ Vultr داشته باشد.",
         reply_markup=b.as_markup())
     await cb.answer()
@@ -885,7 +886,10 @@ async def pick_region(cb: CallbackQuery, state: FSMContext):
     region = cb.data.split(":", 1)[1]
     data = await state.get_data()
     acc = st.account(data["acc_id"])
-    await state.update_data(region=region)
+    region_label = next((item[1] for item in data.get("regions", [])
+                         if item[0] == region),
+                        providers.location_text(acc["provider"], region))
+    await state.update_data(region=region, region_label=region_label)
     await cb.message.edit_text("در حال گرفتن پلن‌ها…")
     try:
         plans = await providers.Provider(acc).plans(region)
@@ -894,7 +898,9 @@ async def pick_region(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     await state.update_data(plans=plans)
-    await cb.message.edit_text(f"🌍 {region}\n🔢 پلن را انتخاب کن:",
+    await cb.message.edit_text(
+        f"🌍 {html.escape(region_label)}\n"
+        "🔢 پلن را انتخاب کن:",
                                reply_markup=_paged_kb(plans, "plan", f"acc:{data['acc_id']}"))
     await cb.answer()
 
@@ -963,6 +969,8 @@ async def do_create(msg: Message, state: FSMContext):
     # hand it back through the API a second time.
     st.set_server_pass(acc["id"], srv["id"], srv["root_password"])
     ip = srv.get("ip") or "(در حال تخصیص — چند لحظه بعد در لیست سرورها می‌آید)"
+    region_label = data.get("region_label") or providers.location_text(
+        acc["provider"], srv.get("region"), srv.get("country"))
     b = InlineKeyboardBuilder()
     if srv.get("ip"):
         b.button(text="🔌 نود کردن در پنل", callback_data=f"node:{acc['id']}:{srv['id']}")
@@ -972,7 +980,7 @@ async def do_create(msg: Message, state: FSMContext):
         f"✅ <b>سرور ساخته شد</b>\n\n"
         f"🏷 نام: <code>{html.escape(str(srv['label']))}</code>\n"
         f"📡 آی‌پی: <code>{ip}</code>\n"
-        f"🌍 منطقه: <code>{srv.get('region')}</code>\n"
+        f"🌍 منطقه: <b>{html.escape(region_label)}</b>\n"
         f"🔢 پلن: <code>{srv.get('plan')}</code>\n"
         f"👤 یوزر: <code>root</code>\n"
         f"🔑 رمز: <code>{html.escape(srv['root_password'])}</code>\n\n"
@@ -2551,7 +2559,7 @@ async def _replace_target(t, log_fn):
         if not sib:
             raise RuntimeError(
                 f"اکانت «{acc['label']}» بن شده و هیچ اکانت دیگری برای "
-                f"{old.get('region')} باقی نمانده")
+                f"{providers.location_text(acc['provider'], old.get('region'), old.get('country'))} باقی نمانده")
         target_acc = sib
         await log_fn(f"اکانت جایگزین (کم‌بارترین اکانت همان دیتاسنتر): "
                      f"«{html.escape(sib['label'])}»")
@@ -2588,7 +2596,7 @@ async def _replace_target(t, log_fn):
         await replacer.scrap(st, target_acc, cand, log_fn)
     if srv is None:
         raise RuntimeError(f"بعد از {IP_HUNT_ATTEMPTS} تلاش، آی‌پی تمیزی در "
-                           f"{old.get('region')} پیدا نشد")
+                           f"{providers.location_text(acc['provider'], old.get('region'), old.get('country'))} پیدا نشد")
 
     await log_fn("نصب و نود کردن سرور نو…")
     server_ca, api_key = await provision_node(srv["ip"], srv["root_password"], log_fn)
@@ -2643,7 +2651,9 @@ async def _replace_target(t, log_fn):
     return {"fqdn": fqdn, "old_ip": old_ip, "old_label": old.get("label"),
             "old_account": acc["label"], "new_ip": srv["ip"],
             "new_label": srv.get("label"), "new_account": target_acc["label"],
-            "region": old.get("region"), "plan": old.get("plan"),
+            "provider": acc["provider"], "region": old.get("region"),
+            "country": old.get("country"),
+            "plan": old.get("plan"),
             "healthy": healthy, "verdict": verdict, "ban_note": ban_note}
 
 
@@ -2817,7 +2827,7 @@ async def _do_watch(*, alert: bool):
                     f"({html.escape(str(info['new_label']))}) — "
                     f"اکانت «{html.escape(info['new_account'])}»"
                     f"{'' if info['healthy'] else ' <i>(حذف شد)</i>'}\n"
-                    f"📍 {info['region']} · {info['plan']}\n\n"
+                    f"📍 {providers.location_text(info['provider'], info['region'], info.get('country'))} · {info['plan']}\n\n"
                     f"باقی‌ماندهٔ جایگزینی امروز برای این کانفیگ: "
                     f"{_replace_budget(t['id'])}")
             if info.get("ban_note"):

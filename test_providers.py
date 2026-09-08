@@ -13,6 +13,24 @@ class ProxyParsingTests(unittest.TestCase):
         )
 
 
+class LocationFormattingTests(unittest.IsolatedAsyncioTestCase):
+    def test_country_flag_uses_iso_regional_indicators(self):
+        self.assertEqual(providers.country_flag("de"), "🇩🇪")
+        self.assertEqual(providers.country_flag("United States"), "🇺🇸")
+
+    def test_location_text_uses_provider_region_fallback(self):
+        self.assertEqual(providers.location_text("vultr", "fra"), "🇩🇪 fra")
+        self.assertEqual(providers.location_text("linode", "us-east"), "🇺🇸 us-east")
+
+    async def test_country_flag_is_added_to_region_choices(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={
+            "regions": [{"id": "fra", "city": "Frankfurt", "country": "DE"}]
+        })
+        regions = await p.regions()
+        self.assertEqual(regions, [("fra", "🇩🇪 Frankfurt DE")])
+
+
 class ProxyFamilyTests(unittest.IsolatedAsyncioTestCase):
     async def test_ipv4_replaces_dual_stack_proxy_hostname(self):
         loop = __import__("asyncio").get_running_loop()

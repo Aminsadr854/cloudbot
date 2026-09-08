@@ -31,6 +31,93 @@ VULTR = "https://api.vultr.com/v2"
 HETZNER = "https://api.hetzner.cloud/v1"
 
 
+# Server responses only carry a provider-specific location id, while the
+# regions/locations endpoints include the country separately. Keep a small
+# fallback for existing servers so their summaries can still show a flag
+# without an extra API request on every screen.
+_REGION_COUNTRIES = {
+    "linode": {
+        "us-east": "US", "us-central": "US", "us-west": "US",
+        "us-southeast": "US", "us-iad": "US", "us-lax": "US",
+        "us-sea": "US", "us-mia": "US", "us-ord": "US",
+        "ca-central": "CA", "ca-central-1": "CA",
+        "eu-west": "GB", "eu-central": "DE", "fr-par": "FR",
+        "de-fra": "DE", "nl-ams": "NL", "it-mil": "IT",
+        "se-sto": "SE", "es-mad": "ES", "gb-lon": "GB",
+        "pl-waw": "PL", "br-gru": "BR", "in-bom": "IN",
+        "in-maa": "IN", "sg-sin": "SG", "jp-tyo": "JP",
+        "au-mel": "AU", "au-syd": "AU", "id-cgk": "ID",
+        "mx-mex": "MX", "il-ost": "IL",
+    },
+    "vultr": {
+        "ams": "NL", "fra": "DE", "lhr": "GB", "man": "GB",
+        "par": "FR", "mad": "ES", "waw": "PL", "sto": "SE",
+        "jnb": "ZA", "cpt": "ZA", "del": "IN",
+        "bom": "IN", "blr": "IN", "sgp": "SG", "nrt": "JP",
+        "icn": "KR", "syd": "AU", "mel": "AU", "akl": "NZ",
+        "sao": "BR", "ord": "US", "dfw": "US", "lax": "US",
+        "mia": "US", "atl": "US", "ewr": "US", "sea": "US",
+        "sjc": "US", "yto": "CA", "tor": "CA", "mex": "MX",
+        "dxb": "AE", "tlv": "IL", "ist": "TR",
+    },
+    "hetzner": {
+        "ash": "US", "ash-dc1": "US", "hil": "US", "hil-dc1": "US",
+        "fsn1": "DE", "nbg1": "DE", "hel1": "FI", "sin": "SG",
+        "falkenstein": "DE", "nuremberg": "DE", "helsinki": "FI",
+        "ashburn": "US", "hillsboro": "US", "singapore": "SG",
+    },
+}
+
+_COUNTRY_ALIASES = {
+    "UNITED STATES": "US", "USA": "US", "UNITED KINGDOM": "GB", "UK": "GB",
+    "GERMANY": "DE", "DEUTSCHLAND": "DE", "FRANCE": "FR",
+    "NETHERLANDS": "NL", "THE NETHERLANDS": "NL", "SPAIN": "ES",
+    "POLAND": "PL", "SWEDEN": "SE", "FINLAND": "FI", "CANADA": "CA",
+    "BRAZIL": "BR", "INDIA": "IN", "SINGAPORE": "SG", "JAPAN": "JP",
+    "AUSTRALIA": "AU", "NEW ZEALAND": "NZ", "SOUTH AFRICA": "ZA",
+    "SOUTH KOREA": "KR", "ISRAEL": "IL", "TURKEY": "TR",
+    "UNITED ARAB EMIRATES": "AE", "MEXICO": "MX", "INDONESIA": "ID",
+}
+
+
+def country_code(value):
+    """Return a two-letter ISO country code when ``value`` identifies one."""
+    if value is None:
+        return None
+    value = str(value).strip().upper()
+    if len(value) == 2 and value.isalpha():
+        return value
+    return _COUNTRY_ALIASES.get(value)
+
+
+def country_flag(country):
+    """Return the Telegram flag emoji for a country, or an empty string."""
+    code = country_code(country)
+    if not code:
+        return ""
+    return "".join(chr(0x1F1E6 + ord(letter) - ord("A")) for letter in code)
+
+
+def region_country(provider, region):
+    """Resolve a provider location id to a country when it is known locally."""
+    key = str(region or "").strip().lower()
+    country = _REGION_COUNTRIES.get(provider, {}).get(key)
+    if country:
+        return country
+    # Linode location ids commonly start with their ISO country code.
+    prefix = key.split("-", 1)[0]
+    if len(prefix) == 2 and prefix.isalpha():
+        return country_code(prefix)
+    return None
+
+
+def location_text(provider, region, country=None):
+    """Format a location with its country flag while preserving its name/id."""
+    value = str(region or "—")
+    flag = country_flag(country or region_country(provider, region))
+    return f"{flag} {value}" if flag else value
+
+
 def proxy_url(proxy: str | None) -> str | None:
     """
     Turn the user's proxy string into a full proxy URL.
@@ -186,6 +273,7 @@ class Provider:
                 out.append({
                     "id": i["id"], "label": i.get("label"),
                     "region": i.get("region"),
+                    "country": region_country(self.provider, i.get("region")),
                     "ip": (i.get("ipv4") or [None])[0],
                     "status": i.get("status"),
                     "plan": i.get("type"),
@@ -198,6 +286,7 @@ class Provider:
                 out.append({
                     "id": i["id"], "label": i.get("label") or i.get("hostname"),
                     "region": i.get("region"),
+                    "country": region_country(self.provider, i.get("region")),
                     "ip": i.get("main_ip") if i.get("main_ip", "0.0.0.0") != "0.0.0.0" else "(provisioning)",
                     "status": i.get("status") + "/" + i.get("power_status", ""),
                     "plan": i.get("plan"),
@@ -207,10 +296,13 @@ class Provider:
         d = await self._req("GET", "/servers?per_page=50")
         out = []
         for i in d.get("servers", []):
+            location = (i.get("datacenter") or {}).get("location") or {}
             ipv4 = ((i.get("public_net") or {}).get("ipv4") or {}).get("ip")
             out.append({
                 "id": i["id"], "label": i.get("name"),
-                "region": ((i.get("datacenter") or {}).get("location") or {}).get("name"),
+                "region": location.get("name"),
+                "country": country_code(location.get("country_iso") or location.get("country"))
+                           or region_country(self.provider, location.get("name")),
                 "ip": ipv4 or "(provisioning)",
                 "status": i.get("status"),
                 "plan": (i.get("server_type") or {}).get("name"),
@@ -221,20 +313,25 @@ class Provider:
         if self.provider == "linode":
             i = await self._req("GET", f"/linode/instances/{server_id}")
             return {"id": i["id"], "label": i.get("label"), "region": i.get("region"),
+                    "country": region_country(self.provider, i.get("region")),
                     "ip": (i.get("ipv4") or [None])[0], "status": i.get("status"),
                     "plan": i.get("type")}
         if self.provider == "vultr":
             d = await self._req("GET", f"/instances/{server_id}")
             i = d.get("instance", d)
             return {"id": i["id"], "label": i.get("label"), "region": i.get("region"),
+                    "country": region_country(self.provider, i.get("region")),
                     "ip": i.get("main_ip"), "status": i.get("status"),
                     "plan": i.get("plan"), "default_password": i.get("default_password")}
         # hetzner
         d = await self._req("GET", f"/servers/{server_id}")
         i = d.get("server", d)
+        location = (i.get("datacenter") or {}).get("location") or {}
         ipv4 = ((i.get("public_net") or {}).get("ipv4") or {}).get("ip")
         return {"id": i["id"], "label": i.get("name"),
-                "region": ((i.get("datacenter") or {}).get("location") or {}).get("name"),
+                "region": location.get("name"),
+                "country": country_code(location.get("country_iso") or location.get("country"))
+                           or region_country(self.provider, location.get("name")),
                 "ip": ipv4, "status": i.get("status"),
                 "plan": (i.get("server_type") or {}).get("name")}
 
@@ -242,14 +339,23 @@ class Provider:
     async def regions(self):
         if self.provider == "linode":
             d = await self._req("GET", "/regions?page_size=200")
-            return [(r["id"], r.get("label") or r["id"]) for r in d.get("data", [])]
+            return [(r["id"], location_text(self.provider,
+                                              r.get("label") or r["id"],
+                                              r.get("country")))
+                    for r in d.get("data", [])]
         if self.provider == "vultr":
             d = await self._req("GET", "/regions?per_page=200")
-            return [(r["id"], f"{r.get('city','')} {r.get('country','')}".strip() or r["id"])
+            return [(r["id"], location_text(
+                        self.provider,
+                        f"{r.get('city','')} {r.get('country','')}".strip() or r["id"],
+                        r.get("country")))
                     for r in d.get("regions", [])]
         # hetzner
         d = await self._req("GET", "/locations?per_page=50")
-        return [(l["name"], f"{l.get('city','')} {l.get('country','')}".strip() or l["name"])
+        return [(l["name"], location_text(
+                    self.provider,
+                    f"{l.get('city','')} {l.get('country','')}".strip() or l["name"],
+                    l.get("country_iso") or l.get("country")))
                 for l in d.get("locations", [])]
 
     async def plans(self, region=None):
@@ -328,6 +434,7 @@ class Provider:
             i = await self._req("POST", "/linode/instances", json=body)
             return {"id": i["id"], "label": i.get("label"),
                     "ip": (i.get("ipv4") or [None])[0], "region": i.get("region"),
+                    "country": region_country(self.provider, i.get("region")),
                     "plan": i.get("type"), "root_password": root_password}
         if self.provider == "vultr":
             body = {
@@ -340,6 +447,7 @@ class Provider:
             return {"id": i["id"], "label": i.get("label"),
                     "ip": i.get("main_ip") if i.get("main_ip", "0.0.0.0") != "0.0.0.0" else None,
                     "region": i.get("region"), "plan": i.get("plan"),
+                    "country": region_country(self.provider, i.get("region")),
                     "root_password": i.get("default_password") or root_password}
         # hetzner: with no ssh_keys attached, Hetzner generates a root password
         # and returns it once in the create response - which is what node-it needs.
@@ -349,9 +457,12 @@ class Provider:
         }
         d = await self._req("POST", "/servers", json=body)
         i = d.get("server", d)
+        location = (i.get("datacenter") or {}).get("location") or {}
         ipv4 = ((i.get("public_net") or {}).get("ipv4") or {}).get("ip")
         return {"id": i["id"], "label": i.get("name"), "ip": ipv4,
-                "region": ((i.get("datacenter") or {}).get("location") or {}).get("name"),
+                "region": location.get("name"),
+                "country": country_code(location.get("country_iso") or location.get("country"))
+                           or region_country(self.provider, location.get("name")),
                 "plan": (i.get("server_type") or {}).get("name"),
                 "root_password": d.get("root_password") or root_password}
 
