@@ -364,7 +364,10 @@ class Provider:
             out = []
             for t in d.get("data", []):
                 price = (t.get("price") or {}).get("monthly")
-                out.append((t["id"], f"{t.get('label', t['id'])} - ${price}/mo"))
+                transfer = t.get("transfer")
+                traffic = f" · 📡 {transfer} GB traffic" if transfer is not None else ""
+                out.append((t["id"],
+                            f"{t.get('label', t['id'])}{traffic} - ${price}/mo"))
             return out
         if self.provider == "vultr":
             path = f"/plans?per_page=500" + (f"&region={region}" if region else "")

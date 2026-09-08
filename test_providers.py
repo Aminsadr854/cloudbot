@@ -31,6 +31,19 @@ class LocationFormattingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(regions, [("fra", "🇩🇪 Frankfurt DE")])
 
 
+class PlanFormattingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_linode_plan_shows_monthly_transfer(self):
+        p = providers.Provider({"provider": "linode", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"data": [{
+            "id": "g6-standard-1", "label": "Linode 2GB", "transfer": 2000,
+            "price": {"monthly": 12},
+        }]})
+
+        self.assertEqual(await p.plans(), [
+            ("g6-standard-1", "Linode 2GB · 📡 2000 GB traffic - $12/mo")
+        ])
+
+
 class ProxyFamilyTests(unittest.IsolatedAsyncioTestCase):
     async def test_ipv4_replaces_dual_stack_proxy_hostname(self):
         loop = __import__("asyncio").get_running_loop()
