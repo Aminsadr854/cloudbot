@@ -57,13 +57,15 @@ modprobe ip_gre 2>/dev/null || true
 ip link del {dev} 2>/dev/null || true
 ip tunnel add {dev} mode gre local {iran_ip} remote {foreign_ip} ttl 255
 ip addr add 10.21.{subnet_n}.1/30 dev {dev}
-ip link set {dev} mtu 1400 up
+ip link set {dev} mtu 1476 up
 sysctl -qw net.ipv4.ip_forward=1
 sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
 nft list table ip cbtun >/dev/null 2>&1 && nft delete table ip cbtun
 nft add table ip cbtun
 nft add chain ip cbtun pre '{{ type nat hook prerouting priority dstnat; }}'
 nft add chain ip cbtun post '{{ type nat hook postrouting priority srcnat; }}'
+nft add chain ip cbtun forward '{{ type filter hook forward priority 0; policy accept; }}'
+nft add rule ip cbtun forward tcp flags syn tcp option maxseg size set 1360
 {dnat}
 nft add rule ip cbtun post oifname "{dev}" counter masquerade
 echo GRE_IRAN_OK
@@ -84,7 +86,7 @@ done
 ip link del {dev} 2>/dev/null || true
 ip tunnel add {dev} mode gre local {foreign_ip} remote {iran_ip} ttl 255
 ip addr add 10.21.{subnet_n}.2/30 dev {dev}
-ip link set {dev} mtu 1400 up
+ip link set {dev} mtu 1476 up
 sysctl -qw net.ipv4.ip_forward=1
 sysctl -qw net.ipv4.conf.all.rp_filter=2 2>/dev/null || true
 echo GRE_FOREIGN_OK

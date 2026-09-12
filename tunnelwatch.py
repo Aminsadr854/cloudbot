@@ -113,7 +113,13 @@ nft delete table ip cbtun >/dev/null 2>&1
 echo IRAN_CLEAN_OK
 """
 
-FOREIGN_CLEAN = r"""
+def foreign_clean_script(dev=None):
+    if dev:
+        return f"""
+ip link del "{dev}" 2>/dev/null || true
+echo FOREIGN_CLEAN_OK
+"""
+    return r"""
 # `ip -o link show` prints a GRE device as "cbgre3@NONE"; feeding that name
 # straight to `ip link del` fails with "Cannot find device", and because the
 # failure was silenced the wipe reported success while deleting nothing. The
@@ -129,25 +135,19 @@ echo FOREIGN_CLEAN_OK
 """
 
 
-async def wipe(iran, foreign, jump, log):
+async def wipe(iran, foreign, jump, log, dev=None):
     """
-    Remove every tunnel this bot has ever put on these two machines.
-
-    This is deliberately blunt rather than surgical. Tearing down only the
-    tunnel we have a record of leaves behind the ones we do not: a tunnel the
-    owner registered after building it by hand carries no device name, and a
-    failed attempt earlier in the same repair left a device nobody recorded.
-    Either one keeps forwarding the same port as the tunnel we are about to
-    build, and two tunnels fighting over one port is exactly the outage the
-    repair was supposed to end. So: wipe the Iran side first, always, before
-    anything new is stood up.
+    Remove the old tunnel on these two machines without disturbing other tunnels
+    sharing the same foreign server.
     """
-    await log("پاک‌سازی کامل تانل‌های قبلی روی سرور ایران…")
+    await log("پاک‌سازی تانل قبلی روی سرور ایران…")
     try:
         ic = await tun.connect(iran["host"], iran["port"], iran["user"],
                                iran["password"], jump=jump)
         try:
-            code, out = await tun.run(ic, IRAN_CLEAN)
+            # On Iran relay, delete the specific device if known, or wipe cbgre
+            cmd = f'ip link del "{dev}" 2>/dev/null || true; echo IRAN_CLEAN_OK' if dev else IRAN_CLEAN
+            code, out = await tun.run(ic, cmd)
             if "IRAN_CLEAN_OK" not in out:
                 await log(f"⚠️ پاک‌سازی ایران کامل نشد: {out[-120:]}")
         finally:
@@ -163,7 +163,7 @@ async def wipe(iran, foreign, jump, log):
         fc = await tun.connect(foreign["host"], foreign["port"],
                                foreign["user"], foreign["password"])
         try:
-            await tun.run(fc, FOREIGN_CLEAN)
+            await tun.run(fc, foreign_clean_script(dev))
         finally:
             fc.close()
     except Exception as e:
@@ -200,7 +200,7 @@ async def rebuild(st, t, *, kind=None, foreign=None, jump, log):
     # Wipe BOTH ends before building: the Iran side so nothing competes for
     # the port, the old foreign side because it is either being reused or
     # thrown away. Skipped only for a brand-new box that never had a tunnel.
-    await wipe(iran, d.get("foreign"), jump, log)
+    await wipe(iran, d.get("foreign"), jump, log, dev=d.get("dev"))
     await log(f"برپاسازی تانل {kind} — ایران {iran['host']} ← خارج {foreign['host']}")
     detail = await build(st, t, kind, iran, foreign, jump, log)
 
