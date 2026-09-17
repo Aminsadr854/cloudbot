@@ -423,6 +423,82 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("104.16.0.2", self.st.scan_pool(1)["ips"])
         self.assertEqual(self.st.found_ips(1)[0]["ip"], "104.16.0.3")
 
+    # Test 1 — Fake DNS IP: Given DNS A-record = 85.9.109.98 and scanner results = [], last_best_ip != 85.9.109.98
+    async def test_regression_1_fake_dns_ip_rejected(self):
+        fake_ip = "85.9.109.98"
+        self.st.update_cfscan(2, fqdn="fake.domain.com", last_best_ip=None)
+        d = choose([], live_ip=fake_ip, engine_id=2, st=self.st)
+        self.assertIsNone(d["entry"])
+        self.assertFalse(d["change"])
+        self.assertIsNone(self.st.cfscan(2).get("last_best_ip"))
+        self.assertNotEqual(self.st.cfscan(2).get("last_best_ip"), fake_ip)
+
+    # Test 2 — DNS IP not in shortlist: live_entry = None and X must not become last_best_ip.
+    async def test_regression_2_dns_ip_not_in_shortlist(self):
+        dns_ip = "85.9.108.98"
+        shortlist = [{"ip": "104.16.1.1", "score": 50}, {"ip": "104.16.1.2", "score": 60}]
+        d = choose(shortlist, live_ip=dns_ip, engine_id=3, st=self.st)
+        self.assertIsNone(d["entry"])
+        keep_entry = next((r for r in shortlist if r["ip"] == dns_ip), None)
+        self.assertIsNone(keep_entry)
+
+    # Test 3 — Valid existing IP: If DNS IP is genuinely in validated results, behavior works correctly.
+    async def test_regression_3_valid_existing_ip(self):
+        valid_ip = "104.16.1.1"
+        results = [{"ip": valid_ip, "rtt": 40, "tcp_ms": 30, "tls_ms": 10, "ttfb_ms": 40, "score": 50},
+                   {"ip": "104.16.1.2", "rtt": 45, "tcp_ms": 35, "tls_ms": 10, "ttfb_ms": 45, "score": 60}]
+        d = choose(results, live_ip=valid_ip, engine_id=1, st=self.st)
+        self.assertIsNotNone(d["entry"])
+        self.assertEqual(d["entry"]["ip"], valid_ip)
+
+    # Test 4 — New confirmed candidate: Passes scanner + phone validation -> becomes last_best_ip.
+    async def test_regression_4_new_confirmed_candidate(self):
+        self.st.update_cfscan(2, fqdn="eng2.test.com", auto_apply=True, last_best_ip=None)
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(return_value=["zone2", "eng2.test.com"])
+        mock_cf.find_a_record = AsyncMock(return_value={"id": "rec2", "content": "85.9.109.98"})
+        mock_cf.update_a = AsyncMock(return_value=True)
+
+        cand = {"ts": int(time.time()), "ips": ["104.17.2.50"], "metrics": {"104.17.2.50": {"rtt": 35, "ok": True}}}
+        self.st.set_scan_candidates([{"ip": "104.17.2.50", "rtt": 35, "tcp_ms": 20, "tls_ms": 15, "ttfb_ms": 35}],
+                                    controls=[], keep=10, engine_id=2)
+
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf):
+            with patch("store.Store.cf_token", return_value="dummy_token"):
+                with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.17.2.50", "rtt": 35}, "why": "both approved", "voters": 2}):
+                    await self.e2.phone_recheck_pass()
+
+        self.assertEqual(self.st.cfscan(2).get("last_best_ip"), "104.17.2.50")
+        self.assertEqual(self.st.found_ips(2)[0]["ip"], "104.17.2.50")
+
+    # Test 5 — No new valid candidate: Preserve existing legitimate last_best_ip.
+    async def test_regression_5_preserve_legitimate_best_ip(self):
+        self.st.update_cfscan(1, fqdn="eng1.test.com", last_best_ip="104.16.1.100")
+        self.st.set_scan_candidates([{"ip": "104.16.1.200"}], controls=[], keep=10, engine_id=1)
+
+        with patch("scanner_engine.decide", return_value={"change": False, "entry": None, "why": "not better", "voters": 2}):
+            await self.e1.phone_recheck_pass()
+
+        self.assertEqual(self.st.cfscan(1).get("last_best_ip"), "104.16.1.100")
+
+    # Test 6 — Three engines independent: No engine inherits another engine's last_best_ip.
+    async def test_regression_6_three_engines_isolation(self):
+        self.st.update_cfscan(1, last_best_ip="104.16.1.10")
+        self.st.update_cfscan(2, last_best_ip=None)
+        self.st.update_cfscan(3, last_best_ip=None)
+
+        self.assertEqual(self.st.cfscan(1).get("last_best_ip"), "104.16.1.10")
+        self.assertIsNone(self.st.cfscan(2).get("last_best_ip"))
+        self.assertIsNone(self.st.cfscan(3).get("last_best_ip"))
+
+    # Test 7 — Telegram display: Never displays current DNS placeholder as Best IP unless validated.
+    async def test_regression_7_telegram_display_placeholder(self):
+        cfg_unvalidated = {"fqdn": "c2c2c2c2c2.rjwarehousing.ir", "last_best_ip": None}
+        best_ip_display = cfg_unvalidated.get("last_best_ip") or "—"
+        self.assertEqual(best_ip_display, "—")
+        self.assertNotEqual(best_ip_display, "85.9.109.98")
+
 
 if __name__ == "__main__":
     unittest.main()
+

@@ -138,8 +138,7 @@ def choose(results: list, live_ip: Optional[str] = None, measured: Optional[dict
         st = Store()
     ranked = [r for r in results if r.get("ip")]
     on_list = {r["ip"] for r in ranked}
-    live_entry = (next((r for r in ranked if r["ip"] == live_ip), None)
-                  or ({"ip": live_ip} if live_ip else None))
+    live_entry = next((r for r in ranked if r["ip"] == live_ip), None)
 
     def keep(why, voters=0, needs=None):
         return {"change": False, "entry": live_entry, "why": why,
@@ -395,8 +394,7 @@ class ScannerEngine:
             except Exception as e:
                 await log_fn(f"[ENGINE {self.engine_id}] ⚠️ خطای دامنه: {html.escape(str(e)[:150])}")
 
-        keep_entry = (next((r for r in shortlist if r["ip"] == live_ip), None)
-                      or ({"ip": live_ip} if live_ip else None))
+        keep_entry = next((r for r in shortlist if r["ip"] == live_ip), None)
         fields = {"last_scan_ts": int(time.time())}
         if keep_entry:
             fields.update(last_best_ip=keep_entry["ip"], last_best=keep_entry)

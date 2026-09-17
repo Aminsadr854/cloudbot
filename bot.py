@@ -1893,8 +1893,7 @@ async def _close_window(log, *, apply_if_better):
     # relay confirming the address beats the live one. So publishing never moves
     # the domain; phone_recheck does, once both reports are in.
     st.set("awaiting_phones", 0)
-    keep = (next((r for r in shortlist if r["ip"] == live_ip), None)
-            or ({"ip": live_ip} if live_ip else None))
+    keep = next((r for r in shortlist if r["ip"] == live_ip), None)
     fields = {"last_scan_ts": int(time.time())}
     if keep:
         fields.update(last_best_ip=keep["ip"], last_best=keep)
