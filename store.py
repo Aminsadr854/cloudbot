@@ -23,7 +23,6 @@ CREATE TABLE IF NOT EXISTS accounts (
     provider  TEXT NOT NULL,          -- 'linode' | 'vultr'
     token     BLOB NOT NULL,          -- encrypted API token
     proxy     BLOB,                   -- encrypted host:port:user:pass, or NULL
-    proxy_family TEXT NOT NULL DEFAULT 'default', -- default | ipv4 | ipv6
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tunnels (
@@ -61,22 +60,15 @@ class Store:
         self.con = sqlite3.connect(DB_PATH, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
         self.con.executescript(SCHEMA)
-        # Existing installations predate the per-proxy IP-family preference.
-        # SQLite's CREATE TABLE IF NOT EXISTS does not add columns, so migrate
-        # them in place without touching their encrypted credentials.
-        columns = {r["name"] for r in self.con.execute("PRAGMA table_info(accounts)")}
-        if "proxy_family" not in columns:
-            self.con.execute("ALTER TABLE accounts ADD COLUMN proxy_family TEXT NOT NULL DEFAULT 'default'")
-            self.con.commit()
         self.f = _fernet()
 
     # ---- accounts ------------------------------------------------------
-    def add_account(self, label, provider, token, proxy=None, proxy_family="default"):
+    def add_account(self, label, provider, token, proxy=None):
         self.con.execute(
-            "INSERT INTO accounts (label, provider, token, proxy, proxy_family, created_at)"
-            " VALUES (?,?,?,?,?,?)",
+            "INSERT INTO accounts (label, provider, token, proxy, created_at)"
+            " VALUES (?,?,?,?,?)",
             (label, provider, self.f.encrypt(token.encode()),
-             self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, int(time.time())))
+             self.f.encrypt(proxy.encode()) if proxy else None, int(time.time())))
         self.con.commit()
         return self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -85,16 +77,11 @@ class Store:
         self.con.commit()
         return n
 
-    def set_account_label(self, acc_id, label):
-        """Rename an account without rewriting its encrypted credentials."""
-        self.con.execute("UPDATE accounts SET label = ? WHERE id = ?", (label, acc_id))
-        self.con.commit()
-
-    def set_proxy(self, acc_id, proxy, proxy_family="default"):
-        """Set, change, or clear (proxy=None) an account's proxy preference."""
+    def set_proxy(self, acc_id, proxy):
+        """Set, change, or clear (proxy=None) an account's proxy."""
         self.con.execute(
-            "UPDATE accounts SET proxy = ?, proxy_family = ? WHERE id = ?",
-            (self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, acc_id))
+            "UPDATE accounts SET proxy = ? WHERE id = ?",
+            (self.f.encrypt(proxy.encode()) if proxy else None, acc_id))
         self.con.commit()
 
     def _row(self, r):
@@ -102,7 +89,6 @@ class Store:
             "id": r["id"], "label": r["label"], "provider": r["provider"],
             "token": self.f.decrypt(r["token"]).decode(),
             "proxy": self.f.decrypt(r["proxy"]).decode() if r["proxy"] else None,
-            "proxy_family": r["proxy_family"],
             "created_at": r["created_at"],
         }
 
@@ -211,25 +197,6 @@ class Store:
         import json
         v = self.get("cfscan_found")
         return json.loads(v) if v else []
-
-    # ---- panel connection (encrypted: it is an admin login) ------------
-    # Kept here rather than in the environment so an installation can be set up
-    # entirely from Telegram. Nothing about the panel is baked into the image.
-    def set_panel(self, url, user, password, core_id):
-        self._set_enc("panel", {"url": url.rstrip("/"), "user": user,
-                                "password": password, "core_id": int(core_id)})
-
-    def panel(self) -> dict:
-        return self._get_enc("panel") or {}
-
-    def _set_enc(self, k, obj):
-        import json
-        self.set(k, self.f.encrypt(json.dumps(obj).encode()).decode())
-
-    def _get_enc(self, k):
-        import json
-        v = self.get(k)
-        return json.loads(self.f.decrypt(v.encode()).decode()) if v else None
 
     # ---- subscription link (encrypted: it is a bearer secret) ----------
     def set_sub_url(self, url):
@@ -342,6 +309,204 @@ class Store:
     def set_watch_last(self, results: list):
         import json
         self.set("watch_last", json.dumps(results))
+
+    # ---- phone probes -------------------------------------------------
+    # A relay measures one operator's view of an IP. Phones on other operators
+    # see a different one, and an address that is only clean where the relay
+    # sits is not clean for the customers. These tables hold what the phones
+    # were asked to test and what they found.
+    def set_scan_candidates(self, entries: list, controls=None, keep=45):
+        """
+        The shortlist handed to the phones, with the relay's own numbers kept.
+
+        Storing the metrics beside the addresses is what lets the phone verdicts
+        be ranked across the whole shortlist later, instead of across the short
+        history of addresses that happened to be applied. Plain IP strings are
+        still accepted, for callers that have nothing more to say.
+        """
+        import json, time
+        ips, metrics = [], {}
+        for e in list(entries)[:keep]:
+            if isinstance(e, str):
+                ip = e
+            else:
+                ip = e.get("ip")
+                if ip:
+                    metrics[ip] = {k: v for k, v in e.items() if k != "ip"}
+            if ip:
+                ips.append(ip)
+        self.set("scan_candidates", json.dumps(
+            {"ts": int(time.time()), "ips": ips, "metrics": metrics,
+             # Reference addresses, handed to the phones mixed in with the real
+             # candidates but never judged as candidates themselves.
+             "controls": [c for c in (controls or []) if c]}))
+
+    def set_candidate_meta(self, **fields):
+        """Bookkeeping that rides with the shortlist: what has been tried this
+        window, and how many replacement lists have gone out."""
+        import json
+        v = self.get("scan_candidates")
+        d = json.loads(v) if v else {}
+        d.update(fields)
+        self.set("scan_candidates", json.dumps(d))
+
+    def scan_candidates(self) -> dict:
+        import json
+        v = self.get("scan_candidates")
+        d = json.loads(v) if v else {}
+        return {"ts": d.get("ts", 0), "ips": d.get("ips", []),
+                "metrics": d.get("metrics", {}),
+                "controls": d.get("controls", []),
+                "tried": d.get("tried", []),
+                "reshortlists": int(d.get("reshortlists") or 0)}
+
+    # ---- the rolling pool the continuous scan fills --------------------
+    # The relay measures around the clock; every result lands here, and once a
+    # window closes the best of them become the shortlist the phones judge.
+    # Keeping the pool rather than the last scan's output is the difference
+    # between "the best of the last minute" and "the best of the last six
+    # hours", which is what the whole cycle is supposed to mean.
+    def pool_add(self, entries: list, keep=200):
+        import json, time
+        pool = self.scan_pool()
+        seen = pool.get("ips") or {}
+        now = int(time.time())
+        for e in entries:
+            ip = e.get("ip")
+            if not ip or not isinstance(e.get("rtt"), (int, float)):
+                continue
+            # The newest measurement wins: an address that has since gone bad
+            # should not be remembered by its best moment.
+            seen[ip] = {**{k: v for k, v in e.items() if k != "ip"}, "ts": now}
+        if len(seen) > keep:
+            def rank(kv):
+                m = kv[1]
+                return ((m.get("rtt") or 999) + 2 * (m.get("jitter") or 0)
+                        + 1000 * (m.get("loss") or 0))
+            seen = dict(sorted(seen.items(), key=rank)[:keep])
+        pool["ips"] = seen
+        pool.setdefault("started", now)
+        pool["passes"] = int(pool.get("passes") or 0) + 1
+        self.set("scan_pool", json.dumps(pool))
+
+    def scan_pool(self) -> dict:
+        import json
+        v = self.get("scan_pool")
+        d = json.loads(v) if v else {}
+        return {"started": d.get("started") or 0, "ips": d.get("ips") or {},
+                "passes": int(d.get("passes") or 0)}
+
+    def pool_reset(self):
+        import json, time
+        self.set("scan_pool", json.dumps(
+            {"started": int(time.time()), "ips": {}, "passes": 0}))
+
+    # ---- addresses a phone could not reach ------------------------------
+    # An operator that cuts the TLS handshake to an address leaves it looking
+    # perfect from the relay's fixed line, so without a memory of what the
+    # handsets found unusable the same address is picked again on the next
+    # cycle, and the next. The memory is deliberately short. The filtering
+    # moves through the day: the same handset on the same operator found one
+    # address in fifty usable at midday and twenty-six in fifty that evening.
+    # Remembering a refusal for half a day would rule out most of the space on
+    # the strength of one bad hour.
+    def mark_blocked(self, ips, ttl_hours=3):
+        import json, time
+        now = int(time.time())
+        d = self.blocked_ips(raw=True)
+        for ip in ips:
+            d[ip] = now
+        cutoff = now - ttl_hours * 3600
+        d = {ip: ts for ip, ts in d.items() if ts >= cutoff}
+        self.set("blocked_ips", json.dumps(d))
+
+    def blocked_ips(self, raw=False, ttl_hours=3):
+        import json, time
+        v = self.get("blocked_ips")
+        d = json.loads(v) if v else {}
+        if raw:
+            return d
+        cutoff = time.time() - ttl_hours * 3600
+        return {ip for ip, ts in d.items() if ts >= cutoff}
+
+    def probe_token(self) -> str:
+        """Shared secret the phones authenticate with; created on first use."""
+        t = self.get("probe_token")
+        if not t:
+            import secrets
+            t = secrets.token_urlsafe(24)
+            self.set("probe_token", t)
+        return t
+
+    def save_device_report(self, device: str, operator: str, results: list,
+                           net: str = "", app: str = "", keep_devices=12):
+        """`net` is what the phone was actually on when it measured. A round
+        taken over Wi-Fi still carries the SIM's operator name, so without this
+        it would pass as a measurement of that operator's route."""
+        import json, time
+        all_r = self.device_reports()
+        all_r[device] = {"operator": operator, "ts": int(time.time()),
+                         "net": net, "app": app, "results": results}
+        # Keep the newest devices only, so a lost phone cannot grow this for ever.
+        if len(all_r) > keep_devices:
+            for k in sorted(all_r, key=lambda k: all_r[k]["ts"])[:-keep_devices]:
+                all_r.pop(k, None)
+        self.set("device_reports", json.dumps(all_r))
+
+    def touch_device(self, device: str, operator: str = "", net: str = "",
+                     app: str = ""):
+        """Record that a phone was heard from just now."""
+        import json, time
+        seen = self.devices_seen()
+        prev = seen.get(device, {})
+        seen[device] = {"ts": int(time.time()),
+                        "operator": operator or prev.get("operator", ""),
+                        "net": net or prev.get("net", ""),
+                        "app": app or prev.get("app", "")}
+        self.set("devices_seen", json.dumps(seen))
+
+    def devices_seen(self) -> dict:
+        import json
+        v = self.get("devices_seen")
+        return json.loads(v) if v else {}
+
+    def forget_device(self, device: str):
+        import json
+        for key in ("devices_seen", "device_reports"):
+            d = json.loads(self.get(key) or "{}")
+            d.pop(device, None)
+            self.set(key, json.dumps(d))
+
+    def set_device_name(self, device: str, name: str):
+        """A name the owner chose. The operator is what the phone reports; this
+        is which physical handset it is, which only a person can know."""
+        import json
+        names = self.device_names()
+        if name:
+            names[device] = name[:32]
+        else:
+            names.pop(device, None)
+        self.set("device_names", json.dumps(names))
+
+    def device_names(self) -> dict:
+        import json
+        v = self.get("device_names")
+        return json.loads(v) if v else {}
+
+    def probe_interval(self) -> int:
+        """Hours between phone measurement rounds. The phones read this."""
+        try:
+            return max(1, int(self.get("probe_interval", "12")))
+        except (TypeError, ValueError):
+            return 12
+
+    def set_probe_interval(self, hours: int):
+        self.set("probe_interval", max(1, int(hours)))
+
+    def device_reports(self) -> dict:
+        import json
+        v = self.get("device_reports")
+        return json.loads(v) if v else {}
 
     # ---- settings ------------------------------------------------------
     def get(self, k, default=None):

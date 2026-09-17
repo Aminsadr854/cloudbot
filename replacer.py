@@ -95,6 +95,36 @@ async def find_server(st, ip):
     return None, None, False
 
 
+async def unreadable_accounts(st):
+    """
+    Accounts whose server list cannot be fetched right now, with the reason.
+
+    find_server() skips these, because an account that returns nothing cannot be
+    searched for an IP. Skipping is right; discarding the fact is not. A tunnel
+    whose foreign server lives in a refused account looks exactly like a tunnel
+    whose server was deleted - and the repair that follows wipes the Iran side
+    and tries to SSH into a machine it can neither see nor replace, every time
+    the watchdog comes round. Reporting which account went dark turns an endless
+    rebuild loop into one sentence naming what to fix.
+
+    Each entry is (account, reason, hard). `hard` separates an account that
+    answered and said no - a dead token, a suspension - from one that merely
+    failed to answer, which a flaky proxy or a timeout produces several times a
+    day. Only the first justifies building a replacement server somewhere else;
+    treating a 502 the same way would spend real money on a blip that clears by
+    itself a minute later.
+    """
+    out = []
+    for acc in st.accounts():
+        try:
+            servers, refused = await account_servers(acc)
+            if refused:
+                out.append((acc, "دسترسی رد شد (توکن باطل یا اکانت معلق)", True))
+        except Exception as e:
+            out.append((acc, str(e)[:120], False))
+    return out
+
+
 async def sibling_account(st, exclude_id, provider, region):
     """
     Another account of the same provider that can host the same region.
@@ -160,8 +190,7 @@ async def build_replacement(st, acc, old_server, log):
     prov = providers.Provider(acc)
     image = await pick_image(acc)
     label = new_label(old_server.get("label"), old_server.get("ip"))
-    await log(f"ساخت سرور نو روی «{acc['label']}» — "
-              f"{providers.location_text(acc['provider'], old_server.get('region'), old_server.get('country'))} / "
+    await log(f"ساخت سرور نو روی «{acc['label']}» — {old_server.get('region')} / "
               f"{old_server.get('plan')}")
     import secrets
     import string

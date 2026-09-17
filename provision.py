@@ -75,15 +75,26 @@ async def provision_node(host, password, log, user="root", port=22):
         # and fails to install Docker. Wait for those to finish and for the
         # locks to clear before installing.
         await log("در انتظار آماده‌شدن سرور (قفل apt)…")
+        # Stopping the updaters only after the lock clears was not enough: the
+        # apt-daily timers start them again moments later, mid-install, and a
+        # Docker install interrupted that way leaves dpkg half-configured so
+        # every later attempt fails too. Stop the timers first, then wait, then
+        # finish whatever dpkg left undone before installing anything.
         wait_apt = (
+            "systemctl stop apt-daily.timer apt-daily-upgrade.timer "
+            "unattended-upgrades 2>/dev/null || true; "
             "cloud-init status --wait >/dev/null 2>&1 || true; "
             "for i in $(seq 1 90); do "
             "  fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock "
             "/var/lib/dpkg/lock >/dev/null 2>&1 || break; sleep 5; "
             "done; "
-            "systemctl stop unattended-upgrades 2>/dev/null || true"
+            "systemctl stop apt-daily.service apt-daily-upgrade.service "
+            "unattended-upgrades 2>/dev/null || true; "
+            "export DEBIAN_FRONTEND=noninteractive; "
+            "dpkg --configure -a >/dev/null 2>&1 || true; "
+            "apt-get -y -f install >/dev/null 2>&1 || true"
         )
-        await _run(conn, wait_apt, timeout=600)
+        await _run(conn, wait_apt, timeout=900)
 
         await log("نصب نود پاسارگارد (چند دقیقه طول می‌کشد)…")
         # -y and the INSTALL_* env vars keep the installer from stopping on a
@@ -97,6 +108,18 @@ async def provision_node(host, password, log, user="root", port=22):
         )
         code, out = await _run(conn, install, timeout=900)
         await log(f"خروجی نصب:\n<code>{out.strip()[-400:]}</code>")
+
+        # One retry after repairing dpkg: the usual failure on a new box is a
+        # package step that collided with the OS's own first-boot updates, and a
+        # second pass on a settled system succeeds.
+        _, probe_cert = await _run(
+            conn, f"test -s {CERT_PATH} && echo ok || "
+                  "find /var/lib -name ssl_cert.pem 2>/dev/null | head -1")
+        if not probe_cert.strip():
+            await log("نصب کامل نشد؛ ترمیم dpkg و تلاش دوباره…")
+            await _run(conn, wait_apt, timeout=900)
+            code, out = await _run(conn, install, timeout=900)
+            await log(f"خروجی نصب دوم:\n<code>{out.strip()[-400:]}</code>")
 
         await log("خواندن گواهی و کلید نود…")
         _, cert = await _run(conn, f"cat {CERT_PATH} 2>/dev/null")
@@ -158,6 +181,23 @@ class Panel:
                                   headers={"Authorization": f"Bearer {tok}"},
                                   ssl=self._ctx) as r:
             return r.status in (200, 204)
+
+    async def hosts(self):
+        """Every host entry the panel serves to clients."""
+        async with self._session() as s:
+            tok = await self._token(s)
+            async with s.get(f"{self.base}/api/hosts",
+                             headers={"Authorization": f"Bearer {tok}"},
+                             ssl=self._ctx) as r:
+                d = await r.json()
+        if isinstance(d, list):
+            return d
+        if isinstance(d, dict):
+            out = []
+            for v in d.values():
+                out.extend(v if isinstance(v, list) else [v])
+            return out
+        return []
 
     async def list_nodes(self):
         async with self._session() as s:

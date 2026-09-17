@@ -10,6 +10,7 @@ it is read, the same way the server-monitor bot handles passwords.
 """
 import asyncio
 import html
+import json
 import logging
 import os
 import secrets
@@ -46,52 +47,49 @@ log = logging.getLogger("cloudbot")
 
 TOKEN = os.environ["CLOUDBOT_TOKEN"]
 OWNER = int(os.environ["CLOUDBOT_OWNER"])
-# The panel is configured from inside Telegram, not from the environment, so a
-# fresh install needs nothing but a bot token and an owner id. Anything found in
-# the environment is treated as a first-run seed and then lives in the encrypted
-# store like every other credential.
-PANEL_SEED = {
-    "url": os.environ.get("CLOUDBOT_PANEL_URL", ""),
-    "user": os.environ.get("CLOUDBOT_PANEL_USER", ""),
-    "password": os.environ.get("CLOUDBOT_PANEL_PASS", ""),
-    "core_id": os.environ.get("CLOUDBOT_CORE_ID", ""),
-}
+# Phones are given this address, never the bot host: a handset in Iran
+# dialling a foreign address is the traffic that gets shaped.
+PROBE_BASE = os.environ.get("CLOUDBOT_PROBE_BASE",
+                            "https://status.etesalpaya.com")
+PANEL_URL = os.environ["CLOUDBOT_PANEL_URL"]
+PANEL_USER = os.environ["CLOUDBOT_PANEL_USER"]
+PANEL_PASS = os.environ["CLOUDBOT_PANEL_PASS"]
+SNI_CORE_ID = int(os.environ.get("CLOUDBOT_CORE_ID", "6"))
 
 st = Store()
-def panel_cfg() -> dict:
-    return st.panel()
-
-
-def core_id() -> int:
-    """Which core config new nodes are attached to. 0 means 'let the panel decide'."""
-    return int(panel_cfg().get("core_id") or 0)
-
-
-class _PanelProxy:
-    """
-    Builds a Panel from stored settings on every call.
-
-    A module-level Panel would freeze whatever was configured at import time,
-    and this bot is meant to be configured after it starts - and reconfigured
-    later without a restart.
-    """
-
-    def _live(self):
-        c = panel_cfg()
-        if not c.get("url"):
-            raise RuntimeError("پنل هنوز تنظیم نشده — «⚙️ تنظیمات → 🎛 پنل»")
-        return Panel(c["url"], c["user"], c["password"])
-
-    def __getattr__(self, name):
-        return getattr(self._live(), name)
-
-
-panel = _PanelProxy()
+panel = Panel(PANEL_URL, PANEL_USER, PANEL_PASS)
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 PROVIDER_LABEL = {"linode": "🟢 Linode", "vultr": "🔵 Vultr", "hetzner": "🔴 Hetzner"}
-PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
+
+
+def _own_addresses() -> set[str]:
+    """
+    Every IPv4 address this machine answers on.
+
+    One of the Hetzner servers in the account is the machine this bot runs on.
+    Resetting its root password reboots it, which kills the bot in the middle of
+    the action and takes the new password down with it - so the confirm screen
+    has to be able to say so before the tap, not after.
+
+    Read straight from the kernel rather than shelled out, so the check costs
+    nothing and cannot fail because a tool is missing.
+    """
+    found: set[str] = set()
+    candidate = ""
+    try:
+        with open("/proc/net/fib_trie", "r") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("|--"):
+                    candidate = stripped[3:].strip()
+                elif "/32 host LOCAL" in stripped and candidate:
+                    if not candidate.startswith("127."):
+                        found.add(candidate)
+    except Exception:
+        pass
+    return found
 
 
 def gen_password(n=20):
@@ -120,7 +118,6 @@ def kb_main():
     b.button(text="🔌 نود کردن سرور", callback_data="nodeit")
     b.button(text="🔎 اسکنر آی‌پی تمیز", callback_data="scan")
     b.button(text="🩺 دیده‌بان کانفیگ", callback_data="wd")
-    b.button(text="⚙️ تنظیمات", callback_data="settings")
     b.adjust(1)
     return b.as_markup()
 
@@ -140,50 +137,10 @@ def kb_account(acc):
     b = InlineKeyboardBuilder()
     b.button(text="📋 سرورها", callback_data=f"srvs:{acc['id']}")
     b.button(text="➕ ساخت سرور", callback_data=f"new:{acc['id']}")
-    b.button(text="⚙️ تنظیمات", callback_data=f"accset:{acc['id']}")
+    b.button(text="🌐 پروکسی", callback_data=f"prx:{acc['id']}")
     b.button(text="🔑 حذف اکانت", callback_data=f"delacc:{acc['id']}")
     b.button(text="🔙 اکانت‌ها", callback_data="accounts")
     b.adjust(2, 2, 1)
-    return b.as_markup()
-
-
-def proxy_summary(proxy):
-    """Show a proxy endpoint without exposing its authentication details."""
-    if not proxy:
-        return "بدون پروکسی"
-    value = proxy.split("://", 1)[-1]
-    if "@" in value:
-        value = value.rsplit("@", 1)[1]
-    if value.startswith("["):
-        end = value.find("]")
-        if end < 0:
-            return "پروکسی تنظیم شده"
-        port = value[end + 2:].split(":", 1)[0] if value[end + 1:end + 2] == ":" else ""
-        return f"{value[:end + 1]}:{port}" if port else value[:end + 1]
-    bits = value.split(":", 2)
-    return ":".join(bits[:2]) if len(bits) >= 2 else "پروکسی تنظیم شده"
-
-
-def account_settings_text(acc):
-    family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
-    return (
-        "⚙️ <b>تنظیمات اکانت</b>\n\n"
-        f"🏷 نام: <b>{html.escape(acc['label'])}</b>\n"
-        f"☁️ ارائه‌دهنده: {PROVIDER_LABEL.get(acc['provider'], acc['provider'])}\n"
-        f"🌐 پروکسی: <code>{html.escape(proxy_summary(acc['proxy']))}</code>\n"
-        f"🔌 مسیر اتصال پراکسی: <b>{family}</b>\n"
-        "🔐 توکن API: <i>ذخیره‌شده و رمزنگاری‌شده</i>"
-    )
-
-
-def kb_account_settings(acc):
-    b = InlineKeyboardBuilder()
-    b.button(text="✏️ تغییر نام", callback_data=f"accname:{acc['id']}")
-    b.button(text="🌐 تغییر پراکسی", callback_data=f"prx:{acc['id']}")
-    if acc["proxy"]:
-        b.button(text="🗑 حذف پراکسی", callback_data=f"accprxclear:{acc['id']}")
-    b.button(text="🔙 بازگشت", callback_data=f"acc:{acc['id']}")
-    b.adjust(1)
     return b.as_markup()
 
 
@@ -219,23 +176,11 @@ async def cb_account(cb: CallbackQuery):
     if not acc:
         await cb.answer("یافت نشد", show_alert=True)
         return
-    prx = proxy_summary(acc["proxy"])
-    family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
+    prx = acc["proxy"].split(":")[0] + ":…" if acc["proxy"] else "بدون پروکسی"
     await cb.message.edit_text(
         f"{PROVIDER_LABEL.get(acc['provider'])} <b>{html.escape(acc['label'])}</b>\n"
-        f"🌐 پروکسی: <code>{html.escape(prx)}</code> · {family}",
+        f"🌐 پروکسی: <code>{html.escape(prx)}</code>",
         reply_markup=kb_account(acc))
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("accset:"))
-async def cb_account_settings(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    acc = st.account(int(cb.data.split(":", 1)[1]))
-    if not acc:
-        await cb.answer("یافت نشد", show_alert=True)
-        return
-    await cb.message.edit_text(account_settings_text(acc), reply_markup=kb_account_settings(acc))
     await cb.answer()
 
 
@@ -247,16 +192,6 @@ class Add(StatesGroup):
     label = State()
     token = State()
     proxy = State()
-    proxy_family = State()
-
-
-def kb_proxy_family(prefix: str):
-    b = InlineKeyboardBuilder()
-    b.button(text="پیش‌فرض", callback_data=f"{prefix}:default")
-    b.button(text="IPv4", callback_data=f"{prefix}:ipv4")
-    b.button(text="IPv6", callback_data=f"{prefix}:ipv6")
-    b.adjust(3)
-    return b.as_markup()
 
 
 @dp.callback_query(F.data == "add_acc")
@@ -302,10 +237,9 @@ async def add_token(msg: Message, state: FSMContext):
         "یا اگر لازم نیست، دکمهٔ زیر را بزن.", reply_markup=b.as_markup())
 
 
-async def _finish_add(data, proxy, proxy_family, answer):
+async def _finish_add(data, proxy, answer):
     try:
-        acc = {"provider": data["provider"], "token": data["token"], "proxy": proxy,
-               "proxy_family": proxy_family}
+        acc = {"provider": data["provider"], "token": data["token"], "proxy": proxy}
         who = await providers.Provider(acc).whoami()
     except Exception as e:
         log.exception("add-account validation failed (provider=%s proxy=%s)",
@@ -314,7 +248,7 @@ async def _finish_add(data, proxy, proxy_family, answer):
                      "اگر پروکسی از نوع SOCKS است، جلوش <code>socks5://</code> بگذار. "
                      "وگرنه توکن را بررسی کن.")
         return
-    st.add_account(data["label"], data["provider"], data["token"], proxy, proxy_family)
+    st.add_account(data["label"], data["provider"], data["token"], proxy)
     await answer(f"✅ اکانت <b>{html.escape(data['label'])}</b> اضافه شد.\n"
                  f"شناسایی شد: <code>{html.escape(str(who))}</code>")
 
@@ -327,20 +261,11 @@ async def add_proxy(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("❌ قالب پروکسی نادرست است. host:port:username:password")
         return
-    await state.update_data(proxy=proxy)
-    await state.set_state(Add.proxy_family)
-    await msg.answer("اتصال به پراکسی با کدام IP برقرار شود؟", reply_markup=kb_proxy_family("addfam"))
-
-
-@dp.callback_query(Add.proxy_family, F.data.startswith("addfam:"))
-async def add_proxy_family(cb: CallbackQuery, state: FSMContext):
-    family = cb.data.split(":", 1)[1]
     data = await state.get_data()
     await state.clear()
-    await cb.message.edit_text("در حال تست اتصال…")
-    await _finish_add(data, data["proxy"], family, cb.message.edit_text)
-    await cb.message.answer("منو:", reply_markup=kb_main())
-    await cb.answer()
+    note = await msg.answer("در حال تست اتصال…")
+    await _finish_add(data, proxy, note.edit_text)
+    await msg.answer("منو:", reply_markup=kb_main())
 
 
 @dp.callback_query(Add.proxy, F.data == "noproxy")
@@ -348,7 +273,7 @@ async def add_noproxy(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     await cb.message.edit_text("در حال تست اتصال…")
-    await _finish_add(data, None, "default", cb.message.edit_text)
+    await _finish_add(data, None, cb.message.edit_text)
     await cb.message.answer("منو:", reply_markup=kb_main())
     await cb.answer()
 
@@ -356,43 +281,8 @@ async def add_noproxy(cb: CallbackQuery, state: FSMContext):
 # --------------------------------------------------------------------------
 # proxy change
 # --------------------------------------------------------------------------
-class AccountSettings(StatesGroup):
-    name = State()
-
-
-@dp.callback_query(F.data.startswith("accname:"))
-async def account_name_start(cb: CallbackQuery, state: FSMContext):
-    acc_id = int(cb.data.split(":", 1)[1])
-    acc = st.account(acc_id)
-    if not acc:
-        await cb.answer("یافت نشد", show_alert=True)
-        return
-    await state.set_state(AccountSettings.name)
-    await state.update_data(acc_id=acc_id)
-    b = InlineKeyboardBuilder()
-    b.button(text="🔙 انصراف", callback_data=f"accset:{acc_id}")
-    await cb.message.edit_text(
-        f"نام جدید اکانت را بفرست.\n\nنام فعلی: <b>{html.escape(acc['label'])}</b>",
-        reply_markup=b.as_markup())
-    await cb.answer()
-
-
-@dp.message(AccountSettings.name)
-async def account_name_set(msg: Message, state: FSMContext):
-    label = (msg.text or "").strip()
-    if not label or len(label) > 80:
-        await msg.answer("نام باید بین ۱ تا ۸۰ کاراکتر باشد.")
-        return
-    data = await state.get_data()
-    await state.clear()
-    st.set_account_label(data["acc_id"], label)
-    acc = st.account(data["acc_id"])
-    await msg.answer("✅ نام اکانت به‌روز شد.", reply_markup=kb_account_settings(acc))
-
-
 class Proxy(StatesGroup):
     value = State()
-    family = State()
 
 
 @dp.callback_query(F.data.startswith("prx:"))
@@ -418,50 +308,19 @@ async def prx_set(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("❌ قالب نادرست. host:port:username:password")
         return
-    await state.update_data(proxy=proxy)
-    await state.set_state(Proxy.family)
-    await msg.answer("اتصال به پراکسی با کدام IP برقرار شود؟", reply_markup=kb_proxy_family("prxfam"))
-
-
-@dp.callback_query(Proxy.family, F.data.startswith("prxfam:"))
-async def prx_family(cb: CallbackQuery, state: FSMContext):
-    family = cb.data.split(":", 1)[1]
     data = await state.get_data()
-    account = st.account(data["acc_id"])
-    await cb.message.edit_text("در حال تست اتصال…")
-    try:
-        await providers.Provider({**account, "proxy": data["proxy"], "proxy_family": family}).whoami()
-    except Exception as e:
-        await cb.message.edit_text(
-            f"❌ اتصال ناموفق بود:\n<code>{html.escape(str(e)[:350])}</code>\n\n"
-            "یک خانوادهٔ IP دیگر انتخاب کن یا با /start دوباره تلاش کن.",
-            reply_markup=kb_proxy_family("prxfam"))
-        await cb.answer()
-        return
     await state.clear()
-    st.set_proxy(data["acc_id"], data["proxy"], family)
-    await cb.message.edit_text("✅ پروکسی به‌روز شد.", reply_markup=kb_account(st.account(data["acc_id"])))
-    await cb.answer()
+    st.set_proxy(data["acc_id"], proxy)
+    await msg.answer("✅ پروکسی به‌روز شد.", reply_markup=kb_account(st.account(data["acc_id"])))
 
 
 @dp.callback_query(Proxy.value, F.data == "prx_clear")
 async def prx_clear(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
-    st.set_proxy(data["acc_id"], None, "default")
+    st.set_proxy(data["acc_id"], None)
     await cb.message.edit_text("✅ پروکسی حذف شد.",
                                reply_markup=kb_account(st.account(data["acc_id"])))
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("accprxclear:"))
-async def account_proxy_clear(cb: CallbackQuery, state: FSMContext):
-    await state.clear()
-    acc_id = int(cb.data.split(":", 1)[1])
-    st.set_proxy(acc_id, None, "default")
-    acc = st.account(acc_id)
-    await cb.message.edit_text("✅ پروکسی حذف شد.\n\n" + account_settings_text(acc),
-                               reply_markup=kb_account_settings(acc))
     await cb.answer()
 
 
@@ -504,8 +363,7 @@ async def cb_servers(cb: CallbackQuery):
         return
     b = InlineKeyboardBuilder()
     for s in servers:
-        where = providers.location_text(acc["provider"], s.get("region"), s.get("country"))
-        b.button(text=f"{s['label']} · {where} · {s['ip']} · {s['status']}",
+        b.button(text=f"{s['label']} · {s['ip']} · {s['status']}",
                  callback_data=f"srv:{acc_id}:{s['id']}")
     b.button(text="🔙 بازگشت", callback_data=f"acc:{acc_id}")
     b.adjust(1)
@@ -519,262 +377,175 @@ async def cb_server(cb: CallbackQuery):
     _, acc_id, srv_id = cb.data.split(":")
     acc = st.account(int(acc_id))
     try:
-        prov = providers.Provider(acc)
-        s = await prov.server(srv_id)
-        floating_ips = await prov.vultr_floating_ips(srv_id) if acc["provider"] == "vultr" else []
+        s = await providers.Provider(acc).server(srv_id)
     except Exception as e:
         await cb.answer(str(e)[:180], show_alert=True)
         return
+    # The provider hands the root password over once, at creation, and never
+    # again - so what the bot saved then is the only copy there is. Showing it
+    # here rather than only in the creation message is the difference between
+    # a record you can come back to and one you had to copy in the moment.
+    pw = st.server_pass(int(acc_id), srv_id)
+    ip = s.get("ip")
+
     b = InlineKeyboardBuilder()
     b.button(text="🔌 نود کردن در پنل", callback_data=f"node:{acc_id}:{srv_id}")
-    if acc["provider"] == "vultr":
-        b.button(text="🌐 مدیریت IPها", callback_data=f"ipman:{acc_id}:{srv_id}")
-        b.button(text="🔄 ریبوت", callback_data=f"power:reboot:{acc_id}:{srv_id}")
-        power_label = "⏹ خاموش کردن" if s.get("status") == "active" else "▶️ روشن کردن"
-        power_action = "halt" if s.get("status") == "active" else "start"
-        b.button(text=power_label, callback_data=f"power:{power_action}:{acc_id}:{srv_id}")
+    if pw and ip:
+        b.button(text="📋 خط اتصال SSH", callback_data=f"srvssh:{acc_id}:{srv_id}")
+    if not pw:
+        b.button(text="🔑 ثبت رمز این سرور", callback_data=f"srvpw:{acc_id}:{srv_id}")
+    if acc.get("provider") == "hetzner":
+        b.button(text="🔄 ریست رمز روت", callback_data=f"srvrst:{acc_id}:{srv_id}")
     b.button(text="🗑 حذف سرور", callback_data=f"delsrv:{acc_id}:{srv_id}")
     b.button(text="🔙 سرورها", callback_data=f"srvs:{acc_id}")
     b.adjust(1)
-    float_lines = ""
-    if acc["provider"] == "vultr":
-        if floating_ips:
-            shown = [f"• <code>{html.escape(_floating_ip_value(ip))}</code>"
-                     f" — {html.escape(str(ip.get('label') or 'بدون نام'))}"
-                     for ip in floating_ips]
-            float_lines = "\n📌 <b>Floating IPها:</b>\n" + "\n".join(shown)
-        else:
-            float_lines = "\n📌 <b>Floating IPها:</b> ندارد"
+
+    creds = (f"👤 کاربر: <code>root</code>\n"
+             f"🔑 رمز: <code>{html.escape(pw)}</code>" if pw else
+             "🔑 رمز: <i>ذخیره نشده — این سرور را ربات نساخته، یا رمزش عوض شده</i>")
+
     await cb.message.edit_text(
         f"🖥 <b>{html.escape(str(s['label']))}</b>\n"
-        f"🌍 منطقه: <b>{html.escape(providers.location_text(acc['provider'], s.get('region'), s.get('country')))}</b>\n"
+        f"🌍 منطقه: <code>{s.get('region')}</code>\n"
         f"🔢 پلن: <code>{s.get('plan')}</code>\n"
-        f"📡 آی‌پی: <code>{s.get('ip')}</code>\n"
-        f"وضعیت: <b>{s.get('status')}</b>{float_lines}", reply_markup=b.as_markup())
+        f"📡 آی‌پی: <code>{ip}</code>\n"
+        f"وضعیت: <b>{s.get('status')}</b>\n\n"
+        f"{creds}", reply_markup=b.as_markup())
     await cb.answer()
 
 
-def _vultr_ip_value(result):
-    """Read the allocated address from either documented Vultr response shape."""
-    data = result.get("ipv4", result)
-    return data.get("ip") or data.get("ip_address") or "در حال تخصیص"
-
-
-async def _vultr_action_context(acc_id, srv_id):
+@dp.callback_query(F.data.startswith("srvssh:"))
+async def cb_server_ssh(cb: CallbackQuery):
+    """One tappable line that carries everything needed to get in."""
+    _, acc_id, srv_id = cb.data.split(":")
     acc = st.account(int(acc_id))
-    if not acc or acc["provider"] != "vultr":
-        raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
-    server = await providers.Provider(acc).server(srv_id)
-    return acc, server
+    try:
+        s = await providers.Provider(acc).server(srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    pw = st.server_pass(int(acc_id), srv_id)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔙 بازگشت", callback_data=f"srv:{acc_id}:{srv_id}")
+    await cb.message.edit_text(
+        f"🖥 <b>{html.escape(str(s['label']))}</b>\n\n"
+        f"<code>ssh root@{s.get('ip')}</code>\n\n"
+        f"🔑 <code>{html.escape(pw or '—')}</code>\n\n"
+        f"<code>sshpass -p '{html.escape(pw or '')}' ssh -o StrictHostKeyChecking=no "
+        f"root@{s.get('ip')}</code>\n\n"
+        f"<i>روی هر خط بزنی کپی می‌شود.</i>",
+        reply_markup=b.as_markup())
+    await cb.answer()
 
 
-def _floating_ip_value(ip):
-    # Vultr calls the address `subnet` for Reserved IP records, while other
-    # endpoints use `ip` or `ip_address`.
-    return str(ip.get("ip_address") or ip.get("ip") or ip.get("subnet") or "—")
+class SrvPw(StatesGroup):
+    value = State()
 
 
-@dp.callback_query(F.data.startswith("ipman:"))
-async def vultr_ip_manager(cb: CallbackQuery):
+@dp.callback_query(F.data.startswith("srvpw:"))
+async def cb_server_setpw(cb: CallbackQuery, state: FSMContext):
+    """
+    Record a password for a server the bot did not create.
+
+    Most servers here predate the bot or were made by hand, and without this
+    their entry stays half a record - an address with no way in.
+    """
     _, acc_id, srv_id = cb.data.split(":")
+    await state.set_state(SrvPw.value)
+    await state.update_data(acc_id=acc_id, srv_id=srv_id)
+    await cb.message.edit_text(
+        "رمز root این سرور را بفرست تا ذخیره‌اش کنم.\n\n"
+        "<i>پیامت بلافاصله پاک می‌شود.</i>")
+    await cb.answer()
+
+
+@dp.message(SrvPw.value)
+async def on_server_pw(m: Message, state: FSMContext):
+    data = await state.get_data()
+    pw = (m.text or "").strip()
     try:
-        acc, server = await _vultr_action_context(acc_id, srv_id)
-        floating_ips = await providers.Provider(acc).vultr_floating_ips(srv_id)
+        await m.delete()
+    except Exception:
+        pass
+    await state.clear()
+    if not pw:
+        await m.answer("چیزی نفرستادی.")
+        return
+    st.set_server_pass(int(data["acc_id"]), data["srv_id"], pw)
+    b = InlineKeyboardBuilder()
+    b.button(text="🖥 بازگشت به سرور",
+             callback_data=f"srv:{data['acc_id']}:{data['srv_id']}")
+    await m.answer("✅ ذخیره شد.", reply_markup=b.as_markup())
+
+
+@dp.callback_query(F.data.startswith("srvrst:"))
+async def cb_server_resetpw(cb: CallbackQuery):
+    """
+    Ask before resetting: Hetzner reboots the machine to apply the new password.
+
+    On a relay or a tunnel endpoint that is a live outage, short but real, so it
+    is never done on a single tap.
+    """
+    _, acc_id, srv_id = cb.data.split(":")
+    acc = st.account(int(acc_id))
+    try:
+        s = await providers.Provider(acc).server(srv_id)
     except Exception as e:
         await cb.answer(str(e)[:180], show_alert=True)
         return
     b = InlineKeyboardBuilder()
-    b.button(text="➕ IPv4 عمومی جدید", callback_data=f"v4add:{acc_id}:{srv_id}")
-    b.button(text="➕ Floating IP جدید", callback_data=f"float:{acc_id}:{srv_id}")
-    for ip in floating_ips:
-        # Both Vultr IDs are UUIDs; only send the Reserved-IP ID so the
-        # callback stays below Telegram's 64-byte callback-data limit.
-        b.button(text=f"🗑 حذف {_floating_ip_value(ip)}", callback_data=f"floatdel:{acc_id}:{ip['id']}")
-    b.button(text="🔄 تازه‌سازی", callback_data=f"ipman:{acc_id}:{srv_id}")
-    b.button(text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.button(text="⚠️ بله، رمز را عوض کن", callback_data=f"srvrst_ok:{acc_id}:{srv_id}")
+    b.button(text="🔙 نه", callback_data=f"srv:{acc_id}:{srv_id}")
     b.adjust(1)
-    if floating_ips:
-        listed = "\n".join(
-            f"• <code>{html.escape(_floating_ip_value(ip))}</code> — "
-            f"{html.escape(str(ip.get('label') or 'بدون نام'))}" for ip in floating_ips)
-    else:
-        listed = "ندارد"
     await cb.message.edit_text(
-        "🌐 <b>مدیریت IPها</b>\n\n"
-        f"📡 IP اصلی: <code>{html.escape(str(server.get('ip')))}</code>\n\n"
-        f"📌 <b>Floating IPهای متصل ({len(floating_ips)}):</b>\n{listed}\n\n"
-        "برای ساخت Floating IP جدید، Vultr سقف حساب/منطقه را بررسی می‌کند.",
+        f"🔄 <b>ریست رمز روت</b>\n\n"
+        f"🖥 <code>{html.escape(str(s['label']))}</code>\n"
+        f"📡 <code>{s.get('ip')}</code>\n"
+        + ("\n⛔️ <b>این همان سروری است که خودِ این ربات روی آن اجرا می‌شود.</b>\n"
+           "با ریبوت، ربات هم قطع می‌شود و رمز جدید را نمی‌بینی؛ "
+           "آن را باید از پنل هتزنر برداری.\n"
+           if str(s.get("ip") or "") in _own_addresses() else "")
+        + "\nهتزنر یک رمز تازه می‌سازد و برای اعمالش <b>سرور را ریبوت می‌کند</b>.\n"
+        "تا بالا آمدن دوباره، سرویس این سرور قطع است.\n\n"
+        "رمز جدید بلافاصله نمایش داده و ذخیره می‌شود. ادامه بدهم؟",
         reply_markup=b.as_markup())
     await cb.answer()
 
 
-POWER_TEXT = {
-    "start": ("روشن کردن", "سرور شروع به روشن شدن می‌کند."),
-    "halt": ("خاموش کردن", "سرور خاموش می‌شود و اتصال‌های فعال قطع خواهند شد."),
-    "reboot": ("ریبوت", "سرور ریبوت می‌شود و اتصال‌های فعال قطع خواهند شد."),
-}
-
-
-@dp.callback_query(F.data.startswith("power:"))
-async def vultr_power_prompt(cb: CallbackQuery):
-    _, action, acc_id, srv_id = cb.data.split(":")
-    if action not in POWER_TEXT:
-        await cb.answer("عملیات نامعتبر", show_alert=True)
-        return
+@dp.callback_query(F.data.startswith("srvrst_ok:"))
+async def cb_server_resetpw_ok(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    acc = st.account(int(acc_id))
+    await cb.message.edit_text("⏳ در حال گرفتن رمز تازه از هتزنر…")
     try:
-        _, server = await _vultr_action_context(acc_id, srv_id)
+        pw = await providers.Provider(acc).reset_root_password(srv_id)
     except Exception as e:
-        await cb.answer(str(e)[:180], show_alert=True)
-        return
-    label, warning = POWER_TEXT[action]
-    b = InlineKeyboardBuilder()
-    b.button(text=f"⚠️ بله، {label}", callback_data=f"powerok:{action}:{acc_id}:{srv_id}")
-    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
-    b.adjust(1)
-    await cb.message.edit_text(
-        f"⚠️ <b>{label} سرور</b>\n\n{html.escape(str(server['label']))}\n\n{warning}",
-        reply_markup=b.as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("powerok:"))
-async def vultr_power_execute(cb: CallbackQuery):
-    _, action, acc_id, srv_id = cb.data.split(":")
-    if action not in POWER_TEXT:
-        await cb.answer("عملیات نامعتبر", show_alert=True)
-        return
-    label, _ = POWER_TEXT[action]
-    await cb.message.edit_text(f"⏳ در حال {label}…")
-    try:
-        acc, _ = await _vultr_action_context(acc_id, srv_id)
-        await providers.Provider(acc).vultr_power(srv_id, action)
-    except Exception as e:
-        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        b = InlineKeyboardBuilder()
+        b.button(text="🔙 بازگشت", callback_data=f"srv:{acc_id}:{srv_id}")
+        await cb.message.edit_text(
+            "❌ ریست رمز انجام نشد.\n"
+            f"<code>{html.escape(str(e)[:250])}</code>\n\n"
+            "<i>رمز قبلی دست‌نخورده ماند.</i>", reply_markup=b.as_markup())
         await cb.answer()
         return
-    await cb.message.edit_text(
-        f"✅ دستور {label} ارسال شد.", reply_markup=InlineKeyboardBuilder().button(
-            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("floatdel:"))
-async def vultr_delete_floating_prompt(cb: CallbackQuery):
-    _, acc_id, reserved_id = cb.data.split(":")
+    # Saved before it is shown: a password applied on the server but missing
+    # from the record is the one failure that locks us out of our own machine.
+    st.set_server_pass(int(acc_id), srv_id, pw)
     try:
-        acc = st.account(int(acc_id))
-        if not acc or acc["provider"] != "vultr":
-            raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
-        floating = await providers.Provider(acc).vultr_floating_ip(reserved_id)
-    except Exception as e:
-        await cb.answer(str(e)[:180], show_alert=True)
-        return
+        s = await providers.Provider(acc).server(srv_id)
+        ip = s.get("ip")
+    except Exception:
+        ip = None
     b = InlineKeyboardBuilder()
-    b.button(text="⚠️ بله، برای همیشه حذف کن", callback_data=f"floatdelok:{acc_id}:{reserved_id}")
-    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{floating.get('instance_id')}")
-    b.adjust(1)
+    b.button(text="🖥 بازگشت به سرور", callback_data=f"srv:{acc_id}:{srv_id}")
     await cb.message.edit_text(
-        "⚠️ <b>حذف Floating IP</b>\n\n"
-        f"<code>{html.escape(_floating_ip_value(floating))}</code> از Vultr حذف می‌شود؛ این عمل قابل بازگشت نیست.",
+        "✅ <b>رمز روت عوض شد و ذخیره شد.</b>\n\n"
+        f"👤 کاربر: <code>root</code>\n"
+        f"🔑 رمز جدید: <code>{html.escape(pw)}</code>\n\n"
+        + (f"<code>sshpass -p '{html.escape(pw)}' ssh -o StrictHostKeyChecking=no "
+           f"root@{ip}</code>\n\n" if ip else "")
+        + "<i>سرور در حال ریبوت است؛ چند لحظه تا بالا آمدنش صبر کن.</i>",
         reply_markup=b.as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("floatdelok:"))
-async def vultr_delete_floating(cb: CallbackQuery):
-    _, acc_id, reserved_id = cb.data.split(":")
-    await cb.message.edit_text("⏳ در حال حذف Floating IP…")
-    try:
-        acc = st.account(int(acc_id))
-        if not acc or acc["provider"] != "vultr":
-            raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
-        await providers.Provider(acc).delete_vultr_floating_ip(reserved_id)
-    except Exception as e:
-        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
-        await cb.answer()
-        return
-    await cb.message.edit_text(
-        "✅ Floating IP حذف شد.", reply_markup=InlineKeyboardBuilder().button(
-            text="🔙 سرورها", callback_data=f"srvs:{acc_id}").as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("v4add:"))
-async def vultr_add_ipv4_prompt(cb: CallbackQuery):
-    _, acc_id, srv_id = cb.data.split(":")
-    try:
-        _, server = await _vultr_action_context(acc_id, srv_id)
-    except Exception as e:
-        await cb.answer(str(e)[:180], show_alert=True)
-        return
-    b = InlineKeyboardBuilder()
-    b.button(text="⚠️ بله، IPv4 جدید اضافه کن", callback_data=f"v4add_ok:{acc_id}:{srv_id}")
-    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
-    b.adjust(1)
-    await cb.message.edit_text(
-        "⚠️ <b>افزودن IPv4 جدید</b>\n\n"
-        f"برای <b>{html.escape(str(server['label']))}</b> یک IPv4 عمومی دیگر می‌سازد و سرور را ریبوت می‌کند.\n"
-        "آی‌پی اصلی Vultr جایگزین نمی‌شود؛ آی‌پی جدید به سرور اضافه خواهد شد.",
-        reply_markup=b.as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("v4add_ok:"))
-async def vultr_add_ipv4(cb: CallbackQuery):
-    _, acc_id, srv_id = cb.data.split(":")
-    await cb.message.edit_text("⏳ در حال ساخت IPv4 و ریبوت سرور…")
-    try:
-        acc, _ = await _vultr_action_context(acc_id, srv_id)
-        result = await providers.Provider(acc).add_vultr_ipv4(srv_id)
-    except Exception as e:
-        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
-        await cb.answer()
-        return
-    await cb.message.edit_text(
-        f"✅ IPv4 جدید درخواست شد: <code>{html.escape(str(_vultr_ip_value(result)))}</code>\n\n"
-        "Vultr سرور را ریبوت می‌کند؛ چند دقیقه بعد از فهرست سرورها وضعیت را بررسی کن.",
-        reply_markup=InlineKeyboardBuilder().button(
-            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("float:"))
-async def vultr_floating_ip_prompt(cb: CallbackQuery):
-    _, acc_id, srv_id = cb.data.split(":")
-    try:
-        _, server = await _vultr_action_context(acc_id, srv_id)
-    except Exception as e:
-        await cb.answer(str(e)[:180], show_alert=True)
-        return
-    b = InlineKeyboardBuilder()
-    b.button(text="⚠️ بله، Floating IP بساز", callback_data=f"float_ok:{acc_id}:{srv_id}")
-    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
-    b.adjust(1)
-    await cb.message.edit_text(
-        "⚠️ <b>افزودن Floating IP</b>\n\n"
-        f"یک Reserved IPv4 جدید در منطقهٔ <b>{html.escape(providers.location_text(acc['provider'], server.get('region'), server.get('country')))}</b> می‌سازد و به این سرور وصل می‌کند.\n"
-        "این IP جداگانه قابل جابه‌جایی بین سرورهای همان منطقه است و ممکن است هزینهٔ Vultr داشته باشد.",
-        reply_markup=b.as_markup())
-    await cb.answer()
-
-
-@dp.callback_query(F.data.startswith("float_ok:"))
-async def vultr_floating_ip(cb: CallbackQuery):
-    _, acc_id, srv_id = cb.data.split(":")
-    await cb.message.edit_text("⏳ در حال ساخت و اتصال Floating IP…")
-    try:
-        acc, server = await _vultr_action_context(acc_id, srv_id)
-        reserved = await providers.Provider(acc).create_and_attach_vultr_floating_ip(
-            srv_id, server["region"], f"cloudbot-{server['label'] or srv_id[:8]}")
-    except Exception as e:
-        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
-        await cb.answer()
-        return
-    await cb.message.edit_text(
-        f"✅ Floating IP ساخته و متصل شد: <code>{html.escape(str(_vultr_ip_value(reserved)))}</code>\n"
-        f"شناسه: <code>{html.escape(str(reserved.get('id', '—')))}</code>",
-        reply_markup=InlineKeyboardBuilder().button(
-            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
     await cb.answer()
 
 
@@ -886,10 +657,7 @@ async def pick_region(cb: CallbackQuery, state: FSMContext):
     region = cb.data.split(":", 1)[1]
     data = await state.get_data()
     acc = st.account(data["acc_id"])
-    region_label = next((item[1] for item in data.get("regions", [])
-                         if item[0] == region),
-                        providers.location_text(acc["provider"], region))
-    await state.update_data(region=region, region_label=region_label)
+    await state.update_data(region=region)
     await cb.message.edit_text("در حال گرفتن پلن‌ها…")
     try:
         plans = await providers.Provider(acc).plans(region)
@@ -898,9 +666,7 @@ async def pick_region(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     await state.update_data(plans=plans)
-    await cb.message.edit_text(
-        f"🌍 {html.escape(region_label)}\n"
-        "🔢 پلن را انتخاب کن:",
+    await cb.message.edit_text(f"🌍 {region}\n🔢 پلن را انتخاب کن:",
                                reply_markup=_paged_kb(plans, "plan", f"acc:{data['acc_id']}"))
     await cb.answer()
 
@@ -969,8 +735,6 @@ async def do_create(msg: Message, state: FSMContext):
     # hand it back through the API a second time.
     st.set_server_pass(acc["id"], srv["id"], srv["root_password"])
     ip = srv.get("ip") or "(در حال تخصیص — چند لحظه بعد در لیست سرورها می‌آید)"
-    region_label = data.get("region_label") or providers.location_text(
-        acc["provider"], srv.get("region"), srv.get("country"))
     b = InlineKeyboardBuilder()
     if srv.get("ip"):
         b.button(text="🔌 نود کردن در پنل", callback_data=f"node:{acc['id']}:{srv['id']}")
@@ -980,7 +744,7 @@ async def do_create(msg: Message, state: FSMContext):
         f"✅ <b>سرور ساخته شد</b>\n\n"
         f"🏷 نام: <code>{html.escape(str(srv['label']))}</code>\n"
         f"📡 آی‌پی: <code>{ip}</code>\n"
-        f"🌍 منطقه: <b>{html.escape(region_label)}</b>\n"
+        f"🌍 منطقه: <code>{srv.get('region')}</code>\n"
         f"🔢 پلن: <code>{srv.get('plan')}</code>\n"
         f"👤 یوزر: <code>root</code>\n"
         f"🔑 رمز: <code>{html.escape(srv['root_password'])}</code>\n\n"
@@ -1028,7 +792,7 @@ async def node_it(cb: CallbackQuery):
         await logline("افزودن نود به پنل روی هستهٔ SNI-SCAN…")
         node = await panel.add_node(
             name=str(s.get("label") or ip), address=ip,
-            server_ca=server_ca, api_key=api_key, core_config_id=core_id())
+            server_ca=server_ca, api_key=api_key, core_config_id=SNI_CORE_ID)
         await logline(f"✅ <b>نود اضافه شد</b> (id={node.get('id')}). "
                       f"چند لحظه بعد در پنل سبز می‌شود.")
     except Exception as e:
@@ -1188,7 +952,7 @@ async def cf_create_do(cb: CallbackQuery, state: FSMContext):
 async def cf_chg(cb: CallbackQuery, state: FSMContext):
     await state.set_state(CF.change_sub)
     await cb.message.edit_text(
-        "ساب‌دامین کامل را بفرست (مثلاً <code>node1.example.com</code>):")
+        "ساب‌دامین کامل را بفرست (مثلاً <code>node1.rjwarehousing.ir</code>):")
     await cb.answer()
 
 
@@ -1574,7 +1338,7 @@ async def nodeit_do(msg: Message, state: FSMContext):
         await logline("افزودن نود به پنل روی هستهٔ SNI-SCAN…")
         node = await panel.add_node(name=s["host"], address=s["host"],
                                     server_ca=server_ca, api_key=api_key,
-                                    core_config_id=core_id())
+                                    core_config_id=SNI_CORE_ID)
         await logline(f"✅ <b>نود اضافه شد</b> (id={node.get('id')}). "
                       f"چند لحظه بعد در پنل سبز می‌شود.")
     except Exception as e:
@@ -1611,6 +1375,7 @@ def kb_scan(cfg):
     b.button(text="▶️ اسکن الان", callback_data="scan_now")
     b.button(text="📊 وضعیت", callback_data="scan_status")
     b.button(text="📋 آی‌پی‌های پیدا شده", callback_data="scan_found")
+    b.button(text="📱 تأیید با گوشی‌ها", callback_data="scan_verified")
     b.button(text="🔙 بازگشت", callback_data="home")
     b.adjust(2, 2, 2, 1, 1)
     return b.as_markup()
@@ -1620,13 +1385,23 @@ def _scan_summary(cfg):
     ssh = cfg.get("ssh") or {}
     dom = cfg.get("fqdn") or "—"
     iv = cfg.get("interval_hours")
+    pool = st.scan_pool()
+    started = pool.get("started") or 0
+    age_h = (time.time() - started) / 3600 if started else 0
+    left = max(0, (iv or 6) - age_h)
     return (
         "🔎 <b>اسکنر آی‌پی تمیز کلادفلر</b>\n\n"
         f"🖥 سرور اسکن: <code>{ssh.get('host','—')}</code>\n"
         f"🌐 دامنهٔ مقصد: <code>{html.escape(str(dom))}</code>\n"
-        f"⏱ هر: <b>{str(iv)+' ساعت' if iv else 'دستی'}</b>\n"
+        f"🔄 اسکن پیوسته: هر <b>{SCAN_GAP_MINUTES}</b> دقیقه "
+        f"<b>{SCAN_SAMPLE}</b> آدرس\n"
+        f"📦 پنجرهٔ جاری: <b>{len(pool.get('ips') or {})}</b> آدرس در "
+        f"<b>{pool.get('passes') or 0}</b> پاس — "
+        f"{'داوری تا %.1f ساعت دیگر' % left if started else 'شروع نشده'}\n"
+        f"📱 برترین‌ها به گوشی‌ها: <b>{PHONE_SHORTLIST}</b> تا، هر "
+        f"<b>{str(iv)+' ساعت' if iv else 'دستی'}</b>\n"
         f"♻️ اعمال خودکار: <b>{'روشن' if cfg.get('auto_apply') else 'خاموش'}</b>\n"
-        f"⭐️ بهترین فعلی: <code>{cfg.get('last_best_ip') or '—'}</code>")
+        f"⭐️ انتخاب فعلی: <code>{cfg.get('last_best_ip') or '—'}</code>")
 
 
 @dp.callback_query(F.data == "scan")
@@ -1800,48 +1575,177 @@ async def _apply_ip(fqdn, ip):
         await cf.create_a(zone[0], fqdn, ip, proxied=False)
 
 
-async def _do_scan(log, *, apply_if_better):
-    """Run one scan; return (best, applied, message)."""
+async def _scan_pass(log):
+    """
+    One pass of the continuous scan. Its results go into the window's pool.
+
+    The download stage is skipped here. It is the entire bandwidth cost of a
+    scan, and paying it on every pass around the clock would be absurd when the
+    only addresses whose throughput matters are the handful that reach the end
+    of a window. Latency, jitter and loss - which is what decides a proxy - cost
+    almost nothing to measure.
+    """
     cfg = st.cfscan()
     ssh = cfg.get("ssh")
     if not ssh:
-        raise RuntimeError("سرور اسکن تنظیم نشده")
-    results, tail = await cfscanner.run_scan(ssh, st.jump(), log)
-    if not results:
-        raise RuntimeError("اسکن نتیجه‌ای نداشت")
-    best = results[0]
-    prev = cfg.get("last_best")
-    better = cfscanner.is_better(best, cfg.get("last_best_ip"), prev)
-    st.update_cfscan(last_scan_ts=int(time.time()), last_best_ip=best["ip"], last_best=best)
+        return 0
+    results, _tail = await cfscanner.run_scan(
+        ssh, st.jump(), log, limit=SCAN_SAMPLE,
+        final=PHONE_SHORTLIST, no_speed=True)
+    st.pool_add(results)
+    return len(results)
 
-    applied = False
+
+MAX_RESHORTLIST = 4       # fresh shortlists per window before giving the pool a rest
+
+
+async def _reshortlist(log):
+    """
+    Hand the phones a different fifty, now, without waiting for the window.
+
+    When every address on a shortlist comes back unreachable from a handset
+    whose own connection was proven working, the shortlist is the problem: the
+    operator is filtering exactly the addresses the relay likes best. Waiting
+    six hours to try again would leave customers on that operator broken for
+    six hours. The pool usually holds far more than the fifty that were handed
+    out, so the next best untried batch goes out immediately and the phones are
+    asked to measure it.
+
+    Bounded, because a night when the operator blocks everything would
+    otherwise burn the whole pool in minutes and learn nothing new.
+    """
+    cand = st.scan_candidates()
+    tried = set(cand.get("tried") or []) | set(cand.get("ips") or [])
+    rounds = int(cand.get("reshortlists") or 0)
+    if rounds >= MAX_RESHORTLIST:
+        await log("سقف لیست‌های جایگزین این پنجره پر شد")
+        # Worth saying out loud once, and only once per window. Having tried
+        # several hundred addresses and had every one refused on both operators
+        # while the relay saw nothing wrong, the conclusion is no longer about
+        # which address to pick - it is that this transport is being filtered,
+        # and no address will fix it.
+        if not st.get(f"blocked_alert_{cand.get('ts')}"):
+            st.set(f"blocked_alert_{cand.get('ts')}", 1)
+            try:
+                await bot.send_message(
+                    OWNER,
+                    f"⛔️ <b>هیچ آدرسی روی موبایل کار نمی‌کند</b>\n\n"
+                    f"{len(tried)} آدرس در {MAX_RESHORTLIST} لیست پیاپی امتحان شد. "
+                    f"روی هر دو اپراتور پورت باز می‌شود و TLS قطع می‌شود، در حالی که "
+                    f"اینترنت خود گوشی‌ها سالم است و سرور ایران روی همان آدرس‌ها "
+                    f"پکت‌لاس صفر می‌بیند.\n\n"
+                    f"<b>این با عوض کردن آی‌پی حل نمی‌شود.</b> چیزی که فیلتر می‌شود "
+                    f"خودِ مسیر است، نه آدرس خاص. تانل‌های خودت مسیر دیگری دارند و "
+                    f"سالم‌اند.\n\n"
+                    f"<i>تا پنجرهٔ بعدی دیگر پیام نمی‌دهم.</i>")
+            except Exception:
+                log.exception("blocked alert failed")
+        return False
+
+    blocked = st.blocked_ips()
+    pool = st.scan_pool().get("ips") or {}
+    fresh = [dict(m, ip=ip) for ip, m in pool.items()
+             if ip not in tried and ip not in blocked]
+    if len(fresh) < 5:
+        await log("آدرس نیازمودهٔ کافی در استخر نیست")
+        return False
+    fresh.sort(key=cfscanner.score)
+    batch = fresh[:PHONE_SHORTLIST]
+
+    st.set_scan_candidates(batch, _control_ips(), keep=PHONE_SHORTLIST)
+    st.set_candidate_meta(tried=sorted(tried | {e["ip"] for e in batch}),
+                          reshortlists=rounds + 1)
+    await log(f"لیست جایگزین #{rounds + 1}: {len(batch)} آدرس تازه به گوشی‌ها داده شد")
+    try:
+        await bot.send_message(
+            OWNER,
+            f"🚫 <b>اپراتور کل لیست را بسته بود</b>\n\n"
+            f"گوشی هیچ‌کدام از {len(cand.get('ips') or [])} آدرس را نتوانست باز کند "
+            f"(پورت باز می‌شد، TLS قطع می‌شد) در حالی که اینترنت خودش سالم بود.\n\n"
+            f"<i>اگر دور بعد هم همین شد، مسئله نام دامنه است نه آی‌پی.</i>\n\n"
+            f"📋 {len(batch)} آدرس تازه فرستادم و از گوشی‌ها خواستم دوباره بسنجند "
+            f"(تلاش {rounds + 1} از {MAX_RESHORTLIST}).")
+    except Exception:
+        log.exception("reshortlist alert failed")
+    return True
+
+
+async def _close_window(log, *, apply_if_better):
+    """
+    Six hours of scanning are over: pick the best, prove them, hand them on.
+
+    The pool holds whatever the passes turned up. Its best are re-measured once
+    here as a fixed list - this time with the download stage - because they were
+    each seen at a different moment and a single comparable measurement is what
+    a ranking needs. Then they go to the phones, and the choice is made from
+    whatever the phones have to say about them.
+    """
+    cfg = st.cfscan()
+    pool = st.scan_pool()
+    blocked = st.blocked_ips()
+    entries = [dict(m, ip=ip) for ip, m in (pool.get("ips") or {}).items()
+               if ip not in blocked]
+    if not entries:
+        # Everything the window found is on the blocked list; better to hand out
+        # the best of a bad set than nothing at all, and let the phones re-judge.
+        entries = [dict(m, ip=ip) for ip, m in (pool.get("ips") or {}).items()]
+    if not entries:
+        raise RuntimeError("استخر اسکن خالی است")
+    entries.sort(key=cfscanner.score)
+    top = [e["ip"] for e in entries[:PHONE_SHORTLIST]]
+    await log(f"پایان پنجره: {len(entries)} آدرس در {pool.get('passes')} پاس — "
+              f"{len(top)} تای برتر دوباره سنجیده می‌شوند")
+
+    ssh = cfg.get("ssh")
+    results, _tail = await cfscanner.run_scan(ssh, st.jump(), log, only=top,
+                                              final=PHONE_SHORTLIST)
+    if not results:
+        # The re-check found nothing alive; the pool's own numbers still stand.
+        results = entries[:PHONE_SHORTLIST]
+    results.sort(key=cfscanner.score)
+
+    # Refreshed once a window: cheap, and it cannot go stale between windows.
+    sni = await _refresh_probe_sni()
+    if sni:
+        await log(f"نام دست‌دادن مشتری‌ها: {sni}")
+
+    shortlist = results[:PHONE_SHORTLIST]
+    st.set_scan_candidates(shortlist, _control_ips(), keep=PHONE_SHORTLIST)
+    st.set_candidate_meta(tried=[e["ip"] for e in shortlist], reshortlists=0)
+    st.pool_reset()
+
     fqdn = cfg.get("fqdn")
-    if apply_if_better and fqdn and st.cf_token():
-        # Decide against what is ACTUALLY on the domain, not against the last
-        # scan's best - otherwise a stale or manually-set record never gets
-        # corrected. Replace the record when its IP has dropped out of the
-        # clean set entirely, or when the best beats it by a real margin;
-        # leave it alone when it is still fine, to avoid hourly flip-flopping.
+    live_ip = None
+    cf = rec = zone = None
+    if fqdn and st.cf_token():
         try:
             cf = Cloudflare(st.cf_token())
             zone = await cf.zone_for(fqdn)
             rec = await cf.find_a_record(zone[0], fqdn) if zone else None
-            cur_ip = rec["content"] if rec else None
-            cur_metrics = next((r for r in results if r["ip"] == cur_ip), None)
-            if cur_ip != best["ip"] and (
-                cur_ip is None or cur_metrics is None
-                or cfscanner.is_better(best, cur_ip, cur_metrics)
-            ):
-                if rec:
-                    await cf.update_a(zone[0], rec, best["ip"])
-                else:
-                    await cf.create_a(zone[0], fqdn, best["ip"], proxied=False)
-                applied = True
+            live_ip = rec["content"] if rec else None
         except Exception as e:
-            await log(f"⚠️ اعمال روی دامنه خطا داد: {html.escape(str(e)[:150])}")
-    if better or applied:
-        st.add_found_ip({**best, "applied": applied})
-    return best, better, applied
+            await log(f"⚠️ خواندن رکورد دامنه خطا داد: {html.escape(str(e)[:150])}")
+
+    # A list published this second has been measured by no phone, and the
+    # domain moves only on a round both phones completed on this list, with the
+    # relay confirming the address beats the live one. So publishing never moves
+    # the domain; phone_recheck does, once both reports are in.
+    st.set("awaiting_phones", 0)
+    keep = (next((r for r in shortlist if r["ip"] == live_ip), None)
+            or ({"ip": live_ip} if live_ip else None))
+    fields = {"last_scan_ts": int(time.time())}
+    if keep:
+        fields.update(last_best_ip=keep["ip"], last_best=keep)
+    st.update_cfscan(**fields)
+    await log("لیست تازه منتشر شد؛ دامنه فقط با تأیید هر دو گوشی و برتری در تست سرور "
+              f"عوض می‌شود. آدرس فعلی: {live_ip or '—'}")
+    return (keep or shortlist[0]), False, False, "منتظر سنجش هر دو گوشی"
+
+
+# Kept for the "scan now" button: close the window early, on demand.
+async def _do_scan(log, *, apply_if_better):
+    await _scan_pass(log)
+    return await _close_window(log, apply_if_better=apply_if_better)
 
 
 @dp.callback_query(F.data == "scan_now")
@@ -1862,8 +1766,10 @@ async def scan_now(cb: CallbackQuery):
             pass
 
     try:
-        best, better, applied = await _do_scan(logline, apply_if_better=cfg.get("auto_apply"))
-        tag = ("🎉 بهتر از قبلی" if better else "بدون بهبود نسبت به فعلی")
+        best, better, applied, why = await _do_scan(
+            logline, apply_if_better=cfg.get("auto_apply"))
+        tag = ("🎉 عوض شد" if better else "همان قبلی")
+        src = html.escape(why)
         extra = ""
         if not applied and cfg.get("fqdn"):
             extra = "\n\nبرای گذاشتنش پشت دامنه از دکمهٔ زیر، یا «اعمال خودکار» را روشن کن."
@@ -1874,7 +1780,7 @@ async def scan_now(cb: CallbackQuery):
         b.adjust(1)
         await status.edit_text(
             f"✅ <b>اسکن تمام شد</b> — {tag}\n\n"
-            f"⭐️ بهترین: <code>{best['ip']}</code>\n{_fmt_metrics(best)}"
+            f"⭐️ بهترین: <code>{best['ip']}</code> — {src}\n{_fmt_metrics(best)}"
             + (f"\n✅ روی <code>{cfg['fqdn']}</code> اعمال شد" if applied else "") + extra,
             reply_markup=b.as_markup())
     except Exception as e:
@@ -1900,35 +1806,170 @@ async def scan_apply_last(cb: CallbackQuery):
         await cb.message.edit_text(f"❌ {html.escape(str(e)[:200])}", reply_markup=kb_scan(cfg))
 
 
-async def scan_scheduler():
-    """Run the scan on the configured interval and alert on a better IP."""
-    await asyncio.sleep(20)
+async def phone_recheck():
+    """
+    Re-run the choice when the phones have something new to say.
+
+    The scan sets the shortlist every six hours; the phones answer whenever
+    they get round to it. Deciding only at scan time would leave a report
+    unused for most of a cycle, and the phones are the half of this that speaks
+    for the customers. The relay's numbers from the last scan are reused - they
+    describe the very addresses in question, and rescanning on every report
+    would cost far more than it is worth.
+    """
+    await asyncio.sleep(90)
     while True:
+        await asyncio.sleep(120)
         try:
             cfg = st.cfscan()
-            iv = cfg.get("interval_hours")
-            if iv and cfg.get("ssh"):
-                due = (time.time() - (cfg.get("last_scan_ts") or 0)) >= iv * 3600
-                if due:
-                    async def qlog(t):
-                        log.info("scan: %s", t)
-                    best, better, applied = await _do_scan(qlog, apply_if_better=cfg.get("auto_apply"))
-                    if better or applied:
-                        head = ("🎉 <b>آی‌پی تمیزتر پیدا شد</b>" if better
-                                else "🔄 <b>آی‌پی دامنه به‌روزرسانی شد</b>")
-                        msg = f"{head}\n\n⭐️ <code>{best['ip']}</code>\n{_fmt_metrics(best)}"
-                        if applied and cfg.get("fqdn"):
-                            msg += f"\n\n✅ روی <code>{cfg['fqdn']}</code> اعمال شد."
-                        elif cfg.get("fqdn"):
-                            msg += (f"\n\nبرای گذاشتنش پشت <code>{cfg['fqdn']}</code> "
-                                    f"«اعمال خودکار» را روشن کن.")
-                        try:
-                            await bot.send_message(OWNER, msg)
-                        except Exception:
-                            log.exception("scan alert delivery failed")
+            cand = st.scan_candidates()
+            if time.time() - (cand.get("ts") or 0) > 12 * 3600:
+                continue                      # too old to act on
+            metrics = cand.get("metrics") or {}
+            results = [dict(metrics[ip], ip=ip) for ip in cand.get("ips", [])
+                       if metrics.get(ip, {}).get("rtt")]
+            if not results:
+                continue
+            results.sort(key=cfscanner.score)
+
+            fqdn = cfg.get("fqdn")
+            if not (fqdn and st.cf_token()):
+                continue
+            cf = Cloudflare(st.cf_token())
+            zone = await cf.zone_for(fqdn)
+            rec = await cf.find_a_record(zone[0], fqdn) if zone else None
+            live_ip = rec["content"] if rec else None
+
+            blocked_now = _record_blocked()
+            on_list = {r["ip"] for r in results}
+
+            # If any phone got through to anything here, the list is doing its
+            # job and `choose` has something to work with; replacing it would
+            # throw away the one thing we were looking for.
+            usable = any(
+                x.get("ok") and x.get("ip") in on_list
+                for r in _fresh_reports().values()
+                for x in (r.get("results") or []))
+
+            # Otherwise, wait until every phone that is online has finished with
+            # this list. A round can take a quarter of an hour, so replacing the
+            # list the moment the first phone rejects it threw away the second
+            # phone's work - and two phones that never measure the same list can
+            # never agree on anything, which is the whole point of having two.
+            # A phone that is offline is not waited for.
+            pending = []
+            if not usable:
+                for d, _i in _phone_status()[0]:
+                    seen = {x["ip"] for x in
+                            ((st.device_reports().get(d) or {}).get("results") or [])}
+                    if not (seen & on_list):
+                        pending.append(d)
+                if pending:
+                    log.info("waiting for %s to finish this list", ", ".join(pending))
+
+            if not usable and not pending and on_list and on_list <= blocked_now:
+                # Every address here was refused by a phone that was working.
+                async def rlog(t):
+                    log.info("reshortlist: %s", t)
+                if await _reshortlist(rlog):
+                    continue
+
+            d = await decide(results, live_ip, cand)
+            if d["why"] != st.get("scan_last_decision"):
+                st.set("scan_last_decision", d["why"])
+                log.info("scan decision (live %s, %d phones): %s",
+                         live_ip, d["voters"], d["why"])
+            await _warn_silent_phones(cand, d)
+            if not d["change"]:
+                if d["entry"]:
+                    st.update_cfscan(last_best_ip=d["entry"]["ip"], last_best=d["entry"])
+                continue
+
+            chosen, why = d["entry"], d["why"]
+            st.update_cfscan(last_best_ip=chosen["ip"], last_best=chosen)
+            applied = False
+            if cfg.get("auto_apply"):
+                if rec:
+                    await cf.update_a(zone[0], rec, chosen["ip"])
+                else:
+                    await cf.create_a(zone[0], fqdn, chosen["ip"], proxied=False)
+                applied = True
+                st.add_found_ip({**chosen, "applied": True, "by_phone": True,
+                                 "phones": d["voters"]})
+            elif st.get("scan_suggested") == "%s|%s" % (cand.get("ts"), chosen["ip"]):
+                continue          # already told the owner about this one
+            else:
+                st.set("scan_suggested", "%s|%s" % (cand.get("ts"), chosen["ip"]))
+
+            msg = (f"🔄 <b>آی‌پی دامنه عوض شد</b>\n\n"
+                   f"از <code>{live_ip or '—'}</code> به <code>{chosen['ip']}</code>\n"
+                   f"{why}\n{_fmt_metrics(chosen)}")
+            if not applied:
+                msg = msg.replace("عوض شد", "آمادهٔ تعویض است", 1)
+                msg += "\n\n<i>اعمال خودکار خاموش است؛ روی دامنه گذاشته نشد.</i>"
+            try:
+                await bot.send_message(OWNER, msg)
+            except Exception:
+                log.exception("recheck alert delivery failed")
+        except Exception:
+            log.exception("phone recheck pass failed")
+
+
+async def scan_scheduler():
+    """
+    Scan continuously; every `interval_hours`, judge what the window found.
+
+    The relay is idle almost all the time and its whole job is finding clean
+    addresses, so it scans around the clock rather than once a cycle: six hours
+    of passes see far more of the Cloudflare space than one pass ever could, and
+    a good address that only appears at 3am is no longer missed. The window is
+    what makes that useful - the phones cannot be asked about a list that
+    changes every ten minutes, so the results accumulate and are judged
+    together.
+    """
+    await asyncio.sleep(20)
+    while True:
+        gap = SCAN_GAP_MINUTES * 60
+        try:
+            cfg = st.cfscan()
+            if not cfg.get("ssh"):
+                await asyncio.sleep(gap)
+                continue
+
+            async def qlog(t):
+                log.info("scan: %s", t)
+
+            pool = st.scan_pool()
+            iv = cfg.get("interval_hours") or 6
+            started = pool.get("started") or 0
+            if not started:
+                st.pool_reset()
+                started = time.time()
+
+            found = await _scan_pass(qlog)
+            log.info("scan pass: %d addresses into the pool (%d in window)",
+                     found, len(st.scan_pool().get("ips") or {}))
+
+            if time.time() - started >= iv * 3600:
+                best, changed, applied, why = await _close_window(
+                    qlog, apply_if_better=cfg.get("auto_apply"))
+                if changed or applied:
+                    head = ("🎉 <b>آی‌پی انتخابی عوض شد</b>" if changed
+                            else "🔄 <b>آی‌پی دامنه به‌روزرسانی شد</b>")
+                    msg = (f"{head}\n\n⭐️ <code>{best['ip']}</code> — "
+                           f"{html.escape(why)}\n{_fmt_metrics(best)}")
+                    if applied and cfg.get("fqdn"):
+                        msg += f"\n\n✅ روی <code>{cfg['fqdn']}</code> اعمال شد."
+                    elif cfg.get("fqdn"):
+                        msg += (f"\n\nبرای گذاشتنش پشت <code>{cfg['fqdn']}</code> "
+                                f"«اعمال خودکار» را روشن کن.")
+                    try:
+                        await bot.send_message(OWNER, msg)
+                    except Exception:
+                        log.exception("scan alert delivery failed")
         except Exception:
             log.exception("scan scheduler pass failed")
-        await asyncio.sleep(300)
+        await asyncio.sleep(gap)
 
 
 # ==========================================================================
@@ -2169,8 +2210,8 @@ async def wd_add(cb: CallbackQuery, state: FSMContext):
         "آدرس کانفیگ را به این شکل بفرست:\n"
         "<code>نام | هاست | پورت | tls</code>\n\n"
         "مثال‌ها:\n"
-        "<code>سرور اول | node1.example.com | 443 | tls</code>\n"
-        "<code>اوپن‌وی‌پی‌ان | 203.0.113.10 | 1194 | notls</code>\n\n"
+        "<code>ترکیه وی‌لس | tr.example.com | 443 | tls</code>\n"
+        "<code>اوپن‌وی‌پی‌ان | 91.108.145.140 | 1194 | notls</code>\n\n"
         "اگر هاست یک دامنهٔ پشت کلادفلر است و می‌خواهی موقع خرابی خودم آی‌پی "
         "تمیز تازه پشتش بگذارم، آخرش <code>| heal</code> اضافه کن:\n"
         "<code>سی‌دی‌ان | cdn.example.com | 443 | tls | heal</code>\n\n"
@@ -2400,6 +2441,95 @@ async def _repair_tunnel(target, log_fn):
         raise RuntimeError("تانلی برای این کانفیگ ثبت نشده")
 
     acc, fsrv, _ = await tunnelwatch.foreign_account(st, rec)
+    if acc and fsrv:
+        _remember_foreign(rec, acc, fsrv)
+    if acc is None:
+        # The foreign server could not be placed in any account. That is either
+        # a server deleted by hand - which the rebuild below handles - or an
+        # account we were refused, in which case rebuilding is impossible: we
+        # can neither inspect the machine nor create its replacement. Rebuilding
+        # anyway wipes the Iran side first, so the config goes down again on
+        # every pass and never comes back. Say what is broken instead.
+        blocked = await tunnelwatch.unreadable_accounts(st)
+        # Only an account that answered and refused us is a reason to rebuild
+        # elsewhere. One that simply failed to answer gets another pass.
+        dead = [b for b in blocked if b[2]]
+        flaky = [b for b in blocked if not b[2]]
+        if flaky and not dead:
+            note = ("⏳ اکانت‌هایی موقتاً جواب ندادند: "
+                    + "، ".join(html.escape(str(a.get("label"))) for a, _r, _h in flaky)
+                    + "\nاین معمولاً از پراکسی است و خودش برطرف می‌شود. "
+                      "تعمیر به پاس بعدی موکول شد.")
+            # No hold is set here: holds are keyed by watch-target id, and the
+            # watchdog already applies one when a repair comes back incomplete.
+            await log_fn(note)
+            return {"banned": False, "note": note, "account": None,
+                    "results": [{"iran": rec.get("iran_host"),
+                                 "old_foreign": rec.get("foreign_host"),
+                                 "ok": False, "how": "اکانت موقتاً جواب نداد"}]}
+        blocked = dead
+        if blocked:
+            names = "، ".join(html.escape(str(a.get("label"))) for a, _r, _h in blocked)
+            # An account we cannot read is an account we cannot use, which is
+            # the same predicament as a banned one - so take the same way out:
+            # rebuild the endpoint on a sibling account. What that needs is the
+            # dead endpoint's provider, region and size, which is why they are
+            # written down on every healthy pass.
+            mem = _recall_foreign(rec)
+            if mem is None and len(blocked) == 1:
+                # Never written down, but only one account is dark, so that is
+                # where it was. Borrow a working peer's region on that provider.
+                only = blocked[0][0]
+                peer = _peer_foreign_template(only.get("provider"),
+                                             rec.get("foreign_host"))
+                if peer:
+                    mem = dict(peer, account_id=only.get("id"),
+                               account_label=only.get("label"),
+                               provider=only.get("provider"))
+            if mem:
+                await log_fn(
+                    f"⛔️ اکانت «{html.escape(str(mem.get('account_label') or names))}» "
+                    "از دسترس خارج است — سرور خارج روی یک اکانت دیگر ساخته می‌شود.")
+                acc = {"id": mem.get("account_id"), "provider": mem.get("provider"),
+                       "label": mem.get("account_label") or "?"}
+                # Name the replacement after the tunnel it serves, not after
+                # whichever peer's shape was borrowed - two servers built from
+                # the same template would otherwise fight over one name, and
+                # the panel rejects duplicates.
+                own = st.get("tunfor_" + str(rec.get("iran_host") or ""))
+                label = mem.get("label") if own else (
+                    "tun-" + str(rec.get("iran_host") or "x").replace(".", "-"))
+                fsrv = {"id": None, "ip": rec.get("foreign_host"),
+                        "label": label, "region": mem.get("region"),
+                        "plan": mem.get("plan")}
+                banned, servers = True, []
+                affected = [rec]
+                note = (f"🚫 <b>اکانت «{html.escape(str(acc['label']))}» از دسترس "
+                        "خارج شده</b> — تانل روی اکانت دیگری بازسازی می‌شود.")
+                await log_fn(note)
+                results = []
+                for rec_i in affected:
+                    try:
+                        ok, how = await _repair_one_tunnel(
+                            rec_i, acc, fsrv, banned, jump, log_fn)
+                    except Exception as e:
+                        ok, how = False, f"خطا: {type(e).__name__}: {str(e)[:140]}"
+                    results.append({"iran": rec_i.get("iran_host"),
+                                    "old_foreign": rec_i.get("foreign_host"),
+                                    "ok": ok, "how": how})
+                return {"banned": True, "note": note, "results": results,
+                        "account": acc["label"]}
+            note = (f"⛔️ <b>سرور خارج این تانل پیدا نشد و {len(blocked)} اکانت "
+                    f"قابل خواندن نیست: {names}</b>\n"
+                    f"<code>{html.escape(str(blocked[0][1]))}</code>\n\n"
+                    "هیچ سابقه‌ای هم از منطقه و پلن این سرور نیست، پس جای "
+                    "جایگزین معلوم نیست. تعمیر متوقف شد تا سمت ایران بی‌خود پاک نشود.")
+            await log_fn(note)
+            return {"banned": False, "note": note, "account": None,
+                    "results": [{"iran": rec.get("iran_host"),
+                                 "old_foreign": rec.get("foreign_host"),
+                                 "ok": False,
+                                 "how": "اکانت سرور خارج قابل دسترسی نیست"}]}
     banned, servers = (False, [])
     if acc:
         banned, servers = await tunnelwatch.account_is_banned(st, acc)
@@ -2425,6 +2555,28 @@ async def _repair_tunnel(target, log_fn):
             "account": (acc or {}).get("label")}
 
 
+async def _try_rebuild(rec, log_fn, **kw):
+    """
+    One rung of the ladder, with its failure kept local.
+
+    A rung that raises is a rung that failed, not a reason to abandon the
+    ladder - the later rungs exist precisely because the earlier ones break.
+    Letting the exception out meant the ladder was abandoned at rung one and
+    the watchdog simply began again from rung one on its next pass, every few
+    minutes, wiping the Iran side each time and never reaching the remedies
+    that would have worked.
+    """
+    try:
+        return await tunnelwatch.rebuild(st, rec, log=log_fn, **kw)
+    except Exception as e:
+        # A timeout stringifies to nothing at all, so the bare message produced
+        # a warning with no content - the one failure mode that most needed
+        # naming. The type is always there even when the text is not.
+        detail = str(e)[:180] or "بدون پیام"
+        await log_fn(f"⚠️ {html.escape(type(e).__name__)}: {html.escape(detail)}")
+        return False, None
+
+
 async def _repair_one_tunnel(rec, acc, fsrv, banned, jump, log_fn):
     """The retry ladder for a single tunnel. Returns (ok, description)."""
     kind = rec["kind"]
@@ -2435,13 +2587,13 @@ async def _repair_one_tunnel(rec, acc, fsrv, banned, jump, log_fn):
     # for a new server.
     if not banned:
         await log_fn(f"تلاش ۱: برپاسازی دوبارهٔ {kind} روی همان سرور")
-        ok, _tid = await tunnelwatch.rebuild(st, rec, jump=jump, log=log_fn)
+        ok, _tid = await _try_rebuild(rec, log_fn, jump=jump)
         if ok:
             return True, f"{kind} دوباره برپا شد"
         rec = st.tunnel(rec["id"]) or rec
 
         await log_fn(f"تلاش ۲: تعویض نوع تانل به {other}")
-        ok, tid = await tunnelwatch.rebuild(st, rec, kind=other, jump=jump, log=log_fn)
+        ok, tid = await _try_rebuild(rec, log_fn, kind=other, jump=jump)
         if ok:
             return True, f"نوع تانل به {other} عوض شد"
         rec = st.tunnel(tid or rec["id"]) or rec
@@ -2479,16 +2631,40 @@ async def _repair_one_tunnel(rec, acc, fsrv, banned, jump, log_fn):
     if not target_acc or not fsrv:
         return False, "سرور خارجی این تانل در هیچ اکانتی پیدا نشد"
 
+    old_ip = (fsrv or {}).get("ip") or rec.get("foreign_host")
     for attempt in (1, 2):
         await log_fn(f"ساخت سرور خارجی تازه (تلاش {attempt}/2)…")
-        foreign, srv = await tunnelwatch.new_foreign_server(
-            st, target_acc, fsrv, log_fn)
+        try:
+            foreign, srv = await tunnelwatch.new_foreign_server(
+                st, target_acc, fsrv, log_fn)
+        except Exception as e:
+            await log_fn(f"⚠️ سرور نو ساخته نشد: {html.escape(type(e).__name__)}: "
+                         f"{html.escape(str(e)[:140])}")
+            continue
+
+        # A tunnel only carries traffic to the far end - it serves nothing
+        # itself. A fresh server is a bare OS, so without the node software and
+        # its panel registration nothing listens on the config's port there,
+        # and the tunnel "works" while every customer on it gets nothing. It has
+        # to be a connected node before the tunnel is pointed at it.
+        if not await _make_foreign_node(srv, log_fn):
+            await log_fn("نود روی سرور نو بالا نیامد؛ حذف و گرفتن سرور دیگر…")
+            await _discard_foreign(target_acc, srv, log_fn)
+            continue
+
         for k in (kind, other):
             ok, _tid = await tunnelwatch.rebuild(
                 st, rec, kind=k, foreign=foreign, jump=jump, log=log_fn)
             if ok:
                 # The old endpoint is only scrapped once its replacement works.
-                if not banned:
+                # Its panel node goes too: left behind it sits in the node list
+                # as a permanent error, hiding real failures among fake ones.
+                if old_ip and old_ip != srv.get("ip"):
+                    try:
+                        await panel.delete_nodes_by_address(old_ip)
+                    except Exception as e:
+                        await log_fn(f"⚠️ حذف نود قدیمی از پنل نشد: {str(e)[:120]}")
+                if not banned and (fsrv or {}).get("id"):
                     try:
                         await providers.Provider(acc).delete_server(fsrv["id"])
                         st.forget_server(acc["id"], fsrv["id"])
@@ -2498,8 +2674,134 @@ async def _repair_one_tunnel(rec, acc, fsrv, banned, jump, log_fn):
                               f"با تانل {k}")
             rec = st.tunnel(rec["id"]) or rec
         await log_fn("این آی‌پی جواب نداد؛ حذف و گرفتن آی‌پی دیگر…")
-        await replacer.scrap(st, target_acc, srv, log_fn)
+        await _discard_foreign(target_acc, srv, log_fn)
     return False, "با دو آی‌پی تازه و هر دو نوع تانل هم بالا نیامد"
+
+
+NODE_CONNECT_WAIT = 180
+
+
+async def _make_foreign_node(srv, log_fn):
+    """
+    Install the node on a new tunnel endpoint and wait until the panel reports
+    it connected. Returns False rather than raising: a server that will not
+    take the node is a bad draw to be replaced, not a reason to stop repairing.
+    """
+    ip = srv.get("ip")
+    try:
+        await log_fn("نصب نود روی سرور خارجی نو…")
+        ca, key = await provision_node(ip, srv["root_password"], log_fn)
+        await panel.add_node(name=str(srv.get("label") or ip), address=ip,
+                             server_ca=ca, api_key=key, core_config_id=SNI_CORE_ID)
+    except Exception as e:
+        await log_fn(f"⚠️ نصب نود نشد: {html.escape(type(e).__name__)}: "
+                     f"{html.escape(str(e)[:140])}")
+        return False
+    # Registered is not the same as serving: the panel still has to reach the
+    # node and push the core config before the port is live.
+    deadline = time.time() + NODE_CONNECT_WAIT
+    status = None
+    while time.time() < deadline:
+        try:
+            for n in await panel.list_nodes():
+                if n.get("address") == ip:
+                    status = n.get("status")
+        except Exception:
+            pass
+        if status == "connected":
+            await log_fn(f"✅ نود <code>{ip}</code> در پنل وصل شد.")
+            return True
+        await asyncio.sleep(10)
+    await log_fn(f"⚠️ نود <code>{ip}</code> بعد از {NODE_CONNECT_WAIT} ثانیه "
+                 f"وصل نشد (وضعیت: {html.escape(str(status))}).")
+    return False
+
+
+async def _discard_foreign(acc, srv, log_fn):
+    """Throw a failed endpoint away completely: its panel node and the server."""
+    try:
+        await panel.delete_nodes_by_address(srv.get("ip"))
+    except Exception as e:
+        await log_fn(f"⚠️ حذف نود ناموفق: {str(e)[:120]}")
+    await replacer.scrap(st, acc, srv, log_fn)
+
+
+def _remember_foreign(rec, acc, fsrv):
+    """
+    Note which account a tunnel's foreign end sits on, and its shape.
+
+    An account that stops answering stops telling us what it held, and that is
+    exactly when we need to know: to rebuild the endpoint somewhere else we
+    need its provider, its region and its size. Asking afterwards is too late,
+    so it is written down on every healthy pass. Keyed by the Iran host, which
+    is the one part of a tunnel that survives every rebuild.
+    """
+    if not (acc and fsrv and rec.get("iran_host")):
+        return
+    try:
+        st.set("tunfor_" + str(rec["iran_host"]), json.dumps({
+            "account_id": acc.get("id"), "account_label": acc.get("label"),
+            "provider": acc.get("provider"), "region": fsrv.get("region"),
+            "plan": fsrv.get("plan"), "label": fsrv.get("label"),
+            "ip": fsrv.get("ip"),
+        }))
+    except Exception:
+        pass
+
+
+def _recall_foreign(rec):
+    """What we last knew about this tunnel's foreign end, or None."""
+    raw = st.get("tunfor_" + str(rec.get("iran_host") or ""))
+    if not raw:
+        return None
+    try:
+        d = json.loads(raw)
+        return d if d.get("provider") and d.get("region") and d.get("plan") else None
+    except Exception:
+        return None
+
+
+def _peer_foreign_template(provider, exclude_ip=None):
+    """
+    The shape of another tunnel's foreign endpoint on the same provider.
+
+    A last resort for a tunnel we never got to write down. Every other tunnel's
+    endpoint was already chosen for its latency to Iran, so borrowing one of
+    their regions restores service in a place known to work, rather than
+    guessing at a datacenter that may be useless for this traffic.
+    """
+    for tid_rec in st.tunnels():
+        if tid_rec.get("foreign_host") == exclude_ip:
+            continue
+        mem = _recall_foreign(tid_rec)
+        if mem and mem.get("provider") == provider:
+            return mem
+    return None
+
+
+REPAIR_HOLD_MINUTES = 45
+
+
+def _repair_held(tid):
+    """Minutes left before this config may be repaired again, 0 if free.
+
+    Every repair wipes both ends before rebuilding, so a repair that cannot
+    succeed is not merely useless - it takes the config down again on each
+    pass. A daily cap alone does not help: at a five-minute watch interval it
+    permits hours of that. Whatever the cause, one failure buys quiet."""
+    import time as _t
+    until = st.get(f"repair_hold_{tid}")
+    left = (int(until) - int(_t.time())) / 60 if until else 0
+    return max(0, int(left + 0.5))
+
+
+def _hold_repair(tid, minutes=REPAIR_HOLD_MINUTES):
+    import time as _t
+    st.set(f"repair_hold_{tid}", int(_t.time()) + minutes * 60)
+
+
+def _clear_repair_hold(tid):
+    st.set(f"repair_hold_{tid}", 0)
 
 
 def _replace_budget(tid) -> int:
@@ -2559,7 +2861,7 @@ async def _replace_target(t, log_fn):
         if not sib:
             raise RuntimeError(
                 f"اکانت «{acc['label']}» بن شده و هیچ اکانت دیگری برای "
-                f"{providers.location_text(acc['provider'], old.get('region'), old.get('country'))} باقی نمانده")
+                f"{old.get('region')} باقی نمانده")
         target_acc = sib
         await log_fn(f"اکانت جایگزین (کم‌بارترین اکانت همان دیتاسنتر): "
                      f"«{html.escape(sib['label'])}»")
@@ -2596,13 +2898,13 @@ async def _replace_target(t, log_fn):
         await replacer.scrap(st, target_acc, cand, log_fn)
     if srv is None:
         raise RuntimeError(f"بعد از {IP_HUNT_ATTEMPTS} تلاش، آی‌پی تمیزی در "
-                           f"{providers.location_text(acc['provider'], old.get('region'), old.get('country'))} پیدا نشد")
+                           f"{old.get('region')} پیدا نشد")
 
     await log_fn("نصب و نود کردن سرور نو…")
     server_ca, api_key = await provision_node(srv["ip"], srv["root_password"], log_fn)
     await panel.add_node(name=str(srv.get("label") or srv["ip"]),
                          address=srv["ip"], server_ca=server_ca,
-                         api_key=api_key, core_config_id=core_id())
+                         api_key=api_key, core_config_id=SNI_CORE_ID)
     await log_fn("نود اضافه شد. انتقال دامنه…")
     await _apply_ip(fqdn, srv["ip"])
 
@@ -2651,9 +2953,7 @@ async def _replace_target(t, log_fn):
     return {"fqdn": fqdn, "old_ip": old_ip, "old_label": old.get("label"),
             "old_account": acc["label"], "new_ip": srv["ip"],
             "new_label": srv.get("label"), "new_account": target_acc["label"],
-            "provider": acc["provider"], "region": old.get("region"),
-            "country": old.get("country"),
-            "plan": old.get("plan"),
+            "region": old.get("region"), "plan": old.get("plan"),
             "healthy": healthy, "verdict": verdict, "ban_note": ban_note}
 
 
@@ -2742,6 +3042,12 @@ async def _do_watch(*, alert: bool):
             budget = _replace_budget(t["id"])
             if budget <= 0:
                 continue
+            held = _repair_held(t["id"])
+            if held:
+                # Still in the quiet period a failed repair bought. Say nothing:
+                # the failure was already reported, and repeating it every few
+                # minutes would bury everything else.
+                continue
             await bot.send_message(
                 OWNER, f"🔧 <b>{name}</b> (کانفیگ تانل) خراب است — "
                        f"{CONFIRM_TRIES} تست تأیید با فاصلهٔ یک دقیقه…")
@@ -2758,16 +3064,29 @@ async def _do_watch(*, alert: bool):
             try:
                 info = await _repair_tunnel(t, tlog)
             except Exception as e:
+                _hold_repair(t["id"])
                 await bot.send_message(
                     OWNER, f"❌ <b>تعمیر تانل {name} نشد</b>\n"
-                           f"<code>{html.escape(str(e)[:300])}</code>")
+                           f"<code>{html.escape(str(e)[:300])}</code>\n\n"
+                           f"<i>{REPAIR_HOLD_MINUTES} دقیقه دیگر دوباره تلاش "
+                           f"می‌کنم؛ تا آن موقع دست به این تانل نمی‌زنم.</i>")
                 continue
             lines = []
             if info.get("note"):
                 lines.append(info["note"])
             good = sum(1 for r in info["results"] if r["ok"])
+            if good == len(info["results"]):
+                _clear_repair_hold(t["id"])
+            else:
+                # Something did not come back. Buy quiet before trying again:
+                # the next attempt would wipe both ends first, taking down
+                # whatever this one did manage to restore.
+                _hold_repair(t["id"])
             lines.append(f"{'✅' if good == len(info['results']) else '⚠️'} "
                          f"<b>تعمیر تانل</b> — {good} از {len(info['results'])} برگشت")
+            if good != len(info["results"]):
+                lines.append(f"<i>{REPAIR_HOLD_MINUTES} دقیقه صبر می‌کنم و "
+                             f"دوباره تلاش می‌کنم.</i>")
             for r in info["results"]:
                 mark = "✅" if r["ok"] else "❌"
                 lines.append(f"{mark} ایران <code>{r['iran']}</code> ← "
@@ -2827,7 +3146,7 @@ async def _do_watch(*, alert: bool):
                     f"({html.escape(str(info['new_label']))}) — "
                     f"اکانت «{html.escape(info['new_account'])}»"
                     f"{'' if info['healthy'] else ' <i>(حذف شد)</i>'}\n"
-                    f"📍 {providers.location_text(info['provider'], info['region'], info.get('country'))} · {info['plan']}\n\n"
+                    f"📍 {info['region']} · {info['plan']}\n\n"
                     f"باقی‌ماندهٔ جایگزینی امروز برای این کانفیگ: "
                     f"{_replace_budget(t['id'])}")
             if info.get("ban_note"):
@@ -2985,132 +3304,752 @@ async def watch_scheduler():
             if cfg["enabled"] and st.watch_targets() and st.cfscan().get("ssh"):
                 if time.time() - cfg["last_ts"] >= cfg["interval_minutes"] * 60:
                     st.set_watch_cfg(last_ts=int(time.time()))
-                    await _do_watch(alert=True)
+                    # A pass reaches Iran over SSH, and an SSH connect to a host
+                    # that answers pings but drops the handshake never returns on
+                    # its own. Without a ceiling, one such host stops the watchdog
+                    # for good: every config goes unwatched and unrepaired, and
+                    # nothing says so, because the loop is not crashed - it is
+                    # waiting. A pass that overruns is abandoned; the next one
+                    # starts clean a minute later.
+                    try:
+                        await asyncio.wait_for(
+                            _do_watch(alert=True),
+                            timeout=max(240, cfg["interval_minutes"] * 60 * 2),
+                        )
+                    except asyncio.TimeoutError:
+                        log.error(
+                            "watchdog pass abandoned after %ss - a probe target is "
+                            "hanging; skipping to the next pass",
+                            max(240, cfg["interval_minutes"] * 60 * 2),
+                        )
         except Exception:
             log.exception("watchdog pass failed")
         await asyncio.sleep(60)
 
 
 
-# ==========================================================================
-# settings: everything an installation needs, entered from Telegram
-# ==========================================================================
-class PanelCfg(StatesGroup):
-    url = State()
-    user = State()
-    password = State()
-    core = State()
+def _device_scoring(results, controls=()):
+    """
+    Judge a phone's results against that phone's own connection, not ours.
+
+    Mobile internet here is slower and far more variable than the relay's line,
+    so an absolute threshold either passes everything or fails everything
+    depending on the handset. What actually carries information is the spread
+    *within one session*: the same phone, on the same network, minutes apart,
+    measuring twenty addresses. An address that is better than that phone's own
+    median is better for that operator, whatever the absolute numbers were.
+
+    Returns {ip: (good, rtt, rel)} where rel is the ratio to the median.
+    """
+    # The reference addresses are not candidates and must not colour the
+    # comparison: the relay sits inside Iran and answers several times faster
+    # than any Cloudflare edge, so leaving it in would drag the median down and
+    # make every real address look bad against it.
+    results = [r for r in results if r.get("ip") not in controls]
+    live = [r for r in results if r.get("rtt_ms") and r.get("ok")]
+    if not live:
+        return {}
+    rtts = sorted(r["rtt_ms"] for r in live)
+    median = rtts[len(rtts) // 2]
+    losses = sorted((r.get("loss") or 0) for r in live)
+    median_loss = losses[len(losses) // 2]
+
+    out = {}
+    for r in results:
+        ip = r.get("ip")
+        if not ip:
+            continue
+        rtt = r.get("rtt_ms")
+        loss = r.get("loss") or 0
+        if not r.get("ok") or not rtt:
+            out[ip] = (False, rtt, None)
+            continue
+        rel = rtt / median if median else 1.0
+        # Within a sixth of this phone's own median is "as good as this network
+        # gets"; losing much more than its own typical amount is not.
+        good = rel <= 1.15 and loss <= max(0.25, median_loss + 0.10)
+        out[ip] = (good, rtt, rel)
+    return out
 
 
-def kb_settings():
-    c = panel_cfg()
-    j = st.jump()
-    b = InlineKeyboardBuilder()
-    b.button(text=("🎛 پنل: " + (c.get("url") or "تنظیم نشده")), callback_data="set_panel")
-    b.button(text=("🇮🇷 واسط ایران: " + (j.get("host") if j else "تنظیم نشده")),
-             callback_data="set_jump")
-    b.button(text=("🌐 توکن کلادفلر: " + ("ثبت شده" if st.cf_token() else "تنظیم نشده")),
-             callback_data="cf_token_set")
-    b.button(text="🔙 بازگشت", callback_data="home")
-    b.adjust(1)
-    return b.as_markup()
+REPORT_TTL = 7 * 86400   # a verdict older than this says nothing about today
 
 
-@dp.callback_query(F.data == "settings")
-async def cb_settings(cb: CallbackQuery):
-    await cb.answer()
-    c = panel_cfg()
-    await cb.message.edit_text(
-        "⚙️ <b>تنظیمات</b>\n\n"
-        "هر چیزی که این ربات برای کار کردن لازم دارد از همین‌جا تنظیم می‌شود؛ "
-        "هیچ‌کدام داخل کد یا ایمیج نیست.\n\n"
-        f"🎛 پنل: <code>{html.escape(c.get('url') or '—')}</code>\n"
-        f"🔢 هستهٔ نودها: <code>{c.get('core_id') or 'خودکار'}</code>",
-        reply_markup=kb_settings())
+async def _refresh_probe_sni():
+    """
+    Find the name a customer's client actually puts in the handshake.
 
+    For a CDN config the address and the server name are two different domains
+    on purpose: the packets go to the address, which is where the clean IP is
+    published, while the TLS handshake asks for something else entirely. Probing
+    with the address - or worse, with a Cloudflare speedtest host - measures a
+    handshake no customer ever makes, and the filtering we are trying to detect
+    happens at exactly that step.
 
-@dp.callback_query(F.data == "set_panel")
-async def set_panel(cb: CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.set_state(PanelCfg.url)
-    await cb.message.answer(
-        "🎛 <b>اتصال به پنل</b>\n\n"
-        "۱/۴ — آدرس پنل را بفرست، با پروتکل و پورت:\n"
-        "<code>https://panel.example.com:8000</code>\n\n/cancel برای انصراف")
-
-
-@dp.message(PanelCfg.url)
-async def panel_url(msg: Message, state: FSMContext):
-    u = msg.text.strip().rstrip("/")
-    if not u.startswith("http"):
-        await msg.answer("با http:// یا https:// شروع کن.")
-        return
-    await state.update_data(url=u)
-    await state.set_state(PanelCfg.user)
-    await msg.answer("۲/۴ — نام کاربری ادمین پنل؟")
-
-
-@dp.message(PanelCfg.user)
-async def panel_user(msg: Message, state: FSMContext):
-    await state.update_data(user=msg.text.strip())
-    await state.set_state(PanelCfg.password)
-    await msg.answer("۳/۴ — رمز ادمین پنل؟\n<i>پیام رمز پاک می‌شود.</i>")
-
-
-@dp.message(PanelCfg.password)
-async def panel_password(msg: Message, state: FSMContext):
-    await state.update_data(password=msg.text)
+    Read from the panel rather than configured here, because the two must not be
+    allowed to drift: the panel is where the value is actually set.
+    """
+    fqdn = (st.cfscan().get("fqdn") or "").lower()
+    if not fqdn:
+        return None
     try:
-        await msg.delete()
+        panel = Panel(PANEL_URL, PANEL_USER, PANEL_PASS)
+        for h in await panel.hosts():
+            addrs = [str(a).lower() for a in (h.get("address") or [])]
+            if any(fqdn in a for a in addrs):
+                sni = [s for s in (h.get("sni") or []) if s]
+                if sni:
+                    if sni[0] != st.get("probe_sni"):
+                        # Measurements taken under the old name are not
+                        # measurements of the new test, so record when it
+                        # changed and let the phones be asked again.
+                        st.set("probe_sni", sni[0])
+                        st.set("probe_sni_ts", int(time.time()))
+                    return sni[0]
     except Exception:
-        pass
-    await state.set_state(PanelCfg.core)
-    await msg.answer(
-        "۴/۴ — شناسهٔ هسته‌ای که نودهای تازه به آن وصل شوند.\n"
-        "اگر نمی‌دانی <code>0</code> بفرست تا پنل خودش تصمیم بگیرد.")
+        log.exception("could not read the CDN host's sni from the panel")
+    return None
 
 
-@dp.message(PanelCfg.core)
-async def panel_core(msg: Message, state: FSMContext):
-    raw = msg.text.strip()
-    if not raw.isdigit():
-        await msg.answer("یک عدد بفرست (یا 0).")
+def _control_ips():
+    """
+    The reference address handed to the phones alongside the real candidates.
+
+    A phone that failed everything has told us nothing about any address: its
+    own data may simply have been broken at that moment, and nothing in the
+    numbers distinguishes that from an operator blocking the lot. The way to
+    tell them apart is to have it also measure something that must work
+    whenever its connection does - the Iran relay it is already talking to. If
+    even that failed, the round describes the handset, not Cloudflare.
+    """
+    host = PROBE_BASE.split("//", 1)[-1].split("/")[0].split(":")[0]
+    try:
+        import socket
+        return [socket.gethostbyname(host)]
+    except Exception:
+        return []
+
+
+def _report_trusted(rep, controls):
+    """Whether a round says anything about the addresses. -> (trusted, why)."""
+    res = rep.get("results") or []
+    if not res:
+        return False, "چیزی اندازه‌گیری نشده بود"
+    if (rep.get("net") or "cellular") != "cellular":
+        return False, "روی وای‌فای اندازه‌گیری شده بود، نه دیتای همراه"
+    seen = [r for r in res if r.get("ip") in controls]
+    if seen:
+        if not any(r.get("ok") for r in seen):
+            return False, ("سرور ایران هم از این گوشی جواب نداد — "
+                           "اینترنت خودِ گوشی آن لحظه کار نمی‌کرده")
+        return True, ""
+    # An older round, measured before reference addresses were being sent. The
+    # only thing left to go on is whether anything at all worked.
+    if not any(r.get("ok") for r in res):
+        return False, ("هیچ آدرسی جواب نداد و آن دور مرجعی برای مقایسه نداشت — "
+                       "معلوم نیست تقصیر اپراتور بوده یا اینترنت گوشی")
+    return True, ""
+
+
+def _classify_reports():
+    """(trusted, set_aside) - set_aside maps device -> (report, why)."""
+    now = int(time.time())
+    controls = set(st.scan_candidates().get("controls") or [])
+    trusted, aside = {}, {}
+    for d, r in st.device_reports().items():
+        if now - (r.get("ts") or 0) >= REPORT_TTL:
+            continue
+        ok, why = _report_trusted(r, controls)
+        if ok:
+            trusted[d] = r
+        else:
+            aside[d] = (r, why)
+    return trusted, aside
+
+
+def _fresh_reports():
+    """The rounds that are allowed to influence the choice."""
+    return _classify_reports()[0]
+
+
+SCAN_SAMPLE = 1000        # addresses the relay measures in one pass
+PHONE_SHORTLIST = 50      # the best of a window, handed to the phones
+PHONE_GRACE_MINUTES = 25  # how long a fresh list waits for the handsets
+SCAN_GAP_MINUTES = 10     # between passes of the round-the-clock scan
+
+
+def _record_blocked():
+    """
+    Note every address a trusted round could not complete.
+
+    Only rounds that pass the trust gate count, so a handset with no signal
+    cannot condemn an address it never really tried. What is recorded is a
+    failure to finish the TLS handshake - which from a fixed line looks like
+    nothing at all, and is the whole reason the phones exist.
+    """
+    controls = set(st.scan_candidates().get("controls") or [])
+    bad, good = set(), set()
+    for _d, r in _fresh_reports().items():
+        for x in r.get("results") or []:
+            ip = x.get("ip")
+            if not ip or ip in controls:
+                continue
+            (good if x.get("ok") else bad).add(ip)
+    # An address one operator refuses and another serves happily is not blocked
+    # - it is simply worse on one network. Blacklisting on the union of the two
+    # threw away addresses that were working for half the customers, and in one
+    # case discarded a whole shortlist that had twenty-six usable addresses on
+    # it because the other handset was having a bad hour.
+    bad -= good
+    if bad:
+        st.mark_blocked(bad)
+    return bad
+
+
+def _phone_verdicts(since=0):
+    """
+    {device: {ip: (good, rtt, rel)}} for the rounds that are allowed to count.
+
+    A round counts when it was measured on mobile data and the reference address
+    answered - proof the handset's own connection was working, so that a phone
+    with no signal cannot veto an address it never really reached.
+    """
+    controls = set(st.scan_candidates().get("controls") or [])
+    return {d: _device_scoring(r.get("results", []), controls)
+            for d, r in _fresh_reports().items()
+            if int(r.get("ts") or 0) >= int(since or 0)}
+
+
+REQUIRED_PHONES = 2          # handsets that must both approve an address
+HEAD_TO_HEAD_TTL = 20 * 60   # reuse a relay comparison for this long
+HEAD_TO_HEAD_MAX = 5         # candidates measured against the live address
+
+
+def choose(results, live_ip=None, measured=None, since=0):
+    """
+    Whether to move the domain, and to which address.
+
+        an address qualifies only if EVERY phone that measured this list rated
+        it better than that phone's own median, and at least REQUIRED_PHONES
+        phones did so in a round measured after the list was published;
+        a qualifying address replaces the live one only if the relay measures
+        it better than the live address, both measured in the same run.
+
+    Anything short of that keeps the address already serving customers. A
+    phone that is silent, measured an older list, or had its round set aside
+    is not a vote for anything - and one phone alone is not enough, because an
+    address that suits one operator can be filtered on the other.
+
+    `measured` is {ip: metrics} from one relay run that covered the live address
+    and the contenders. Without it, a qualifying round returns `needs_measure`
+    and no change, so the caller can take that measurement first.
+
+    Returns {change, entry, why, voters, needs_measure}.
+    """
+    ranked = [r for r in results if r.get("ip")]
+    on_list = {r["ip"] for r in ranked}
+    live_entry = (next((r for r in ranked if r["ip"] == live_ip), None)
+                  or ({"ip": live_ip} if live_ip else None))
+
+    def keep(why, voters=0, needs=None):
+        return {"change": False, "entry": live_entry, "why": why,
+                "voters": voters, "needs_measure": needs or []}
+
+    if not ranked:
+        return keep("لیست کاندید خالی است — آدرس فعلی ماند")
+
+    # Only rounds measured after this list was published count. A report is
+    # timestamped on arrival, and each phone keeps only its latest, so an older
+    # one is about an older list - its opinion of an address that happens to be
+    # on this list too was formed under different conditions.
+    verdicts = {d: {ip: v for ip, v in vs.items() if ip in on_list}
+                for d, vs in _phone_verdicts(since).items()}
+    voters = [d for d, v in verdicts.items() if v]
+    if len(voters) < REQUIRED_PHONES:
+        return keep("فقط %d از %d گوشی این لیست را سنجیده؛ تعویض فقط با تأیید هر دو گوشی "
+                    "— آدرس فعلی ماند" % (len(voters), REQUIRED_PHONES), len(voters))
+
+    approved = []
+    for r in ranked:
+        opinions = [verdicts[d].get(r["ip"]) for d in voters]
+        # Every voting phone must have actually tried it, and liked it.
+        if any(o is None for o in opinions) or not all(o[0] for o in opinions):
+            continue
+        rels = [o[2] for o in opinions if o[2]]
+        approved.append(((sum(rels) / len(rels)) if rels else 9, r))
+    if not approved:
+        return keep("هیچ آدرسی تأیید هر دو گوشی را نگرفت — آدرس فعلی ماند", len(voters))
+    approved.sort(key=lambda x: x[0])
+
+    if live_ip and any(r["ip"] == live_ip for _rel, r in approved):
+        return keep("آدرس فعلی خودش مورد تأیید هر دو گوشی است", len(voters))
+
+    contenders = [(rel, r) for rel, r in approved if r["ip"] != live_ip][:HEAD_TO_HEAD_MAX]
+    if measured is None:
+        return keep("در انتظار مقایسهٔ سرور با آدرس فعلی", len(voters),
+                    [r["ip"] for _rel, r in contenders])
+
+    live_m = measured.get(live_ip) if live_ip else None
+    # A live address the relay could not reach at all is beaten by anything
+    # that did answer.
+    live_score = cfscanner.score(live_m) if live_m else float("inf")
+    better = []
+    for rel, r in contenders:
+        m = measured.get(r["ip"])
+        if m and cfscanner.score(m) < live_score:
+            better.append((rel, cfscanner.score(m), r, m))
+    if not better:
+        return keep("%d آدرس تأیید هر دو گوشی را گرفت ولی در تست سرور هیچ‌کدام از آدرس فعلی "
+                    "بهتر نبود — آدرس فعلی ماند" % len(contenders), len(voters))
+
+    better.sort(key=lambda x: (x[0], x[1]))
+    rel, score, r, m = better[0]
+    entry = dict(r, **m)
+    entry["ip"] = r["ip"]
+    live_txt = ("%.0f" % live_score) if live_m else "بی‌پاسخ"
+    why = ("هر دو گوشی تأییدش کردند (%.2f) و در تست سرور از آدرس فعلی بهتر بود "
+           "(امتیاز %.0f در برابر %s)" % (rel, score, live_txt))
+    return {"change": True, "entry": entry, "why": why,
+            "voters": len(voters), "needs_measure": []}
+
+
+async def _head_to_head(since, live_ip, ips):
+    """
+    Measure the live address and the contenders together, in one relay run.
+
+    "Better than the address behind the domain" only means something when both
+    were measured at the same moment on the same path; numbers from hours apart
+    compare the time of day, not the addresses. Cached briefly, because the
+    recheck runs every two minutes and the answer does not change that fast.
+    Returns {ip: metrics}, or None when the measurement could not be taken.
+    """
+    key = "%s|%s|%s" % (since, live_ip or "", ",".join(sorted(ips)))
+    try:
+        cached = json.loads(st.get("scan_h2h") or "{}")
+    except Exception:
+        cached = {}
+    if cached.get("key") == key and time.time() - (cached.get("ts") or 0) < HEAD_TO_HEAD_TTL:
+        return cached.get("measured") or {}
+    ssh = st.cfscan().get("ssh")
+    if not ssh:
+        return None
+    only = ([live_ip] if live_ip else []) + [ip for ip in ips if ip != live_ip]
+
+    async def hlog(t):
+        log.info("head-to-head: %s", t)
+
+    try:
+        rows, _tail = await cfscanner.run_scan(ssh, st.jump(), hlog, only=only, final=len(only))
+    except Exception:
+        log.exception("head-to-head measurement failed")
+        return None
+    measured = {r["ip"]: {k: v for k, v in r.items() if k != "ip"} for r in rows if r.get("ip")}
+    st.set("scan_h2h", json.dumps({"key": key, "ts": int(time.time()), "measured": measured}))
+    log.info("head-to-head %s -> %s", key,
+             {ip: round(cfscanner.score(m)) for ip, m in measured.items()})
+    return measured
+
+
+async def decide(results, live_ip, cand):
+    """choose(), taking the relay comparison first when the phones have agreed."""
+    since = int(cand.get("ts") or 0)
+    d = choose(results, live_ip, since=since)
+    if not d["needs_measure"]:
+        return d
+    measured = await _head_to_head(since, live_ip, d["needs_measure"])
+    if measured is None:
+        d["why"] = "مقایسهٔ سرور با آدرس فعلی انجام نشد — آدرس فعلی ماند"
+        return d
+    return choose(results, live_ip, measured=measured, since=since)
+
+
+SILENT_PHONE_ALERT_GAP = 6 * 3600
+
+
+async def _warn_silent_phones(cand, decision):
+    """
+    Say once in a while why the domain is not moving, when a phone is the reason.
+
+    The rule needs both phones on every list, so one handset that stops
+    measuring freezes the address indefinitely - silently, since nothing is
+    broken on the server's side. A phone can keep pinging and still not measure
+    (battery restrictions stop the scan but not the heartbeat), so what is
+    checked is the measurement, not the ping.
+    """
+    if decision["voters"] >= REQUIRED_PHONES:
         return
+    since = int(cand.get("ts") or 0)
+    if not since or time.time() - since < PHONE_GRACE_MINUTES * 60:
+        return
+    if time.time() - int(st.get("silent_phone_alert_ts") or 0) < SILENT_PHONE_ALERT_GAP:
+        return
+    seen = st.devices_seen()
+    reports = st.device_reports()
+    if len(seen) < REQUIRED_PHONES:
+        return
+    missing = [(d, info) for d, info in seen.items()
+               if int((reports.get(d) or {}).get("ts") or 0) < since]
+    if not missing:
+        return
+    st.set("silent_phone_alert_ts", int(time.time()))
+    lines = []
+    for d, info in missing:
+        last = int((reports.get(d) or {}).get("ts") or 0)
+        lines.append("• %s — آخرین سنجش %s، آخرین تماس %s" % (
+            html.escape(str(info.get("operator") or d)), _ago(last), _ago(info.get("ts"))))
+    try:
+        await bot.send_message(
+            OWNER,
+            "⏳ <b>تعویض آی‌پی متوقف است</b>\n\n"
+            "آی‌پی دامنه فقط وقتی عوض می‌شود که هر دو گوشی لیست فعلی را بسنجند. "
+            "این گوشی از انتشار لیست فعلی سنجشی نفرستاده:\n"
+            + "\n".join(lines) +
+            "\n\nتا گزارشش برسد، آدرس فعلی دامنه دست نمی‌خورد.")
+    except Exception:
+        log.exception("silent phone alert failed")
+
+
+def verified_best():
+    """
+    The shortlist as the phones rated it - what `choose` sees, laid out for the
+    panel.
+
+    The universe is this cycle's shortlist and nothing else. An address the
+    relay did not put forward this time is not a candidate, whatever a phone
+    said about it six hours ago, so there is nothing here that the decision
+    would not also act on.
+    """
+    cand = st.scan_candidates()
+    metrics = cand.get("metrics") or {}
+    on_list = set(cand.get("ips") or [])
+    verdicts = {d: {ip: v for ip, v in vs.items() if ip in on_list}
+                for d, vs in _phone_verdicts(int(cand.get("ts") or 0)).items()}
+    voters = [d for d, v in verdicts.items() if v]
+    reports = _fresh_reports()
+
+    out = []
+    for ip in cand.get("ips") or []:
+        opinions = []
+        for d in voters:
+            v = verdicts[d].get(ip)
+            if v is None:
+                continue
+            good, rtt, rel = v
+            opinions.append({"device": d, "operator": reports[d].get("operator", "?"),
+                             "ok": good, "rtt": rtt, "rel": rel})
+        heard = len(opinions)
+        agreed = (len(voters) >= REQUIRED_PHONES and heard == len(voters)
+                  and all(o["ok"] for o in opinions))
+        rels = [o["rel"] for o in opinions if o.get("rel")]
+        out.append({
+            "ip": ip,
+            "verified": agreed,
+            "rejected": heard > 0 and not agreed,
+            "tested_by": heard,
+            "relay_rtt": (metrics.get(ip) or {}).get("rtt"),
+            "avg_rel": (sum(rels) / len(rels)) if rels else None,
+            "operators": opinions,
+        })
+
+    def rank(e):
+        # Vouched for first, then untried, then refused; inside each, the phones'
+        # own rating leads and the relay's latency only breaks a tie.
+        tier = 0 if e["verified"] else (2 if e["rejected"] else 1)
+        return (tier, e["avg_rel"] if e["avg_rel"] is not None else 9,
+                e["relay_rtt"] or 9999)
+    out.sort(key=rank)
+    return out
+
+
+def _dev_label(dev, info):
+    """What to call this handset: the owner's name if they gave one."""
+    name = st.device_names().get(dev)
+    op = info.get("operator") or "?"
+    return f"{name} ({op})" if name else op
+
+
+def _app_label(info):
+    """The build a phone is running, when it is new enough to say."""
+    v = info.get("app")
+    return f" · نسخه {v}" if v else ""
+
+
+def _net_label(info):
+    """Whether the handset is on mobile data right now. Only rounds measured on
+    mobile data count, so a phone parked on Wi-Fi is online but not measuring."""
+    net = info.get("net")
+    if net == "cellular":
+        return " · دیتای همراه"
+    if net == "wifi":
+        return " · وای‌فای (اندازه‌گیری متوقف)"
+    return ""
+
+
+def _phone_status():
+    """(online, offline) device rows. Online means heard from within one cycle."""
+    import time as _t
+    seen = st.devices_seen()
+    # The phones ping every half hour, so silence for a bit over two of those is
+    # a phone that is off or has no network - not one whose schedule drifted.
+    # (Measurement runs twice a day; liveness is a separate, much cheaper thing.)
+    cutoff = _t.time() - 75 * 60
+    online, offline = [], []
+    for dev, info in seen.items():
+        (online if info.get("ts", 0) >= cutoff else offline).append((dev, info))
+    online.sort(key=lambda x: -x[1].get("ts", 0))
+    offline.sort(key=lambda x: -x[1].get("ts", 0))
+    return online, offline
+
+
+def _ago(ts):
+    import time as _t
+    if not ts:
+        return "هرگز"
+    m = int((_t.time() - ts) / 60)
+    if m < 60:
+        return f"{m} دقیقه پیش"
+    h = m // 60
+    return f"{h} ساعت پیش" if h < 48 else f"{h // 24} روز پیش"
+
+
+@dp.callback_query(F.data == "scan_verified")
+async def cb_scan_verified(cb: CallbackQuery):
+    await cb.answer()
+    online, offline = _phone_status()
+    b = InlineKeyboardBuilder()
+    lines = ["📱 <b>سنجش از گوشی‌ها</b>", ""]
+
+    if not online and not offline:
+        lines += [
+            "هنوز هیچ گوشی‌ای وصل نشده.",
+            "",
+            f"آدرس: <code>{PROBE_BASE}</code>",
+            f"توکن: <code>{html.escape(st.probe_token())}</code>",
+            "",
+            "<i>این دو را در اپ وارد کن.</i>",
+        ]
+    else:
+        for dev, info in online:
+            lines.append(f"🟢 <b>{html.escape(_dev_label(dev, info))}</b> — "
+                         f"آنلاین ({_ago(info.get('ts'))}){_net_label(info)}"
+                         f"{_app_label(info)}")
+            b.button(text=f"📊 {_dev_label(dev, info)[:20]}",
+                     callback_data=f"phone_detail:{dev[:48]}")
+        for dev, info in offline:
+            lines.append(f"🔴 <b>{html.escape(_dev_label(dev, info))}</b> — "
+                         f"آخرین ارتباط {_ago(info.get('ts'))}")
+            b.button(text=f"📊 {_dev_label(dev, info)[:20]} (آفلاین)",
+                     callback_data=f"phone_detail:{dev[:48]}")
+
+        # A round that is set aside must not simply vanish: silence here looks
+        # exactly like a phone that never reported, and the difference between
+        # "nothing to say" and "this handset's own connection was broken" is
+        # the thing worth knowing.
+        trusted_reps, aside_reps = _classify_reports()
+        controls = set(st.scan_candidates().get("controls") or [])
+        for dev, (rep, why) in sorted(aside_reps.items(),
+                                      key=lambda x: -(x[1][0].get("ts") or 0)):
+            res = rep.get("results") or []
+            ok = sum(1 for r in res if r.get("ok"))
+            lines.append(
+                f"⛔️ <b>{html.escape(_dev_label(dev, rep))}</b> — "
+                f"{ok} از {len(res)} آدرس ({_ago(rep.get('ts'))})؛ {why}. "
+                "<i>در انتخاب دخالت داده نشد.</i>")
+            lines.append("")
+
+        # A trusted round that still reached nothing is the most informative
+        # result of all and the easiest to miss: the handset's connection was
+        # proven working against the reference address, and every candidate
+        # still failed. That is the operator blocking them, not a bad phone.
+        # It changes no choice - no other address would work for that operator
+        # either, and vetoing them would break the operator that is fine - but
+        # it is the one thing here worth acting on outside this bot.
+        for dev, rep in sorted(trusted_reps.items(),
+                               key=lambda x: -(x[1].get("ts") or 0)):
+            res = [r for r in (rep.get("results") or [])
+                   if r.get("ip") not in controls]
+            if res and not any(r.get("ok") for r in res):
+                sni = sum(1 for r in res if r.get("stage") == "sni")
+                verdict = ("<b>روی نام دامنه فیلتر می‌کند، نه روی آی‌پی</b> — "
+                           f"{sni} آدرس با نام دیگری باز شد"
+                           if sni else
+                           "<b>یعنی این اپراتور دارد فیلتر می‌کند</b> — "
+                           "با عوض کردن آی‌پی حل نمی‌شود")
+                lines.append(
+                    f"🚫 <b>{html.escape(_dev_label(dev, rep))}</b> — اینترنت این "
+                    f"گوشی سالم بود ولی هیچ‌کدام از {len(res)} آدرس کلادفلر جواب "
+                    f"نداد ({_ago(rep.get('ts'))}). {verdict}.")
+                lines.append("")
+
+        rows = verified_best()
+        ranked = [e for e in rows if e["tested_by"]]
+        live = st.cfscan().get("last_best_ip")
+        lines.append("")
+        # Two handsets only add something while they sit on different networks.
+        # On the same operator they measure the same route twice, and an address
+        # "confirmed by both" says nothing at all about the other carriers.
+        fresh = _fresh_reports()
+        ops = sorted({r.get("operator") for r in fresh.values() if r.get("operator")})
+        if len(fresh) > 1 and len(ops) < 2:
+            who = html.escape("، ".join(ops) or "؟")
+            lines.append("⚠️ <i>در آخرین اندازه‌گیری‌ها هر دو گوشی روی یک "
+                         "اپراتور بوده‌اند (" + who + ") — "
+                         "برای مقایسهٔ اپراتورها یکی را روی سیم‌کارت دیگری بگذار.</i>")
+            lines.append("")
+        if ranked:
+            lines.append("<b>بهترین آی‌پی‌ها</b> <i>(نسبت به شبکهٔ خود هر گوشی — "
+                         "نظر گوشی بر سرور مقدم است)</i>")
+            for e in ranked[:6]:
+                mark = "✅" if e["verified"] else "❌"
+                if e["ip"] == live:
+                    mark += "🌐"
+                ops = "، ".join(
+                    f"{html.escape(st.device_names().get(o['device']) or o['operator'])}: "
+                    + ("خوب" if o["ok"] else "ضعیف")
+                    + (f" ({o['rel']:.2f}×)" if o.get("rel") else "")
+                    for o in e["operators"])
+                lines.append(f"{mark} <code>{e['ip']}</code>\n    {ops}")
+        else:
+            lines.append("<i>گوشی‌ها هنوز روی آی‌پی‌های این اسکن گزارشی نداده‌اند.</i>")
+        both = sum(1 for e in ranked if e["verified"])
+        lines.append("")
+        lines.append("<i>مورد تأیید همهٔ گوشی‌های گزارش‌دهنده: <b>" + str(both) +
+                     "</b> از " + str(len(rows)) + " آدرس این دور — "
+                     "انتخاب دامنه از میان همین‌هاست.</i>")
+
+    lines.append("")
+    lines.append(f"⏱ بازهٔ اجرا روی گوشی‌ها: هر <b>{st.probe_interval()}</b> ساعت")
+    b.button(text="⏱ تغییر بازه", callback_data="phone_interval")
+    b.button(text="🔑 آدرس و توکن", callback_data="phone_creds")
+    b.button(text="🔙 بازگشت", callback_data="scan")
+    b.adjust(1)
+    await cb.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+
+
+@dp.callback_query(F.data == "phone_creds")
+async def cb_phone_creds(cb: CallbackQuery):
+    await cb.answer()
+    b = InlineKeyboardBuilder()
+    b.button(text="🔙 بازگشت", callback_data="scan_verified")
+    await cb.message.edit_text(
+        "🔑 <b>تنظیمات اپ</b>\n\n"
+        f"آدرس سرور:\n<code>{PROBE_BASE}</code>\n\n"
+        f"توکن:\n<code>{html.escape(st.probe_token())}</code>\n\n"
+        "<i>هر دو گوشی همین دو مقدار را می‌گیرند؛ خودشان از هم جدا شناخته می‌شوند.</i>",
+        reply_markup=b.as_markup())
+
+
+@dp.callback_query(F.data == "phone_interval")
+async def cb_phone_interval(cb: CallbackQuery):
+    await cb.answer()
+    b = InlineKeyboardBuilder()
+    for h in (6, 8, 12, 24):
+        b.button(text=f"هر {h} ساعت", callback_data=f"phone_iv:{h}")
+    b.button(text="🔙 بازگشت", callback_data="scan_verified")
+    b.adjust(2, 2, 1)
+    await cb.message.edit_text(
+        "⏱ <b>بازهٔ اجرا روی گوشی‌ها</b>\n\n"
+        "گوشی‌ها این را از سرور می‌خوانند، پس تغییرش خودکار اعمال می‌شود — "
+        "حداکثر تا یک دور بعدی.\n\n"
+        "<i>بازهٔ کوتاه‌تر یعنی بیدارشدن بیشتر رادیو و مصرف باتری بیشتر.</i>",
+        reply_markup=b.as_markup())
+
+
+@dp.callback_query(F.data.startswith("phone_iv:"))
+async def cb_phone_iv_set(cb: CallbackQuery):
+    h = int(cb.data.split(":")[1])
+    st.set_probe_interval(h)
+    await cb.answer(f"هر {h} ساعت")
+    await cb_scan_verified(cb)
+
+
+@dp.callback_query(F.data.startswith("phone_detail:"))
+async def cb_phone_detail(cb: CallbackQuery):
+    await cb.answer()
+    dev = cb.data.split(":", 1)[1]
+    reports = st.device_reports()
+    rep = reports.get(dev)
+    b = InlineKeyboardBuilder()
+    b.button(text="✏️ تغییر نام", callback_data=f"phone_name:{dev[:48]}")
+    b.button(text="🗑 حذف این گوشی", callback_data=f"phone_del:{dev[:48]}")
+    b.button(text="🔙 بازگشت", callback_data="scan_verified")
+    b.adjust(1)
+    if not rep:
+        await cb.message.edit_text("گزارشی از این گوشی نیست.", reply_markup=b.as_markup())
+        return
+    controls = set(st.scan_candidates().get("controls") or [])
+    scoring = _device_scoring(rep.get("results", []), controls)
+    seen_info = st.devices_seen().get(dev, {})
+    live = "🟢 آنلاین" if seen_info and (time.time() - seen_info.get("ts", 0)) < 75 * 60 else "🔴 آفلاین"
+    lines = [f"📊 <b>{html.escape(_dev_label(dev, {'operator': rep.get('operator')}))}</b>  {live}",
+             f"<code>{html.escape(dev)}</code>",
+             f"گزارش: {_ago(rep.get('ts'))}", ""]
+    rows = sorted(rep.get("results", []),
+                  key=lambda r: (not (scoring.get(r.get('ip'), (False,))[0]),
+                                 r.get("rtt_ms") or 99999))
+    for r in rows[:14]:
+        ip = r.get("ip")
+        good, rtt, rel = scoring.get(ip, (False, None, None))
+        mark = "✅" if good else ("⚠️" if r.get("ok") else "❌")
+        bits = []
+        if rtt:
+            bits.append(f"{rtt:.0f}ms")
+        if rel:
+            bits.append(f"{rel:.2f}× میانه")
+        if r.get("loss"):
+            bits.append(f"افت {r['loss']*100:.0f}%")
+        lines.append(f"{mark} <code>{ip}</code> — {' · '.join(bits) or 'بی‌پاسخ'}")
+    lines.append("")
+    lines.append("<i>«میانه» یعنی نسبت به کندی معمول همین گوشی روی همین شبکه — "
+                 "نه مقایسه با سرور.</i>")
+    await cb.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
+
+
+class PhoneName(StatesGroup):
+    waiting = State()
+
+
+@dp.callback_query(F.data.startswith("phone_name:"))
+async def cb_phone_name(cb: CallbackQuery, state: FSMContext):
+    dev = cb.data.split(":", 1)[1]
+    await state.set_state(PhoneName.waiting)
+    await state.update_data(device=dev)
+    await cb.answer()
+    current = st.device_names().get(dev, "")
+    await cb.message.answer(
+        "✏️ یک نام برای این گوشی بفرست (مثلاً <code>گوشی خودم</code> یا "
+        "<code>ایرانسل خانه</code>).\n\n"
+        + (f"نام فعلی: <b>{html.escape(current)}</b>\n\n" if current else "")
+        + "برای برداشتن نام، یک خط تیره بفرست: <code>-</code>")
+
+
+@dp.message(PhoneName.waiting)
+async def phone_name_set(msg: Message, state: FSMContext):
     d = await state.get_data()
     await state.clear()
-    note = await msg.answer("در حال تست اتصال به پنل…")
-    try:
-        p = Panel(d["url"], d["user"], d["password"])
-        nodes = await p.list_nodes()
-    except Exception as e:
-        await note.edit_text(
-            f"❌ وصل نشد: <code>{html.escape(str(e)[:250])}</code>\n\n"
-            "آدرس، نام کاربری و رمز را چک کن و دوباره از «⚙️ تنظیمات» امتحان کن.")
-        return
-    st.set_panel(d["url"], d["user"], d["password"], raw)
-    await note.edit_text(
-        f"✅ پنل وصل شد — {len(nodes)} نود دیده شد.\n"
-        f"هستهٔ نودهای تازه: <code>{raw if raw != '0' else 'خودکار'}</code>",
-        reply_markup=kb_settings())
+    name = msg.text.strip()
+    st.set_device_name(d["device"], "" if name == "-" else name)
+    await msg.answer("✅ ثبت شد." if name != "-" else "✅ نام برداشته شد.")
+
+
+@dp.callback_query(F.data.startswith("phone_del:"))
+async def cb_phone_del(cb: CallbackQuery):
+    st.forget_device(cb.data.split(":", 1)[1])
+    await cb.answer("حذف شد.")
+    await cb_scan_verified(cb)
 
 
 async def main():
     asyncio.create_task(scan_scheduler())
+    asyncio.create_task(phone_recheck())
     asyncio.create_task(watch_scheduler())
     asyncio.create_task(pending_scheduler())
-    # Seed the panel from the environment on first run only, so an installer
-    # can prefill it while the bot stays configurable from Telegram afterwards.
-    if not st.panel().get("url") and PANEL_SEED["url"]:
-        st.set_panel(PANEL_SEED["url"], PANEL_SEED["user"],
-                     PANEL_SEED["password"], PANEL_SEED["core_id"] or 0)
-        log.info("panel seeded from environment: %s", PANEL_SEED["url"])
     # Seed the Iran jump host once, from the env, if not already stored.
     if not st.jump() and os.environ.get("CLOUDBOT_JUMP"):
         h, p, u, pw = os.environ["CLOUDBOT_JUMP"].split(":", 3)
         st.set_jump(h, int(p), u, pw)
         log.info("iran jump host seeded: %s", h)
-    log.info("cloudbot up, owner=%s panel=%s core=%s", OWNER,
-             panel_cfg().get("url") or "(not configured)", core_id())
+    log.info("cloudbot up, owner=%s panel=%s core=%s", OWNER, PANEL_URL, SNI_CORE_ID)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

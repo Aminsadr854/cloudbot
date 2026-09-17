@@ -62,6 +62,11 @@ async def foreign_account(st, t):
     return await replacer.find_server(st, t.get("foreign_host"))
 
 
+async def unreadable_accounts(st):
+    """Accounts that cannot be listed right now, as (account, reason) pairs."""
+    return await replacer.unreadable_accounts(st)
+
+
 async def account_is_banned(st, acc):
     try:
         servers, refused = await replacer.account_servers(acc)
@@ -93,7 +98,12 @@ async def probe(st, iran_host, port, log=None):
 # Everything this bot builds is named with a "cb" prefix, so a wipe can be
 # thorough without touching anything the owner set up by hand.
 IRAN_CLEAN = r"""
-for d in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^cbgre'); do
+# `ip -o link show` prints a GRE device as "cbgre3@NONE"; feeding that name
+# straight to `ip link del` fails with "Cannot find device", and because the
+# failure was silenced the wipe reported success while deleting nothing. The
+# leftover then owns the local/remote pair, so every later `ip tunnel add`
+# fails with EEXIST and no rebuild can ever succeed.
+for d in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^cbgre'); do
   ip link del "$d" 2>/dev/null
 done
 systemctl disable --now paytun-client >/dev/null 2>&1
@@ -104,7 +114,12 @@ echo IRAN_CLEAN_OK
 """
 
 FOREIGN_CLEAN = r"""
-for d in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | grep -E '^cbgre'); do
+# `ip -o link show` prints a GRE device as "cbgre3@NONE"; feeding that name
+# straight to `ip link del` fails with "Cannot find device", and because the
+# failure was silenced the wipe reported success while deleting nothing. The
+# leftover then owns the local/remote pair, so every later `ip tunnel add`
+# fails with EEXIST and no rebuild can ever succeed.
+for d in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | cut -d@ -f1 | grep -E '^cbgre'); do
   ip link del "$d" 2>/dev/null
 done
 systemctl disable --now paytun-server >/dev/null 2>&1

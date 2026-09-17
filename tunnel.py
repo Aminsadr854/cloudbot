@@ -73,6 +73,14 @@ echo GRE_IRAN_OK
 def _gre_foreign_script(dev, subnet_n, foreign_ip, iran_ip):
     return f"""set -e
 modprobe ip_gre 2>/dev/null || true
+# Clear our own leftovers first. The kernel keys a GRE tunnel on its
+# local/remote pair, not on its name, so one stale device - under any name -
+# makes every `ip tunnel add` for the same pair fail with EEXIST for good.
+# The @NONE suffix that `ip -o link show` prints has to come off, or the
+# delete silently does nothing.
+for d in $(ip -o link show 2>/dev/null | awk -F': ' '{{print $2}}' | cut -d@ -f1 | grep -E '^cbgre'); do
+  ip link del "$d" 2>/dev/null || true
+done
 ip link del {dev} 2>/dev/null || true
 ip tunnel add {dev} mode gre local {foreign_ip} remote {iran_ip} ttl 255
 ip addr add 10.21.{subnet_n}.2/30 dev {dev}

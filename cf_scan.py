@@ -122,6 +122,29 @@ async def tcp_probe(ip, port, timeout):
         return None
 
 
+def _ip_of(e):
+    """The address inside a stage result, which is a tuple early and a dict later."""
+    if isinstance(e, tuple):
+        return e[0]
+    return e["ip"] if isinstance(e, dict) else e
+
+
+def _pin(subset, full, pinned):
+    """
+    Put the pinned addresses back into a shortened list, if they got this far.
+
+    Every stage keeps only its best N, which is right for a random sample but
+    wrong for an address the phones already vouched for: it would be cut on the
+    relay's numbers alone and never reach the results, so the handsets' verdict
+    on it could never be acted on.
+    """
+    if not pinned:
+        return subset
+    have = {_ip_of(e) for e in subset}
+    return list(subset) + [e for e in full
+                           if _ip_of(e) in pinned and _ip_of(e) not in have]
+
+
 async def stage_reachable(ips, port, timeout, concurrency, progress_every=20000):
     sem = asyncio.Semaphore(concurrency)
     alive = []
@@ -346,14 +369,33 @@ async def main():
     ap.add_argument("--no-speed", action="store_true", help="skip the download stage")
     ap.add_argument("--out", default="/root/cf_results")
     ap.add_argument("--seed", type=int, default=None)
+    ap.add_argument("--only", default="",
+                    help="measure exactly these addresses and sample nothing; "
+                         "used to re-check a shortlist properly at the end of a "
+                         "window instead of scanning the space again")
+    ap.add_argument("--include", default="",
+                    help="comma-separated addresses to measure whatever the "
+                         "random sample turned up, and to carry through every "
+                         "stage (used for addresses the phones vouched for)")
     args = ap.parse_args()
 
     t0 = time.time()
-    ranges = cloudflare_ranges()
-    ips = candidates(ranges, args.per_24, args.seed)
-    if args.limit:
-        ips = ips[:args.limit]
-    print(f"  ranges: {len(ranges)}   candidates: {len(ips)}", flush=True)
+    only = [x.strip() for x in args.only.split(",") if x.strip()]
+    if only:
+        ranges, ips = [], only
+        print(f"  measuring a fixed list of {len(ips)} address(es)", flush=True)
+    else:
+        ranges = cloudflare_ranges()
+        ips = candidates(ranges, args.per_24, args.seed)
+        if args.limit:
+            ips = ips[:args.limit]
+    pinned = {ip.strip() for ip in args.include.split(",") if ip.strip()}
+    if pinned:
+        ips = list(pinned) + [i for i in ips if i not in pinned]
+        print(f"  pinned: {len(pinned)} address(es) carried through every stage",
+              flush=True)
+    if not only:
+        print(f"  ranges: {len(ranges)}   candidates: {len(ips)}", flush=True)
 
     print("  stage 1  reachable", flush=True)
     alive = await stage_reachable(ips, args.port, args.connect_timeout, args.concurrency)
@@ -362,7 +404,7 @@ async def main():
         print("  nothing answered - this path may block Cloudflare entirely.")
         return
 
-    keep = alive[:max(args.edge_keep * 4, 400)]
+    keep = alive if only else _pin(alive[:max(args.edge_keep * 4, 400)], alive, pinned)
     print(f"  stage 2  confirming Cloudflare on the {len(keep)} quickest", flush=True)
     good, mediated, my_ip = await stage_edge(
         keep, args.host, args.port, args.path,
@@ -378,20 +420,21 @@ async def main():
         print("  none served a Cloudflare response - the TLS path is likely interfered with.")
         return
 
-    finalists = good[:args.edge_keep]
+    finalists = good if only else _pin(good[:args.edge_keep], good, pinned)
     print(f"  stage 3  stability over {args.rounds} probes each", flush=True)
     finalists = await stage_stable(finalists, args.port, args.connect_timeout,
                                    args.rounds, min(args.concurrency, 60))
     finalists.sort(key=score)
 
     if not args.no_speed:
-        top = finalists[:args.final]
+        top = finalists if only else _pin(finalists[:args.final], finalists, pinned)
         mb = args.speed_bytes / 1e6
         print(f"  stage 4  download {mb:.1f} MB from the best {len(top)}"
               f"  (~{mb * len(top):.0f} MB total)", flush=True)
         top = await stage_speed(top, "speed.cloudflare.com", args.port,
                                 args.speed_bytes, max(args.http_timeout, 25), 3)
-        finalists = top + finalists[args.final:]
+        done = {r["ip"] for r in top}
+        finalists = top + [r for r in finalists if r["ip"] not in done]
         finalists.sort(key=score)
 
     print()

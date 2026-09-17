@@ -27,7 +27,8 @@ def _load_scanner() -> str:
 
 
 async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
-                   final=20, host="speed.cloudflare.com"):
+                   final=20, host="speed.cloudflare.com", include=None,
+                   limit=0, only=None, no_speed=False):
     """
     SSH to `ssh` (optionally via `jump`), run the scanner, return the ranked
     result list (best first). Each item: ip, rtt, jitter, loss, rtt_max, mbps.
@@ -49,9 +50,29 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
             f"ulimit -n 65535 2>/dev/null; "
             f"python3 {REMOTE_SCANNER} --per-24 {per_24} --rounds {rounds} "
             f"--final {final} --host {host} --concurrency 500 "
+            # A fixed sample size rather than the whole announced space: the
+            # addresses are shuffled across every /24 first, so a thousand of
+            # them is a fair picture of the whole and finishes in a minute.
+            + (f"--limit {int(limit)} " if limit else "")
+            # `only` measures a fixed list and samples nothing; `no_speed`
+            # drops the download stage, which is the whole bandwidth cost of a
+            # scan and is not worth paying on every pass of a continuous one.
+            + (("--only " + ",".join(
+                i for i in only if all(ch in "0123456789." for ch in i)) + " ")
+               if only else "")
+            + ("--no-speed " if no_speed else "") +
             f"--out {REMOTE_OUT} 2>&1 | tail -25"
         )
-        await log("در حال اسکن کل رنج کلادفلر از داخل ایران (حدود یک دقیقه)…")
+        if include:
+            # Addresses the phones vouched for. They are re-measured here every
+            # round so the relay always has fresh numbers for them, otherwise a
+            # phone-verified address could never be the one deployed.
+            safe = ",".join(i for i in include
+                            if all(ch in "0123456789." for ch in i))
+            if safe:
+                cmd = cmd.replace("--out ", f"--include {safe} --out ")
+        await log("در حال سنجش روی سرور ایران…" if only
+                  else "در حال اسکن رنج کلادفلر از داخل ایران…")
         r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=600)
         tail = (r.stdout or "")[-500:]
 
@@ -90,6 +111,11 @@ def is_better(candidate: dict, current_ip: str | None, current: dict | None,
     cs = _score(candidate)
     os_ = _score(current)
     return cs < os_ * (1 - min_gain)
+
+
+def score(d: dict) -> float:
+    """Public form of the ranking score, for callers that rank alongside us."""
+    return _score(d)
 
 
 def _score(d: dict) -> float:
