@@ -36,7 +36,9 @@ async def candidates(request):
     """The addresses the phones should measure: the last scan's shortlist."""
     if not _auth(request):
         return web.json_response({"error": "unauthorised"}, status=401)
-    c = st.scan_candidates()
+    eng_param = request.query.get("engine")
+    engine_id = int(eng_param) if eng_param and eng_param.isdigit() else None
+    c = st.scan_candidates(engine_id=engine_id)
     # Asking for work is itself proof of life; there is no separate heartbeat to
     # get out of step with reality.
     dev = request.query.get("device", "")
@@ -52,8 +54,10 @@ async def candidates(request):
     for ip in c.get("controls", []):
         if ip not in ips:
             ips.append(ip)
+    eng_cfg = st.cfscan(engine_id=c.get("engine_id") or 1)
     return web.json_response({
         "ts": c.get("ts", 0),
+        "engine_id": c.get("engine_id", 1),
         "ips": ips,
         # The phones take their schedule from here, so it can be changed from
         # Telegram and applied without reinstalling anything.
@@ -71,7 +75,7 @@ async def candidates(request):
         # What a customer's client really asks for. For a CDN config this is a
         # different domain from the address, so the address is the wrong thing
         # to hand a phone - it would measure a handshake nobody makes.
-        "sni": (st.get("probe_sni") or st.cfscan().get("fqdn")
+        "sni": (st.get("probe_sni") or eng_cfg.get("fqdn")
                 or "speed.cloudflare.com"),
         # Tried only where the first name failed, to tell "this address is
         # blocked" apart from "this name is blocked".
@@ -163,7 +167,9 @@ async def ping(request):
     # hour: a phone that started before a new list was published finishes after
     # it, so its timestamp looks current while its measurements are of the list
     # before. Comparing the addresses is the only reading that is not fooled.
-    cand = st.scan_candidates()
+    eng_param = request.query.get("engine")
+    engine_id = int(eng_param) if eng_param and eng_param.isdigit() else None
+    cand = st.scan_candidates(engine_id=engine_id)
     current = set(cand.get("ips") or [])
     rep = st.device_reports().get(dev) or {}
     measured = {x.get("ip") for x in (rep.get("results") or [])}

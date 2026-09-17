@@ -28,12 +28,15 @@ def _load_scanner() -> str:
 
 async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                    final=20, host="speed.cloudflare.com", include=None,
-                   limit=0, only=None, no_speed=False):
+                   limit=0, only=None, no_speed=False, engine_id: int = 1,
+                   remote_out: str | None = None):
     """
     SSH to `ssh` (optionally via `jump`), run the scanner, return the ranked
     result list (best first). Each item: ip, rtt, jitter, loss, rtt_max, mbps.
     `log` is an async callable for progress.
+    `engine_id` isolates output files on the remote server when multiple engines scan.
     """
+    out_file = remote_out or (f"/root/cf_bot_scan_engine_{engine_id}" if engine_id else REMOTE_OUT)
     conn = await tunnel.connect(ssh["host"], int(ssh.get("port", 22)),
                                 ssh["user"], ssh["password"], jump=jump)
     try:
@@ -61,7 +64,7 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                 i for i in only if all(ch in "0123456789." for ch in i)) + " ")
                if only else "")
             + ("--no-speed " if no_speed else "") +
-            f"--out {REMOTE_OUT} 2>&1 | tail -25"
+            f"--out {out_file} 2>&1 | tail -25"
         )
         if include:
             # Addresses the phones vouched for. They are re-measured here every
@@ -76,7 +79,7 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
         r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=600)
         tail = (r.stdout or "")[-500:]
 
-        res = await conn.run(f"cat {REMOTE_OUT}.json 2>/dev/null", check=False)
+        res = await conn.run(f"cat {out_file}.json 2>/dev/null", check=False)
         raw = (res.stdout or "").strip()
         if not raw:
             raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")

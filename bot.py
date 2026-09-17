@@ -40,6 +40,7 @@ import watchdog
 from cloudflare import CFError, Cloudflare
 from provision import Panel, provision_node
 from store import Store
+from scanner_engine import ScannerEngine, delivery_coordinator
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -57,6 +58,11 @@ PANEL_PASS = os.environ["CLOUDBOT_PANEL_PASS"]
 SNI_CORE_ID = int(os.environ.get("CLOUDBOT_CORE_ID", "6"))
 
 st = Store()
+engines = {
+    1: ScannerEngine(1, st, delivery_coordinator),
+    2: ScannerEngine(2, st, delivery_coordinator),
+    3: ScannerEngine(3, st, delivery_coordinator),
+}
 panel = Panel(PANEL_URL, PANEL_USER, PANEL_PASS)
 bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -1364,51 +1370,104 @@ def _fmt_metrics(d):
             f"{('%.0f Mbps' % d['mbps']) if d.get('mbps') else '—'}")
 
 
-def kb_scan(cfg):
+def kb_scan(cfg=None):
     b = InlineKeyboardBuilder()
+    b.button(text="⚙️ مدیریت موتورها (۳ موتور)", callback_data="scan_engines")
     b.button(text="🖥 سرور اسکن (ایران)", callback_data="scan_srv")
-    b.button(text="🌐 دامنهٔ مقصد", callback_data="scan_dom")
+    b.button(text="🌐 تنظیم دامنه‌ها", callback_data="scan_dom")
     b.button(text="⏱ زمان‌بندی", callback_data="scan_sched")
-    auto = cfg.get("auto_apply")
-    b.button(text=("✅ اعمال خودکار: روشن" if auto else "⚪️ اعمال خودکار: خاموش"),
+    auto1 = st.cfscan(1).get("auto_apply")
+    auto2 = st.cfscan(2).get("auto_apply")
+    auto3 = st.cfscan(3).get("auto_apply")
+    all_auto = auto1 and auto2 and auto3
+    b.button(text=("✅ اعمال خودکار: همه روشن" if all_auto else "⚪️ اعمال خودکار"),
              callback_data="scan_auto")
     b.button(text="▶️ اسکن الان", callback_data="scan_now")
-    b.button(text="📊 وضعیت", callback_data="scan_status")
+    b.button(text="📊 وضعیت زنده", callback_data="scan_status")
     b.button(text="📋 آی‌پی‌های پیدا شده", callback_data="scan_found")
     b.button(text="📱 تأیید با گوشی‌ها", callback_data="scan_verified")
     b.button(text="🔙 بازگشت", callback_data="home")
-    b.adjust(2, 2, 2, 1, 1)
+    b.adjust(1, 2, 2, 2, 2, 1)
     return b.as_markup()
 
 
-def _scan_summary(cfg):
-    ssh = cfg.get("ssh") or {}
-    dom = cfg.get("fqdn") or "—"
-    iv = cfg.get("interval_hours")
-    pool = st.scan_pool()
-    started = pool.get("started") or 0
-    age_h = (time.time() - started) / 3600 if started else 0
-    left = max(0, (iv or 6) - age_h)
+def _scan_summary(cfg=None):
+    cfg1 = st.cfscan(1)
+    cfg2 = st.cfscan(2)
+    cfg3 = st.cfscan(3)
+    ssh = cfg1.get("ssh") or {}
+    srv = ssh.get("host", "—")
+    iv = cfg1.get("interval_hours") or 6
+
+    def _eng_desc(eid, c):
+        dom = c.get("fqdn") or "تعیین نشده"
+        ip = c.get("last_best_ip") or "—"
+        st_info = engines[eid].get_status()
+        state = st_info.get("state", "idle")
+        if state == "scanning":
+            icon = "🟢 در حال اسکن (Scanning)"
+        elif state == "waiting_delivery":
+            icon = f"⏳ در صف ارسال به گوشی‌ها ({st_info.get('eta_minutes', 0)} دقیقه)"
+        elif state == "testing":
+            icon = "🟢 در حال سنجش گوشی‌ها (Testing)"
+        elif state == "error":
+            icon = f"🔴 خطا ({st_info.get('detail','')[:20]})"
+        else:
+            icon = "⚪️ آماده (Idle)"
+        return (f"🔹 <b>موتور {eid} (Engine {eid}):</b> {icon}\n"
+                f"   🌐 دامنه: <code>{html.escape(dom)}</code> | آی‌پی: <code>{ip}</code>")
+
     return (
-        "🔎 <b>اسکنر آی‌پی تمیز کلادفلر</b>\n\n"
-        f"🖥 سرور اسکن: <code>{ssh.get('host','—')}</code>\n"
-        f"🌐 دامنهٔ مقصد: <code>{html.escape(str(dom))}</code>\n"
-        f"🔄 اسکن پیوسته: هر <b>{SCAN_GAP_MINUTES}</b> دقیقه "
-        f"<b>{SCAN_SAMPLE}</b> آدرس\n"
-        f"📦 پنجرهٔ جاری: <b>{len(pool.get('ips') or {})}</b> آدرس در "
-        f"<b>{pool.get('passes') or 0}</b> پاس — "
-        f"{'داوری تا %.1f ساعت دیگر' % left if started else 'شروع نشده'}\n"
-        f"📱 برترین‌ها به گوشی‌ها: <b>{PHONE_SHORTLIST}</b> تا، هر "
-        f"<b>{str(iv)+' ساعت' if iv else 'دستی'}</b>\n"
-        f"♻️ اعمال خودکار: <b>{'روشن' if cfg.get('auto_apply') else 'خاموش'}</b>\n"
-        f"⭐️ انتخاب فعلی: <code>{cfg.get('last_best_ip') or '—'}</code>")
+        "🔎 <b>اسکنر آی‌پی تمیز کلادفلر (۳ موتور مستقل)</b>\n\n"
+        f"🖥 سرور اسکن: <code>{srv}</code>\n"
+        f"⏱ زمان‌بندی: هر <b>{iv}</b> ساعت | اسکن پیوسته هر <b>{SCAN_GAP_MINUTES}</b> دقیقه\n\n"
+        f"{_eng_desc(1, cfg1)}\n\n"
+        f"{_eng_desc(2, cfg2)}\n\n"
+        f"{_eng_desc(3, cfg3)}\n\n"
+        "<i>هر ۳ موتور به صورت کاملاً مستقل و موازی اسکن می‌کنند. "
+        "نتایج با فاصلهٔ ۵ دقیقه‌ای به گوشی‌ها فرستاده می‌شوند.</i>"
+    )
 
 
 @dp.callback_query(F.data == "scan")
 async def cb_scan(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    cfg = st.cfscan()
-    await cb.message.edit_text(_scan_summary(cfg), reply_markup=kb_scan(cfg))
+    await cb.message.edit_text(_scan_summary(), reply_markup=kb_scan())
+    await cb.answer()
+
+
+@dp.callback_query(F.data == "scan_engines")
+async def cb_scan_engines(cb: CallbackQuery):
+    b = InlineKeyboardBuilder()
+    for eid in (1, 2, 3):
+        b.button(text=f"🌐 تغییر دامنه موتور {eid}", callback_data=f"scandom:{eid}")
+        b.button(text=f"▶️ اسکن موتور {eid}", callback_data=f"scannow:{eid}")
+    b.button(text="🔙 بازگشت به اسکنر", callback_data="scan")
+    b.adjust(2, 2, 2, 1)
+
+    lines = ["⚙️ <b>مدیریت ۳ موتور اسکن مستقل</b>\n"]
+    for eid in (1, 2, 3):
+        c = st.cfscan(eid)
+        dom = c.get("fqdn") or "تعیین نشده"
+        ip = c.get("last_best_ip") or "—"
+        st_info = engines[eid].get_status()
+        state = st_info.get("state", "idle")
+        state_str = {
+            "scanning": "🟢 در حال اسکن",
+            "waiting_delivery": f"⏳ در صف ارسال به گوشی‌ها ({st_info.get('eta_minutes', 0)} دقیقه دیگر)",
+            "testing": "🟢 در حال سنجش گوشی‌ها",
+            "error": f"🔴 خطا ({html.escape(st_info.get('detail',''))})",
+            "idle": "⚪️ آماده"
+        }.get(state, state)
+        auto_s = "✅ روشن" if c.get("auto_apply") else "⚪️ خاموش"
+        lines.append(
+            f"🔹 <b>موتور {eid} (Engine {eid})</b>\n"
+            f"• دامنهٔ متصل: <code>{html.escape(dom)}</code>\n"
+            f"• وضعیت: {state_str}\n"
+            f"• اعمال خودکار: {auto_s}\n"
+            f"• آخرین آی‌پی منتخب: <code>{ip}</code>\n"
+        )
+    await cb.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
     await cb.answer()
 
 
@@ -1431,32 +1490,58 @@ async def scan_srv_set(msg: Message, state: FSMContext):
         pass
     await state.clear()
     if not s:
-        await msg.answer("❌ قالب نادرست. host:port:user:password", reply_markup=kb_scan(st.cfscan()))
+        await msg.answer("❌ قالب نادرست. host:port:user:password", reply_markup=kb_scan())
         return
-    cfg = st.update_cfscan(ssh=s)
-    await msg.answer("✅ سرور اسکن ذخیره شد.", reply_markup=kb_scan(cfg))
+    for eid in (1, 2, 3):
+        st.update_cfscan(eid, ssh=s)
+    await msg.answer("✅ سرور اسکن برای همهٔ موتورها ذخیره شد.", reply_markup=kb_scan())
 
 
 @dp.callback_query(F.data == "scan_dom")
-async def scan_dom(cb: CallbackQuery, state: FSMContext):
+async def scan_dom_select(cb: CallbackQuery):
     token = st.cf_token()
     if not token:
         await cb.answer("اول توکن کلادفلر را در بخش «DNS کلادفلر» تنظیم کن.", show_alert=True)
         return
-    await cb.message.edit_text("در حال گرفتن دامنه‌ها…")
+    b = InlineKeyboardBuilder()
+    for eid in (1, 2, 3):
+        dom = st.cfscan(eid).get("fqdn") or "تعیین نشده"
+        b.button(text=f"موتور {eid}: {dom[:28]}", callback_data=f"scandom:{eid}")
+    b.button(text="🔙 بازگشت", callback_data="scan")
+    b.adjust(1)
+    await cb.message.edit_text(
+        "🌐 <b>تنظیم دامنه برای هر موتور اسکن</b>\n\n"
+        "هر موتور به صورت مستقل به یک دامنه در کلادفلر متصل می‌شود:\n\n"
+        f"• موتور ۱: <code>{st.cfscan(1).get('fqdn') or '—'}</code>\n"
+        f"• موتور ۲: <code>{st.cfscan(2).get('fqdn') or '—'}</code>\n"
+        f"• موتور ۳: <code>{st.cfscan(3).get('fqdn') or '—'}</code>\n\n"
+        "برای تغییر دامنهٔ هر موتور، روی دکمهٔ آن بزن:",
+        reply_markup=b.as_markup()
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("scandom:"))
+async def scan_pick_engine_dom(cb: CallbackQuery, state: FSMContext):
+    eid = int(cb.data.split(":")[1])
+    token = st.cf_token()
+    if not token:
+        await cb.answer("اول توکن کلادفلر را در بخش «DNS کلادفلر» تنظیم کن.", show_alert=True)
+        return
+    await cb.message.edit_text(f"در حال گرفتن دامنه‌ها برای موتور {eid}…")
     try:
         zones = await Cloudflare(token).zones()
     except Exception as e:
-        await cb.message.edit_text(f"❌ {html.escape(str(e)[:200])}", reply_markup=kb_scan(st.cfscan()))
+        await cb.message.edit_text(f"❌ {html.escape(str(e)[:200])}", reply_markup=kb_scan())
         await cb.answer()
         return
-    await state.update_data(zones=zones)
+    await state.update_data(zones=zones, engine_id=eid)
     b = InlineKeyboardBuilder()
     for i, (_zid, name) in enumerate(zones):
         b.button(text=name, callback_data=f"scanz:{i}")
-    b.button(text="🔙 انصراف", callback_data="scan")
+    b.button(text="🔙 انصراف", callback_data="scan_dom")
     b.adjust(1)
-    await cb.message.edit_text("دامنه‌ای که آی‌پی تمیز پشتش برود را انتخاب کن:",
+    await cb.message.edit_text(f"دامنه‌ای که آی‌پی تمیز <b>موتور {eid}</b> پشتش برود را انتخاب کن:",
                                reply_markup=b.as_markup())
     await cb.answer()
 
@@ -1465,9 +1550,11 @@ async def scan_dom(cb: CallbackQuery, state: FSMContext):
 async def scan_pick_zone(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     zid, zname = data["zones"][int(cb.data.split(":")[1])]
-    await state.update_data(zone_id=zid, zone_name=zname)
+    eid = data.get("engine_id", 1)
+    await state.update_data(zone_id=zid, zone_name=zname, engine_id=eid)
     await state.set_state(Scan.subdomain)
     await cb.message.edit_text(
+        f"موتور: <b>موتور {eid}</b>\n"
         f"دامنه: <b>{html.escape(zname)}</b>\n\n"
         f"نام ساب‌دامین را بفرست (مثلاً <code>cf</code>). برای خودِ دامنه <code>@</code>.")
     await cb.answer()
@@ -1477,10 +1564,11 @@ async def scan_pick_zone(cb: CallbackQuery, state: FSMContext):
 async def scan_sub_set(msg: Message, state: FSMContext):
     sub = msg.text.strip().lower()
     data = await state.get_data()
+    eid = data.get("engine_id", 1)
     await state.clear()
     fqdn = data["zone_name"] if sub == "@" else f"{sub}.{data['zone_name']}"
-    cfg = st.update_cfscan(zone_id=data["zone_id"], zone_name=data["zone_name"], fqdn=fqdn)
-    await msg.answer(f"✅ دامنهٔ مقصد: <code>{html.escape(fqdn)}</code>", reply_markup=kb_scan(cfg))
+    cfg = st.update_cfscan(eid, zone_id=data["zone_id"], zone_name=data["zone_name"], fqdn=fqdn)
+    await msg.answer(f"✅ دامنهٔ مقصد موتور {eid}: <code>{html.escape(fqdn)}</code>", reply_markup=kb_scan(cfg))
 
 
 @dp.callback_query(F.data == "scan_sched")
@@ -1492,15 +1580,16 @@ async def scan_sched(cb: CallbackQuery, state: FSMContext):
     b.button(text="⛔️ دستی (بدون زمان‌بندی)", callback_data="scaniv:0")
     b.button(text="🔙 بازگشت", callback_data="scan")
     b.adjust(3, 2, 1, 1)
-    await cb.message.edit_text("هر چند ساعت یک‌بار اسکن شود؟", reply_markup=b.as_markup())
+    await cb.message.edit_text("هر چند ساعت یک‌بار اسکن شود؟ (روی هر ۳ موتور اعمال می‌شود)", reply_markup=b.as_markup())
     await cb.answer()
 
 
 @dp.callback_query(F.data.startswith("scaniv:"))
 async def scan_iv_set(cb: CallbackQuery):
     h = int(cb.data.split(":")[1])
-    cfg = st.update_cfscan(interval_hours=(h or None))
-    await cb.message.edit_text(_scan_summary(cfg), reply_markup=kb_scan(cfg))
+    for eid in (1, 2, 3):
+        st.update_cfscan(eid, interval_hours=(h or None))
+    await cb.message.edit_text(_scan_summary(), reply_markup=kb_scan())
     await cb.answer("ذخیره شد")
 
 
@@ -1518,45 +1607,118 @@ async def scan_iv_custom_set(msg: Message, state: FSMContext):
         h = int(msg.text.strip())
         assert h > 0
     except Exception:
-        await msg.answer("❌ عدد معتبر بفرست.", reply_markup=kb_scan(st.cfscan()))
+        await msg.answer("❌ عدد معتبر بفرست.", reply_markup=kb_scan())
         return
-    cfg = st.update_cfscan(interval_hours=h)
-    await msg.answer(f"✅ هر {h} ساعت.", reply_markup=kb_scan(cfg))
+    for eid in (1, 2, 3):
+        st.update_cfscan(eid, interval_hours=h)
+    await msg.answer(f"✅ هر {h} ساعت برای همهٔ موتورها.", reply_markup=kb_scan())
 
 
 @dp.callback_query(F.data == "scan_auto")
 async def scan_auto(cb: CallbackQuery):
-    cfg = st.cfscan()
-    cfg = st.update_cfscan(auto_apply=not cfg.get("auto_apply"))
-    await cb.message.edit_text(_scan_summary(cfg), reply_markup=kb_scan(cfg))
-    await cb.answer("اعمال خودکار " + ("روشن" if cfg.get("auto_apply") else "خاموش"))
+    b = InlineKeyboardBuilder()
+    for eid in (1, 2, 3):
+        auto = st.cfscan(eid).get("auto_apply")
+        icon = "✅ روشن" if auto else "⚪️ خاموش"
+        dom = st.cfscan(eid).get("fqdn") or "تعیین نشده"
+        b.button(text=f"موتور {eid} ({dom[:15]}): {icon}", callback_data=f"scan_auto_eng:{eid}")
+    b.button(text="🔄 تغییر وضعیت همه", callback_data="scan_auto_eng:all")
+    b.button(text="🔙 بازگشت", callback_data="scan")
+    b.adjust(1)
+    await cb.message.edit_text(
+        "♻️ <b>اعمال خودکار آی‌پی روی دامنه‌ها</b>\n\n"
+        "وقتی هر موتور آی‌پی بهتری پیدا کند، در صورت روشن بودن اعمال خودکار، "
+        "دامنهٔ اختصاصی همان موتور در کلادفلر آپدیت می‌شود.",
+        reply_markup=b.as_markup()
+    )
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("scan_auto_eng:"))
+async def scan_auto_toggle(cb: CallbackQuery):
+    arg = cb.data.split(":")[1]
+    if arg == "all":
+        new_val = not st.cfscan(1).get("auto_apply")
+        for eid in (1, 2, 3):
+            st.update_cfscan(eid, auto_apply=new_val)
+    else:
+        eid = int(arg)
+        cur = st.cfscan(eid).get("auto_apply")
+        st.update_cfscan(eid, auto_apply=not cur)
+    await scan_auto(cb)
 
 
 @dp.callback_query(F.data == "scan_status")
 async def scan_status(cb: CallbackQuery):
-    cfg = st.cfscan()
-    ts = cfg.get("last_scan_ts")
-    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "هرگز"
-    txt = (_scan_summary(cfg) + f"\n\n🕐 آخرین اسکن: <b>{when}</b>")
-    if cfg.get("last_best"):
-        txt += f"\n📈 معیار بهترین: {_fmt_metrics(cfg['last_best'])}"
-    await cb.message.edit_text(txt, reply_markup=kb_scan(cfg))
+    lines = ["📊 <b>وضعیت زندهٔ موتورهای اسکن</b>\n"]
+    for eid in (1, 2, 3):
+        cfg = st.cfscan(eid)
+        ts = cfg.get("last_scan_ts")
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)) if ts else "هرگز"
+        st_info = engines[eid].get_status()
+        state = st_info.get("state", "idle")
+        state_str = {
+            "scanning": "🟢 در حال اسکن (Scanning)",
+            "waiting_delivery": f"⏳ در صف ارسال به گوشی‌ها ({st_info.get('eta_minutes', 0)} دقیقه دیگر)",
+            "testing": "🟢 در حال سنجش گوشی‌ها (Testing)",
+            "error": f"🔴 خطا: {html.escape(st_info.get('detail',''))}",
+            "idle": "⚪️ آماده (Idle)"
+        }.get(state, state)
+        dom = cfg.get("fqdn") or "تعیین نشده"
+        lines.append(
+            f"🔹 <b>موتور {eid} (Engine {eid})</b>\n"
+            f"• وضعیت: {state_str}\n"
+            f"• دامنهٔ متصل: <code>{html.escape(dom)}</code>\n"
+            f"• آخرین اسکن: <b>{when}</b>\n"
+            f"• بهترین آی‌پی: <code>{cfg.get('last_best_ip') or '—'}</code>"
+        )
+        if cfg.get("last_best"):
+            lines.append(f"• معیار بهترین: {_fmt_metrics(cfg['last_best'])}")
+        lines.append("")
+    b = InlineKeyboardBuilder()
+    b.button(text="🔄 به‌روزرسانی", callback_data="scan_status")
+    b.button(text="🔙 بازگشت", callback_data="scan")
+    b.adjust(1)
+    await cb.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
     await cb.answer()
 
 
 @dp.callback_query(F.data == "scan_found")
 async def scan_found(cb: CallbackQuery):
-    found = st.found_ips()
+    await show_scan_found_for_engine(cb, 1)
+
+
+@dp.callback_query(F.data.startswith("scan_found_eng:"))
+async def cb_scan_found_pick_eng(cb: CallbackQuery):
+    eid = int(cb.data.split(":")[1])
+    await show_scan_found_for_engine(cb, eid)
+
+
+async def show_scan_found_for_engine(cb: CallbackQuery, eid: int):
+    found = st.found_ips(eid)
+    b = InlineKeyboardBuilder()
+    for i in (1, 2, 3):
+        prefix = "👉 " if i == eid else ""
+        b.button(text=f"{prefix}موتور {i}", callback_data=f"scan_found_eng:{i}")
+    b.button(text="🔙 بازگشت", callback_data="scan")
+    b.adjust(3, 1)
+
+    dom = st.cfscan(eid).get("fqdn") or "—"
     if not found:
-        await cb.answer("هنوز آی‌پی‌ای ثبت نشده.", show_alert=True)
+        await cb.message.edit_text(
+            f"📋 <b>آی‌پی‌های پیدا شده - موتور {eid}</b>\n"
+            f"🌐 دامنه: <code>{html.escape(dom)}</code>\n\n"
+            "هنوز آی‌پی‌ای برای این موتور ثبت نشده.",
+            reply_markup=b.as_markup())
+        await cb.answer()
         return
-    lines = ["📋 <b>آخرین آی‌پی‌های تمیز پیدا شده</b>", ""]
-    for e in found[:12]:
+
+    lines = [f"📋 <b>آخرین آی‌پی‌های تمیز - موتور {eid}</b>",
+             f"🌐 دامنه: <code>{html.escape(dom)}</code>", ""]
+    for e in found[:10]:
         when = time.strftime("%m-%d %H:%M", time.localtime(e.get("ts", 0)))
         applied = " ✅اعمال شد" if e.get("applied") else ""
         lines.append(f"<code>{e.get('ip')}</code> — {_fmt_metrics(e)}{applied}  <i>{when}</i>")
-    b = InlineKeyboardBuilder()
-    b.button(text="🔙 بازگشت", callback_data="scan")
     await cb.message.edit_text("\n".join(lines), reply_markup=b.as_markup())
     await cb.answer()
 
@@ -1742,56 +1904,77 @@ async def _close_window(log, *, apply_if_better):
     return (keep or shortlist[0]), False, False, "منتظر سنجش هر دو گوشی"
 
 
-# Kept for the "scan now" button: close the window early, on demand.
+# Kept for compatibility: delegates to Engine 1
 async def _do_scan(log, *, apply_if_better):
-    await _scan_pass(log)
-    return await _close_window(log, apply_if_better=apply_if_better)
+    await engines[1].scan_pass(log)
+    return await engines[1].close_window(log, apply_if_better=apply_if_better)
 
 
 @dp.callback_query(F.data == "scan_now")
-async def scan_now(cb: CallbackQuery):
-    cfg = st.cfscan()
-    if not cfg.get("ssh"):
+async def scan_now_menu(cb: CallbackQuery):
+    b = InlineKeyboardBuilder()
+    for eid in (1, 2, 3):
+        dom = st.cfscan(eid).get("fqdn") or f"موتور {eid}"
+        b.button(text=f"▶️ اسکن موتور {eid} ({dom[:15]})", callback_data=f"scannow:{eid}")
+    b.button(text="🚀 اسکن همزمان هر ۳ موتور", callback_data="scannow:all")
+    b.button(text="🔙 بازگشت", callback_data="scan")
+    b.adjust(1)
+    await cb.message.edit_text("کدام موتور را می‌خواهی همین الان اسکن کنی؟", reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("scannow:"))
+async def cb_scannow_run(cb: CallbackQuery):
+    arg = cb.data.split(":")[1]
+    target_ids = [1, 2, 3] if arg == "all" else [int(arg)]
+    cfg1 = st.cfscan(1)
+    if not cfg1.get("ssh"):
         await cb.answer("اول سرور اسکن را تنظیم کن.", show_alert=True)
         return
-    await cb.answer()
-    status = await cb.message.edit_text("🔎 شروع اسکن…")
-    lines = ["🔎 <b>اسکن آی‌پی تمیز</b>", ""]
+    await cb.answer("اسکن شروع شد.")
+    status_msg = await cb.message.edit_text("🔎 شروع اسکن…")
 
-    async def logline(t):
-        lines.append(t)
+    async def run_one(eid):
+        lines = [f"🔎 <b>اسکن موتور {eid}</b>", ""]
+        async def logline(t):
+            lines.append(t)
+            try:
+                await status_msg.edit_text("\n".join(lines[-12:]))
+            except Exception:
+                pass
         try:
-            await status.edit_text("\n".join(lines[-12:]))
-        except Exception:
-            pass
+            await engines[eid].scan_pass(logline)
+            best, better, applied, why = await engines[eid].close_window(
+                logline, apply_if_better=st.cfscan(eid).get("auto_apply"))
+            return eid, best, applied, None
+        except Exception as e:
+            log.exception("[ENGINE %d] scan_now failed", eid)
+            return eid, None, False, str(e)
 
-    try:
-        best, better, applied, why = await _do_scan(
-            logline, apply_if_better=cfg.get("auto_apply"))
-        tag = ("🎉 عوض شد" if better else "همان قبلی")
-        src = html.escape(why)
-        extra = ""
-        if not applied and cfg.get("fqdn"):
-            extra = "\n\nبرای گذاشتنش پشت دامنه از دکمهٔ زیر، یا «اعمال خودکار» را روشن کن."
-        b = InlineKeyboardBuilder()
-        if not applied and cfg.get("fqdn"):
-            b.button(text=f"🌐 بگذار پشت {cfg['fqdn']}", callback_data="scan_apply_last")
-        b.button(text="🔙 منوی اسکنر", callback_data="scan")
-        b.adjust(1)
-        await status.edit_text(
-            f"✅ <b>اسکن تمام شد</b> — {tag}\n\n"
-            f"⭐️ بهترین: <code>{best['ip']}</code> — {src}\n{_fmt_metrics(best)}"
-            + (f"\n✅ روی <code>{cfg['fqdn']}</code> اعمال شد" if applied else "") + extra,
-            reply_markup=b.as_markup())
-    except Exception as e:
-        log.exception("scan_now failed")
-        await status.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:300])}</code>",
-                               reply_markup=kb_scan(cfg))
+    results = await asyncio.gather(*(run_one(eid) for eid in target_ids))
+    out_lines = ["✅ <b>نتیجهٔ اسکن:</b>\n"]
+    for eid, best, applied, err in results:
+        c = st.cfscan(eid)
+        dom = c.get("fqdn") or "—"
+        if err:
+            out_lines.append(f"❌ <b>موتور {eid}:</b> خطا: <code>{html.escape(err[:100])}</code>")
+        elif best:
+            app_str = " (✅ اعمال شد)" if applied else ""
+            out_lines.append(
+                f"🔹 <b>موتور {eid}</b> (دامنه: <code>{dom}</code>)\n"
+                f"   ⭐️ بهترین: <code>{best['ip']}</code>{app_str}\n"
+                f"   {_fmt_metrics(best)}\n"
+            )
+    b = InlineKeyboardBuilder()
+    b.button(text="🔙 منوی اسکنر", callback_data="scan")
+    await status_msg.edit_text("\n".join(out_lines), reply_markup=b.as_markup())
 
 
-@dp.callback_query(F.data == "scan_apply_last")
+@dp.callback_query(F.data.startswith("scan_apply_last"))
 async def scan_apply_last(cb: CallbackQuery):
-    cfg = st.cfscan()
+    parts = cb.data.split(":")
+    eid = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
+    cfg = st.cfscan(eid)
     ip = cfg.get("last_best_ip")
     fqdn = cfg.get("fqdn")
     if not (ip and fqdn):
@@ -1800,176 +1983,40 @@ async def scan_apply_last(cb: CallbackQuery):
     await cb.answer()
     try:
         await _apply_ip(fqdn, ip)
-        await cb.message.edit_text(f"✅ <code>{fqdn}</code> → <code>{ip}</code>",
-                                   reply_markup=kb_scan(cfg))
+        await cb.message.edit_text(f"✅ موتور {eid}: <code>{fqdn}</code> → <code>{ip}</code>",
+                                   reply_markup=kb_scan())
     except Exception as e:
-        await cb.message.edit_text(f"❌ {html.escape(str(e)[:200])}", reply_markup=kb_scan(cfg))
+        await cb.message.edit_text(f"❌ {html.escape(str(e)[:200])}", reply_markup=kb_scan())
 
 
 async def phone_recheck():
-    """
-    Re-run the choice when the phones have something new to say.
-
-    The scan sets the shortlist every six hours; the phones answer whenever
-    they get round to it. Deciding only at scan time would leave a report
-    unused for most of a cycle, and the phones are the half of this that speaks
-    for the customers. The relay's numbers from the last scan are reused - they
-    describe the very addresses in question, and rescanning on every report
-    would cost far more than it is worth.
-    """
-    await asyncio.sleep(90)
-    while True:
-        await asyncio.sleep(120)
+    """Run independent phone recheck loops for Engine 1, Engine 2, and Engine 3 concurrently."""
+    async def _notify(text):
         try:
-            cfg = st.cfscan()
-            cand = st.scan_candidates()
-            if time.time() - (cand.get("ts") or 0) > 12 * 3600:
-                continue                      # too old to act on
-            metrics = cand.get("metrics") or {}
-            results = [dict(metrics[ip], ip=ip) for ip in cand.get("ips", [])
-                       if metrics.get(ip, {}).get("rtt")]
-            if not results:
-                continue
-            results.sort(key=cfscanner.score)
-
-            fqdn = cfg.get("fqdn")
-            if not (fqdn and st.cf_token()):
-                continue
-            cf = Cloudflare(st.cf_token())
-            zone = await cf.zone_for(fqdn)
-            rec = await cf.find_a_record(zone[0], fqdn) if zone else None
-            live_ip = rec["content"] if rec else None
-
-            blocked_now = _record_blocked()
-            on_list = {r["ip"] for r in results}
-
-            # If any phone got through to anything here, the list is doing its
-            # job and `choose` has something to work with; replacing it would
-            # throw away the one thing we were looking for.
-            usable = any(
-                x.get("ok") and x.get("ip") in on_list
-                for r in _fresh_reports().values()
-                for x in (r.get("results") or []))
-
-            # Otherwise, wait until every phone that is online has finished with
-            # this list. A round can take a quarter of an hour, so replacing the
-            # list the moment the first phone rejects it threw away the second
-            # phone's work - and two phones that never measure the same list can
-            # never agree on anything, which is the whole point of having two.
-            # A phone that is offline is not waited for.
-            pending = []
-            if not usable:
-                for d, _i in _phone_status()[0]:
-                    seen = {x["ip"] for x in
-                            ((st.device_reports().get(d) or {}).get("results") or [])}
-                    if not (seen & on_list):
-                        pending.append(d)
-                if pending:
-                    log.info("waiting for %s to finish this list", ", ".join(pending))
-
-            if not usable and not pending and on_list and on_list <= blocked_now:
-                # Every address here was refused by a phone that was working.
-                async def rlog(t):
-                    log.info("reshortlist: %s", t)
-                if await _reshortlist(rlog):
-                    continue
-
-            d = await decide(results, live_ip, cand)
-            if d["why"] != st.get("scan_last_decision"):
-                st.set("scan_last_decision", d["why"])
-                log.info("scan decision (live %s, %d phones): %s",
-                         live_ip, d["voters"], d["why"])
-            await _warn_silent_phones(cand, d)
-            if not d["change"]:
-                if d["entry"]:
-                    st.update_cfscan(last_best_ip=d["entry"]["ip"], last_best=d["entry"])
-                continue
-
-            chosen, why = d["entry"], d["why"]
-            st.update_cfscan(last_best_ip=chosen["ip"], last_best=chosen)
-            applied = False
-            if cfg.get("auto_apply"):
-                if rec:
-                    await cf.update_a(zone[0], rec, chosen["ip"])
-                else:
-                    await cf.create_a(zone[0], fqdn, chosen["ip"], proxied=False)
-                applied = True
-                st.add_found_ip({**chosen, "applied": True, "by_phone": True,
-                                 "phones": d["voters"]})
-            elif st.get("scan_suggested") == "%s|%s" % (cand.get("ts"), chosen["ip"]):
-                continue          # already told the owner about this one
-            else:
-                st.set("scan_suggested", "%s|%s" % (cand.get("ts"), chosen["ip"]))
-
-            msg = (f"🔄 <b>آی‌پی دامنه عوض شد</b>\n\n"
-                   f"از <code>{live_ip or '—'}</code> به <code>{chosen['ip']}</code>\n"
-                   f"{why}\n{_fmt_metrics(chosen)}")
-            if not applied:
-                msg = msg.replace("عوض شد", "آمادهٔ تعویض است", 1)
-                msg += "\n\n<i>اعمال خودکار خاموش است؛ روی دامنه گذاشته نشد.</i>"
-            try:
-                await bot.send_message(OWNER, msg)
-            except Exception:
-                log.exception("recheck alert delivery failed")
+            await bot.send_message(OWNER, text)
         except Exception:
-            log.exception("phone recheck pass failed")
+            log.exception("notify failed")
+
+    tasks = [
+        asyncio.create_task(engines[eid].recheck_loop(notify_fn=_notify))
+        for eid in (1, 2, 3)
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def scan_scheduler():
-    """
-    Scan continuously; every `interval_hours`, judge what the window found.
-
-    The relay is idle almost all the time and its whole job is finding clean
-    addresses, so it scans around the clock rather than once a cycle: six hours
-    of passes see far more of the Cloudflare space than one pass ever could, and
-    a good address that only appears at 3am is no longer missed. The window is
-    what makes that useful - the phones cannot be asked about a list that
-    changes every ten minutes, so the results accumulate and are judged
-    together.
-    """
-    await asyncio.sleep(20)
-    while True:
-        gap = SCAN_GAP_MINUTES * 60
+    """Run independent scan scheduler loops for Engine 1, Engine 2, and Engine 3 concurrently."""
+    async def _notify(text):
         try:
-            cfg = st.cfscan()
-            if not cfg.get("ssh"):
-                await asyncio.sleep(gap)
-                continue
-
-            async def qlog(t):
-                log.info("scan: %s", t)
-
-            pool = st.scan_pool()
-            iv = cfg.get("interval_hours") or 6
-            started = pool.get("started") or 0
-            if not started:
-                st.pool_reset()
-                started = time.time()
-
-            found = await _scan_pass(qlog)
-            log.info("scan pass: %d addresses into the pool (%d in window)",
-                     found, len(st.scan_pool().get("ips") or {}))
-
-            if time.time() - started >= iv * 3600:
-                best, changed, applied, why = await _close_window(
-                    qlog, apply_if_better=cfg.get("auto_apply"))
-                if changed or applied:
-                    head = ("🎉 <b>آی‌پی انتخابی عوض شد</b>" if changed
-                            else "🔄 <b>آی‌پی دامنه به‌روزرسانی شد</b>")
-                    msg = (f"{head}\n\n⭐️ <code>{best['ip']}</code> — "
-                           f"{html.escape(why)}\n{_fmt_metrics(best)}")
-                    if applied and cfg.get("fqdn"):
-                        msg += f"\n\n✅ روی <code>{cfg['fqdn']}</code> اعمال شد."
-                    elif cfg.get("fqdn"):
-                        msg += (f"\n\nبرای گذاشتنش پشت <code>{cfg['fqdn']}</code> "
-                                f"«اعمال خودکار» را روشن کن.")
-                    try:
-                        await bot.send_message(OWNER, msg)
-                    except Exception:
-                        log.exception("scan alert delivery failed")
+            await bot.send_message(OWNER, text)
         except Exception:
-            log.exception("scan scheduler pass failed")
-        await asyncio.sleep(gap)
+            log.exception("notify failed")
+
+    tasks = [
+        asyncio.create_task(engines[eid].scan_loop(notify_fn=_notify))
+        for eid in (1, 2, 3)
+    ]
+    await asyncio.gather(*tasks, return_exceptions=True)
 
 
 # ==========================================================================

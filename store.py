@@ -44,23 +44,32 @@ CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
-def _fernet():
-    if not os.path.exists(KEY_PATH):
-        os.makedirs(os.path.dirname(KEY_PATH), exist_ok=True)
-        fd = os.open(KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def _fernet(key_path=None):
+    kp = key_path or os.environ.get("CLOUDBOT_KEY", KEY_PATH)
+    if not os.path.exists(kp):
+        os.makedirs(os.path.dirname(kp), exist_ok=True)
+        fd = os.open(kp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(Fernet.generate_key())
-    with open(KEY_PATH, "rb") as f:
+    with open(kp, "rb") as f:
         return Fernet(f.read())
 
 
 class Store:
-    def __init__(self):
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        self.con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    def __init__(self, db_path=None, key_path=None):
+        self.db_path = db_path or os.environ.get("CLOUDBOT_DB", DB_PATH)
+        self.key_path = key_path or os.environ.get("CLOUDBOT_KEY", KEY_PATH)
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.con = sqlite3.connect(self.db_path, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
         self.con.executescript(SCHEMA)
-        self.f = _fernet()
+        self.f = _fernet(self.key_path)
+
+    def close(self):
+        try:
+            self.con.close()
+        except Exception:
+            pass
 
     # ---- accounts ------------------------------------------------------
     def add_account(self, label, provider, token, proxy=None):
@@ -170,32 +179,68 @@ class Store:
         return self.f.decrypt(v.encode()).decode() if v else None
 
     # ---- clean-IP scanner config (encrypted; holds the scan server SSH) -
-    def set_cfscan(self, cfg: dict):
+    def set_cfscan(self, cfg: dict, engine_id: int = 1):
         import json
-        self.set("cfscan", self.f.encrypt(json.dumps(cfg).encode()).decode())
+        key = f"cfscan_engine_{engine_id}"
+        enc = self.f.encrypt(json.dumps(cfg).encode()).decode()
+        self.set(key, enc)
+        if engine_id == 1:
+            self.set("cfscan", enc)
 
-    def cfscan(self) -> dict:
+    def cfscan(self, engine_id: int = 1) -> dict:
         import json
-        v = self.get("cfscan")
-        return json.loads(self.f.decrypt(v.encode()).decode()) if v else {}
+        key = f"cfscan_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("cfscan")
+        if v:
+            try:
+                return json.loads(self.f.decrypt(v.encode()).decode())
+            except Exception:
+                pass
+        # Default configuration for Engine 2 or 3: inherit scan server (ssh),
+        # interval_hours, and auto_apply from Engine 1 by default, but maintain
+        # separate domain and result states.
+        if engine_id != 1:
+            base = self.cfscan(engine_id=1)
+            return {
+                "ssh": base.get("ssh"),
+                "interval_hours": base.get("interval_hours", 6),
+                "auto_apply": base.get("auto_apply", False),
+                "zone_id": None,
+                "zone_name": None,
+                "fqdn": None,
+                "last_scan_ts": 0,
+                "last_best_ip": None,
+                "last_best": None,
+            }
+        return {}
 
-    def update_cfscan(self, **fields):
-        cfg = self.cfscan()
+    def update_cfscan(self, engine_id: int = 1, **fields):
+        engine_id = fields.pop("engine_id", engine_id)
+        cfg = self.cfscan(engine_id=engine_id)
         cfg.update(fields)
-        self.set_cfscan(cfg)
+        self.set_cfscan(cfg, engine_id=engine_id)
         return cfg
 
-    def add_found_ip(self, entry: dict, keep=20):
+    def add_found_ip(self, entry: dict, keep=20, engine_id: int = 1):
         """Record a newly chosen best IP (metrics only, no secrets)."""
         import json, time
-        hist = self.found_ips()
-        entry = {**entry, "ts": int(time.time())}
+        engine_id = entry.get("engine_id", engine_id)
+        hist = self.found_ips(engine_id=engine_id)
+        entry = {**entry, "ts": int(time.time()), "engine_id": engine_id}
         hist.insert(0, entry)
-        self.set("cfscan_found", json.dumps(hist[:keep]))
+        key = f"cfscan_found_engine_{engine_id}"
+        self.set(key, json.dumps(hist[:keep]))
+        if engine_id == 1:
+            self.set("cfscan_found", json.dumps(hist[:keep]))
 
-    def found_ips(self) -> list:
+    def found_ips(self, engine_id: int = 1) -> list:
         import json
-        v = self.get("cfscan_found")
+        key = f"cfscan_found_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("cfscan_found")
         return json.loads(v) if v else []
 
     # ---- subscription link (encrypted: it is a bearer secret) ----------
@@ -315,7 +360,7 @@ class Store:
     # see a different one, and an address that is only clean where the relay
     # sits is not clean for the customers. These tables hold what the phones
     # were asked to test and what they found.
-    def set_scan_candidates(self, entries: list, controls=None, keep=45):
+    def set_scan_candidates(self, entries: list, controls=None, keep=45, engine_id: int = 1):
         """
         The shortlist handed to the phones, with the relay's own numbers kept.
 
@@ -335,26 +380,44 @@ class Store:
                     metrics[ip] = {k: v for k, v in e.items() if k != "ip"}
             if ip:
                 ips.append(ip)
-        self.set("scan_candidates", json.dumps(
-            {"ts": int(time.time()), "ips": ips, "metrics": metrics,
-             # Reference addresses, handed to the phones mixed in with the real
-             # candidates but never judged as candidates themselves.
-             "controls": [c for c in (controls or []) if c]}))
+        payload = {
+            "ts": int(time.time()), "engine_id": engine_id, "ips": ips, "metrics": metrics,
+            # Reference addresses, handed to the phones mixed in with the real
+            # candidates but never judged as candidates themselves.
+            "controls": [c for c in (controls or []) if c]
+        }
+        key = f"scan_candidates_engine_{engine_id}"
+        self.set(key, json.dumps(payload))
+        self.set("scan_candidates", json.dumps(payload))
+        if engine_id == 1:
+            self.set("scan_candidates_engine_1", json.dumps(payload))
 
-    def set_candidate_meta(self, **fields):
+    def set_candidate_meta(self, engine_id: int = 1, **fields):
         """Bookkeeping that rides with the shortlist: what has been tried this
         window, and how many replacement lists have gone out."""
         import json
-        v = self.get("scan_candidates")
+        engine_id = fields.pop("engine_id", engine_id)
+        key = f"scan_candidates_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("scan_candidates")
         d = json.loads(v) if v else {}
         d.update(fields)
+        self.set(key, json.dumps(d))
         self.set("scan_candidates", json.dumps(d))
 
-    def scan_candidates(self) -> dict:
+    def scan_candidates(self, engine_id=None) -> dict:
         import json
-        v = self.get("scan_candidates")
+        if engine_id is not None:
+            key = f"scan_candidates_engine_{engine_id}"
+            v = self.get(key)
+            if not v and engine_id == 1:
+                v = self.get("scan_candidates")
+        else:
+            v = self.get("scan_candidates")
         d = json.loads(v) if v else {}
-        return {"ts": d.get("ts", 0), "ips": d.get("ips", []),
+        return {"ts": d.get("ts", 0), "engine_id": d.get("engine_id", engine_id or 1),
+                "ips": d.get("ips", []),
                 "metrics": d.get("metrics", {}),
                 "controls": d.get("controls", []),
                 "tried": d.get("tried", []),
@@ -366,9 +429,9 @@ class Store:
     # Keeping the pool rather than the last scan's output is the difference
     # between "the best of the last minute" and "the best of the last six
     # hours", which is what the whole cycle is supposed to mean.
-    def pool_add(self, entries: list, keep=200):
+    def pool_add(self, entries: list, keep=200, engine_id: int = 1):
         import json, time
-        pool = self.scan_pool()
+        pool = self.scan_pool(engine_id=engine_id)
         seen = pool.get("ips") or {}
         now = int(time.time())
         for e in entries:
@@ -387,19 +450,59 @@ class Store:
         pool["ips"] = seen
         pool.setdefault("started", now)
         pool["passes"] = int(pool.get("passes") or 0) + 1
-        self.set("scan_pool", json.dumps(pool))
+        key = f"scan_pool_engine_{engine_id}"
+        self.set(key, json.dumps(pool))
+        if engine_id == 1:
+            self.set("scan_pool", json.dumps(pool))
 
-    def scan_pool(self) -> dict:
+    def scan_pool(self, engine_id: int = 1) -> dict:
         import json
-        v = self.get("scan_pool")
+        key = f"scan_pool_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("scan_pool")
         d = json.loads(v) if v else {}
         return {"started": d.get("started") or 0, "ips": d.get("ips") or {},
                 "passes": int(d.get("passes") or 0)}
 
-    def pool_reset(self):
+    def pool_reset(self, engine_id: int = 1):
         import json, time
-        self.set("scan_pool", json.dumps(
-            {"started": int(time.time()), "ips": {}, "passes": 0}))
+        payload = {"started": int(time.time()), "ips": {}, "passes": 0}
+        key = f"scan_pool_engine_{engine_id}"
+        self.set(key, json.dumps(payload))
+        if engine_id == 1:
+            self.set("scan_pool", json.dumps(payload))
+
+    # ---- head-to-head cached measurements per engine -------------------
+    def scan_h2h(self, engine_id: int = 1) -> dict:
+        import json
+        key = f"scan_h2h_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("scan_h2h")
+        return json.loads(v) if v else {}
+
+    def set_scan_h2h(self, data: dict, engine_id: int = 1):
+        import json
+        key = f"scan_h2h_engine_{engine_id}"
+        self.set(key, json.dumps(data))
+        if engine_id == 1:
+            self.set("scan_h2h", json.dumps(data))
+
+    # ---- engine runtime status tracking --------------------------------
+    def engine_status(self, engine_id: int = 1) -> dict:
+        import json
+        v = self.get(f"engine_status_{engine_id}")
+        d = json.loads(v) if v else {}
+        d.setdefault("state", "idle")
+        d.setdefault("detail", "")
+        d.setdefault("ts", 0)
+        return d
+
+    def set_engine_status(self, engine_id: int, state: str, detail: str = ""):
+        import json, time
+        payload = {"state": state, "detail": detail, "ts": int(time.time())}
+        self.set(f"engine_status_{engine_id}", json.dumps(payload))
 
     # ---- addresses a phone could not reach ------------------------------
     # An operator that cuts the TLS handshake to an address leaves it looking
