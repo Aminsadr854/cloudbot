@@ -15,7 +15,9 @@ sys.modules.setdefault("aiohttp", MagicMock())
 
 import store
 import cfscanner
+import scanner_engine
 from scanner_engine import ScannerEngine, PhoneDeliveryCoordinator, choose, decide
+
 
 
 class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
@@ -498,7 +500,80 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(best_ip_display, "—")
         self.assertNotEqual(best_ip_display, "85.9.109.98")
 
+    # Test 8 — Control IP: never returns 127.0.0.1 when using production/default configuration
+    def test_regression_8_control_ips_never_localhost_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            ctrls = scanner_engine._control_ips()
+            self.assertNotIn("127.0.0.1", ctrls)
+
+    # Test 9 — Default control host resolves from https://status.etesalpaya.com
+    def test_regression_9_control_ips_default_resolves_status_etesalpaya(self):
+        with patch.dict(os.environ, {}, clear=True):
+            with patch("socket.gethostbyname", return_value="91.108.145.140") as mock_dns:
+                ctrls = scanner_engine._control_ips()
+                mock_dns.assert_called_once_with("status.etesalpaya.com")
+                self.assertEqual(ctrls, ["91.108.145.140"])
+
+    # Test 10 — CLOUDBOT_PROBE_BASE takes precedence when defined
+    def test_regression_10_control_ips_precedence_probe_base(self):
+        env = {
+            "CLOUDBOT_PROBE_BASE": "https://primary.probe.com",
+            "CLOUDBOT_PROBE": "https://legacy.probe.com"
+        }
+        with patch.dict(os.environ, env, clear=True):
+            with patch("socket.gethostbyname", return_value="1.2.3.4") as mock_dns:
+                ctrls = scanner_engine._control_ips()
+                mock_dns.assert_called_once_with("primary.probe.com")
+                self.assertEqual(ctrls, ["1.2.3.4"])
+
+    # Test 11 — Legacy CLOUDBOT_PROBE works if CLOUDBOT_PROBE_BASE is absent
+    def test_regression_11_control_ips_legacy_probe_fallback(self):
+        env = {"CLOUDBOT_PROBE": "https://legacy.probe.com"}
+        with patch.dict(os.environ, env, clear=True):
+            with patch("socket.gethostbyname", return_value="5.6.7.8") as mock_dns:
+                ctrls = scanner_engine._control_ips()
+                mock_dns.assert_called_once_with("legacy.probe.com")
+                self.assertEqual(ctrls, ["5.6.7.8"])
+
+    # Test 12 — _report_trusted() rejects Wi-Fi or empty measurements
+    def test_regression_12_report_trusted_behavior_unchanged(self):
+        controls = {"91.108.145.140"}
+        # Wi-Fi rejected
+        ok, why = scanner_engine._report_trusted({"net": "wifi", "results": [{"ip": "104.16.1.1", "ok": True}]}, controls)
+        self.assertFalse(ok)
+        self.assertIn("وای‌فای", why)
+
+        # Empty rejected
+        ok, why = scanner_engine._report_trusted({"net": "cellular", "results": []}, controls)
+        self.assertFalse(ok)
+        self.assertIn("چیزی اندازه‌گیری نشده بود", why)
+
+    # Test 13 — Phone report with successful candidates + successful control is classified as trusted
+    def test_regression_13_phone_report_trusted_with_control_success(self):
+        controls = {"91.108.145.140"}
+        results = [
+            {"ip": "104.16.1.1", "ok": True, "rtt_ms": 35.0, "loss": 0.0},
+            {"ip": "91.108.145.140", "ok": True, "rtt_ms": 20.0, "loss": 0.0}
+        ]
+        rep = {"net": "cellular", "results": results}
+        ok, why = scanner_engine._report_trusted(rep, controls)
+        self.assertTrue(ok)
+        self.assertEqual(why, "")
+
+    # Test 14 — Phone report where control probe fails remains untrusted
+    def test_regression_14_phone_report_untrusted_when_control_fails(self):
+        controls = {"91.108.145.140"}
+        results = [
+            {"ip": "104.16.1.1", "ok": False, "rtt_ms": None, "loss": 1.0},
+            {"ip": "91.108.145.140", "ok": False, "rtt_ms": None, "loss": 1.0}
+        ]
+        rep = {"net": "cellular", "results": results}
+        ok, why = scanner_engine._report_trusted(rep, controls)
+        self.assertFalse(ok)
+        self.assertIn("سرور ایران هم از این گوشی جواب نداد", why)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 

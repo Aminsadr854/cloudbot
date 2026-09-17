@@ -33,13 +33,17 @@ DELIVERY_OFFSET_SECONDS = 5 * 60  # 5 minutes offset between engine phone delive
 
 def _control_ips() -> list:
     """The reference address handed to phones alongside real candidates."""
-    probe_base = os.environ.get("CLOUDBOT_PROBE", "http://127.0.0.1:9600")
+    probe_base = os.environ.get(
+        "CLOUDBOT_PROBE_BASE",
+        os.environ.get("CLOUDBOT_PROBE", "https://status.etesalpaya.com")
+    )
     host = probe_base.split("//", 1)[-1].split("/")[0].split(":")[0]
     try:
         import socket
         return [socket.gethostbyname(host)]
     except Exception:
         return []
+
 
 
 def _report_trusted(rep: dict, controls: set) -> tuple[bool, str]:
