@@ -27,14 +27,15 @@ def _load_scanner() -> str:
 
 
 async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
-                   final=20, host="speed.cloudflare.com", include=None,
-                   limit=0, only=None, no_speed=False, engine_id: int = 1,
+                   final=20, host="speed.cloudflare.com", sni: str | None = None,
+                   include=None, limit=0, only=None, no_speed=False, engine_id: int = 1,
                    remote_out: str | None = None):
     """
     SSH to `ssh` (optionally via `jump`), run the scanner, return the ranked
     result list (best first). Each item: ip, rtt, jitter, loss, rtt_max, mbps.
     `log` is an async callable for progress.
     `engine_id` isolates output files on the remote server when multiple engines scan.
+    `sni` allows probing with the actual domain SNI.
     """
     out_file = remote_out or (f"/root/cf_bot_scan_engine_{engine_id}" if engine_id else REMOTE_OUT)
     conn = await tunnel.connect(ssh["host"], int(ssh.get("port", 22)),
@@ -52,7 +53,9 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
         cmd = (
             f"ulimit -n 65535 2>/dev/null; "
             f"python3 {REMOTE_SCANNER} --per-24 {per_24} --rounds {rounds} "
-            f"--final {final} --host {host} --concurrency 500 "
+            f"--final {final} --host {host} "
+            + (f"--sni {sni} " if sni else "")
+            + f"--concurrency 500 "
             # A fixed sample size rather than the whole announced space: the
             # addresses are shuffled across every /24 first, so a thousand of
             # them is a fair picture of the whole and finishes in a minute.

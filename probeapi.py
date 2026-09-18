@@ -33,11 +33,13 @@ def _auth(request) -> bool:
 
 
 async def candidates(request):
-    """The addresses the phones should measure: the last scan's shortlist."""
+    """The addresses the phones should measure: the last scan's shortlist for an explicit engine."""
     if not _auth(request):
         return web.json_response({"error": "unauthorised"}, status=401)
     eng_param = request.query.get("engine")
     engine_id = int(eng_param) if eng_param and eng_param.isdigit() else None
+    if engine_id is None:
+        engine_id = st.active_probe_engine()
     c = st.scan_candidates(engine_id=engine_id)
     # Asking for work is itself proof of life; there is no separate heartbeat to
     # get out of step with reality.
@@ -47,38 +49,23 @@ async def candidates(request):
                         request.query.get("net", "")[:16],
                         request.query.get("app", "")[:16])
     # The reference addresses travel with the candidates and look no different
-    # to the phone, which measures them the same way. Keeping the distinction
-    # here rather than in the app means it can change without reinstalling
-    # anything on a handset.
+    # to the phone, which measures them the same way.
     ips = list(c.get("ips", []))
     for ip in c.get("controls", []):
         if ip not in ips:
             ips.append(ip)
-    eng_cfg = st.cfscan(engine_id=c.get("engine_id") or 1)
+    host, engine_sni = st.get_engine_targets(engine_id)
+
     return web.json_response({
         "ts": c.get("ts", 0),
-        "engine_id": c.get("engine_id", 1),
+        "engine_id": engine_id,
         "ips": ips,
-        # The phones take their schedule from here, so it can be changed from
-        # Telegram and applied without reinstalling anything.
         "interval_hours": st.probe_interval(),
-        # Told rather than hardcoded, so the test can be changed from the server
-        # without shipping a new app to phones that may never be updated.
         "port": 443,
         "rounds": 4,
         "timeout_ms": 4000,
-        # The name the handshake asks for. It used to be hardcoded to a
-        # Cloudflare speedtest host, which is not what a customer's connection
-        # looks like at all - and an operator that filters on the name would
-        # then condemn every address for a reason that has nothing to do with
-        # the address. The customer's own domain is the honest thing to measure.
-        # What a customer's client really asks for. For a CDN config this is a
-        # different domain from the address, so the address is the wrong thing
-        # to hand a phone - it would measure a handshake nobody makes.
-        "sni": (st.get("probe_sni") or eng_cfg.get("fqdn")
-                or "speed.cloudflare.com"),
-        # Tried only where the first name failed, to tell "this address is
-        # blocked" apart from "this name is blocked".
+        "host": host,
+        "sni": engine_sni,
         "sni_alt": "speed.cloudflare.com",
     })
 
@@ -126,11 +113,25 @@ async def report(request):
         if stage in ("ok", "tls", "tcp", "sni"):
             entry["stage"] = stage
         clean.append(entry)
-    st.save_device_report(device, operator, clean, net, app)
+    eng_param = request.query.get("engine")
+    body_eid = body.get("engine_id")
+    engine_id = int(body_eid) if body_eid else (int(eng_param) if eng_param and eng_param.isdigit() else None)
+
+    if engine_id is None:
+        rep_ips = {str(r.get("ip") or "") for r in clean if r.get("ip")}
+        for eid in (1, 2, 3):
+            cand_ips = set(st.scan_candidates(engine_id=eid).get("ips") or [])
+            if rep_ips & cand_ips:
+                engine_id = eid
+                break
+    if engine_id is None:
+        engine_id = st.active_probe_engine()
+
+    st.save_device_report(device, operator, clean, net, app, engine_id=engine_id)
     st.touch_device(device, operator, net, app)
-    log.info("report from %s (%s/%s app=%s): %d results",
-             device, operator, net or "?", app or "?", len(clean))
-    return web.json_response({"ok": True, "accepted": len(clean)})
+    log.info("report from %s for ENGINE %d (%s/%s app=%s): %d results",
+             device, engine_id, operator, net or "?", app or "?", len(clean))
+    return web.json_response({"ok": True, "accepted": len(clean), "engine_id": engine_id})
 
 
 def _num(v):
@@ -144,10 +145,6 @@ def _num(v):
 async def ping(request):
     """
     A few bytes that mean "this handset is switched on and has a network".
-
-    Measuring is expensive and happens twice a day; knowing whether a phone is
-    alive has to be far cheaper than that or it defeats the point of the
-    schedule. This carries no data and does no work beyond a timestamp.
     """
     if not _auth(request):
         return web.json_response({"error": "unauthorised"}, status=401)
@@ -156,35 +153,26 @@ async def ping(request):
         st.touch_device(dev, request.query.get("operator", "")[:48],
                         request.query.get("net", "")[:16],
                         request.query.get("app", "")[:16])
-    # The two six-hour clocks - the server's window and the handset's own timer
-    # - never lined up, so a phone could spend every cycle measuring the list
-    # that was about to be replaced, and its verdict was never used at all. The
-    # window now asks for the round rather than hoping the phone's timer lands
-    # in the right place: a phone that has not reported since this shortlist was
-    # published is told to measure it now.
-    # Whether the phone has measured *this* list, judged by what it actually
-    # reported rather than by when it reported. A round takes a quarter of an
-    # hour: a phone that started before a new list was published finishes after
-    # it, so its timestamp looks current while its measurements are of the list
-    # before. Comparing the addresses is the only reading that is not fooled.
+
     eng_param = request.query.get("engine")
     engine_id = int(eng_param) if eng_param and eng_param.isdigit() else None
+    if engine_id is None:
+        engine_id = st.active_probe_engine()
+
     cand = st.scan_candidates(engine_id=engine_id)
     current = set(cand.get("ips") or [])
-    rep = st.device_reports().get(dev) or {}
+    rep = st.device_reports(engine_id=engine_id).get(dev) or {}
     measured = {x.get("ip") for x in (rep.get("results") or [])}
-    # A round run before the handshake name changed measured something else,
-    # however recent it looks and however well its addresses match.
-    sni_ts = int(st.get("probe_sni_ts") or 0)
+
+    eng_cfg = st.cfscan(engine_id=engine_id)
+    sni_ts = int(eng_cfg.get("sni_ts") or st.get("probe_sni_ts") or 0)
     stale_test = sni_ts and (rep.get("ts") or 0) < sni_ts
-    # A list published after the phone's last round must be measured again,
-    # even where it shares addresses with that round: only rounds taken on
-    # the current list count towards moving the domain.
     listed_ts = int(cand.get("ts") or 0)
     old_round = bool(listed_ts) and (rep.get("ts") or 0) < listed_ts
     run_now = bool(current) and (stale_test or old_round or not (measured & current))
     return web.json_response({
         "ok": True,
+        "engine_id": engine_id,
         "interval_hours": st.probe_interval(),
         "run_now": run_now,
     })

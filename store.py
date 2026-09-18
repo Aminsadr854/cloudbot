@@ -243,6 +243,19 @@ class Store:
             v = self.get("cfscan_found")
         return json.loads(v) if v else []
 
+    def get_engine_targets(self, engine_id: int = 1) -> tuple[str, str]:
+        """Returns (host, sni) for a specific engine, fully isolated."""
+        cfg = self.cfscan(engine_id)
+        fqdn = (cfg.get("fqdn") or "").strip()
+        explicit_sni = (cfg.get("sni") or "").strip()
+        explicit_host = (cfg.get("host") or "").strip()
+
+        sni = explicit_sni
+        if not sni:
+            sni = (self.get("probe_sni") or fqdn or "speed.cloudflare.com").strip()
+        host = explicit_host or fqdn or sni
+        return host, sni
+
     # ---- subscription link (encrypted: it is a bearer secret) ----------
     def set_sub_url(self, url):
         self.set("sub_url", self.f.encrypt(url.encode()).decode())
@@ -363,11 +376,7 @@ class Store:
     def set_scan_candidates(self, entries: list, controls=None, keep=45, engine_id: int = 1):
         """
         The shortlist handed to the phones, with the relay's own numbers kept.
-
-        Storing the metrics beside the addresses is what lets the phone verdicts
-        be ranked across the whole shortlist later, instead of across the short
-        history of addresses that happened to be applied. Plain IP strings are
-        still accepted, for callers that have nothing more to say.
+        Isolated strictly per engine: scan_candidates_engine_{engine_id}.
         """
         import json, time
         ips, metrics = [], {}
@@ -382,38 +391,45 @@ class Store:
                 ips.append(ip)
         payload = {
             "ts": int(time.time()), "engine_id": engine_id, "ips": ips, "metrics": metrics,
-            # Reference addresses, handed to the phones mixed in with the real
-            # candidates but never judged as candidates themselves.
             "controls": [c for c in (controls or []) if c]
         }
         key = f"scan_candidates_engine_{engine_id}"
         self.set(key, json.dumps(payload))
+        # Keep legacy pointer updated with the latest engine's payload
         self.set("scan_candidates", json.dumps(payload))
-        if engine_id == 1:
-            self.set("scan_candidates_engine_1", json.dumps(payload))
 
     def set_candidate_meta(self, engine_id: int = 1, **fields):
-        """Bookkeeping that rides with the shortlist: what has been tried this
-        window, and how many replacement lists have gone out."""
+        """Bookkeeping that rides with the shortlist for a specific engine."""
         import json
         engine_id = fields.pop("engine_id", engine_id)
         key = f"scan_candidates_engine_{engine_id}"
         v = self.get(key)
-        if not v and engine_id == 1:
-            v = self.get("scan_candidates")
         d = json.loads(v) if v else {}
         d.update(fields)
         self.set(key, json.dumps(d))
-        self.set("scan_candidates", json.dumps(d))
+
+    def active_probe_engine(self) -> int:
+        """Find which engine currently has the freshest unmeasured shortlist."""
+        import json
+        best_eid = 1
+        best_ts = 0
+        for eid in (1, 2, 3):
+            v = self.get(f"scan_candidates_engine_{eid}")
+            if v:
+                d = json.loads(v)
+                ts = d.get("ts", 0)
+                if ts > best_ts:
+                    best_ts = ts
+                    best_eid = eid
+        return best_eid
 
     def scan_candidates(self, engine_id=None) -> dict:
         import json
-        if engine_id is not None:
-            key = f"scan_candidates_engine_{engine_id}"
-            v = self.get(key)
-            if not v and engine_id == 1:
-                v = self.get("scan_candidates")
-        else:
+        if engine_id is None:
+            engine_id = self.active_probe_engine()
+        key = f"scan_candidates_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
             v = self.get("scan_candidates")
         d = json.loads(v) if v else {}
         return {"ts": d.get("ts", 0), "engine_id": d.get("engine_id", engine_id or 1),
@@ -542,15 +558,28 @@ class Store:
         return t
 
     def save_device_report(self, device: str, operator: str, results: list,
-                           net: str = "", app: str = "", keep_devices=12):
+                           net: str = "", app: str = "", keep_devices=12,
+                           engine_id: int = 1):
         """`net` is what the phone was actually on when it measured. A round
         taken over Wi-Fi still carries the SIM's operator name, so without this
         it would pass as a measurement of that operator's route."""
         import json, time
-        all_r = self.device_reports()
+        # Per-engine report storage
+        key = f"device_reports_engine_{engine_id}"
+        eng_r = self.device_reports(engine_id=engine_id)
+        eng_r[device] = {"operator": operator, "ts": int(time.time()),
+                         "net": net, "app": app, "results": results,
+                         "engine_id": engine_id}
+        if len(eng_r) > keep_devices:
+            for k in sorted(eng_r, key=lambda k: eng_r[k]["ts"])[:-keep_devices]:
+                eng_r.pop(k, None)
+        self.set(key, json.dumps(eng_r))
+
+        # Also update global device_reports for general heartbeat and backward compatibility
+        all_r = self.device_reports(engine_id=None)
         all_r[device] = {"operator": operator, "ts": int(time.time()),
-                         "net": net, "app": app, "results": results}
-        # Keep the newest devices only, so a lost phone cannot grow this for ever.
+                         "net": net, "app": app, "results": results,
+                         "engine_id": engine_id}
         if len(all_r) > keep_devices:
             for k in sorted(all_r, key=lambda k: all_r[k]["ts"])[:-keep_devices]:
                 all_r.pop(k, None)
@@ -606,8 +635,23 @@ class Store:
     def set_probe_interval(self, hours: int):
         self.set("probe_interval", max(1, int(hours)))
 
-    def device_reports(self) -> dict:
+    def device_reports(self, engine_id: int | None = None) -> dict:
         import json
+        if engine_id is not None:
+            key = f"device_reports_engine_{engine_id}"
+            v = self.get(key)
+            if v:
+                return json.loads(v)
+            # Fallback to filtering global reports by matching candidate IPs
+            cand = self.scan_candidates(engine_id=engine_id)
+            cand_ips = set(cand.get("ips") or [])
+            global_r = json.loads(self.get("device_reports") or "{}")
+            out = {}
+            for d, rep in global_r.items():
+                rep_ips = {r.get("ip") for r in (rep.get("results") or []) if isinstance(r, dict)}
+                if rep_ips & cand_ips or rep.get("engine_id") == engine_id:
+                    out[d] = rep
+            return out
         v = self.get("device_reports")
         return json.loads(v) if v else {}
 

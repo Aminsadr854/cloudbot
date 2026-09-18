@@ -10,6 +10,7 @@ import html
 import json
 import logging
 import os
+import ssl
 import time
 from typing import Callable, Optional
 
@@ -30,6 +31,69 @@ HEAD_TO_HEAD_MAX = 5
 REPORT_TTL = 7 * 86400
 DELIVERY_OFFSET_SECONDS = 5 * 60  # 5 minutes offset between engine phone deliveries
 
+TLS_CTX = ssl.create_default_context()
+TLS_CTX.check_hostname = False
+TLS_CTX.verify_mode = ssl.CERT_NONE
+TLS_CTX.set_alpn_protocols(["http/1.1"])
+
+
+def get_engine_targets(st: Store, engine_id: int) -> tuple[str, str]:
+    """
+    Returns (host, sni) for a specific engine, fully isolated.
+    """
+    return st.get_engine_targets(engine_id)
+
+
+async def verify_domain_ip(ip: str, host: str, sni: str, port: int = 443, timeout: float = 6.0) -> tuple[bool, str]:
+    """
+    Validates whether the actual configured domain works through candidate IP.
+    Connects to ip:port, sets TLS SNI to sni, sends HTTP GET with Host: host.
+    Returns (is_valid, reason).
+    """
+    server_name = (sni or host).strip()
+    try:
+        fut = asyncio.open_connection(ip, port, ssl=TLS_CTX, server_hostname=server_name)
+        reader, writer = await asyncio.wait_for(fut, timeout=timeout)
+
+        req = (f"GET / HTTP/1.1\r\nHost: {host}\r\n"
+               "User-Agent: Mozilla/5.0\r\nAccept: */*\r\nConnection: close\r\n\r\n")
+        writer.write(req.encode())
+        await writer.drain()
+
+        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout=timeout)
+        headers = head.decode("latin1", "replace").lower()
+        status = head.split(b" ")[1].decode() if b" " in head else "?"
+
+        raw_body = await asyncio.wait_for(reader.read(4096), timeout=timeout)
+        body = raw_body.decode("latin1", "replace").lower()
+
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+        # 1. Reject Cloudflare errors
+        cf_errors = ["1034", "1000", "1001", "1002", "520", "521", "522", "523", "524", "525", "526"]
+        for code in cf_errors:
+            if f"error code: {code}" in body or f"errorcode: {code}" in body or f"error {code}" in body:
+                return False, f"Cloudflare Error {code}"
+
+        if status == "403" and ("cloudflare" in headers or "cf-ray" in headers) and "error" in body:
+            return False, "Cloudflare 403 Edge Restriction"
+
+        # 2. Check for valid origin / application responses
+        if status in ("200", "101"):
+            return True, f"HTTP {status} OK"
+        if status == "400" and ("sec-websocket-version" in headers or "bad request" in body):
+            return True, "Valid WebSocket Backend (HTTP 400)"
+        if status in ("204", "301", "302", "404") and not ("error" in body and "cloudflare" in headers):
+            return True, f"HTTP {status} from Origin"
+
+        return False, f"Unexpected response: HTTP {status}"
+    except Exception as e:
+        return False, f"Connection/TLS failed: {type(e).__name__} ({e})"
+
 
 def _control_ips() -> list:
     """The reference address handed to phones alongside real candidates."""
@@ -43,7 +107,6 @@ def _control_ips() -> list:
         return [socket.gethostbyname(host)]
     except Exception:
         return []
-
 
 
 def _report_trusted(rep: dict, controls: set) -> tuple[bool, str]:
@@ -68,7 +131,7 @@ def _classify_reports(st: Store, engine_id: int = 1):
     cand = st.scan_candidates(engine_id=engine_id)
     controls = set(cand.get("controls") or [])
     trusted, aside = {}, {}
-    for d, r in st.device_reports().items():
+    for d, r in st.device_reports(engine_id=engine_id).items():
         if now - (r.get("ts") or 0) >= REPORT_TTL:
             continue
         ok, why = _report_trusted(r, controls)
@@ -179,10 +242,17 @@ def choose(results: list, live_ip: Optional[str] = None, measured: Optional[dict
 
     live_m = measured.get(live_ip) if live_ip else None
     live_score = cfscanner.score(live_m) if live_m else float("inf")
+    if live_m and (live_m.get("cf_error") or live_m.get("valid") is False):
+        live_score = float("inf")
+
     better = []
     for rel, r in contenders:
         m = measured.get(r["ip"])
-        if m and cfscanner.score(m) < live_score:
+        if not m:
+            continue
+        if m.get("cf_error") or m.get("valid") is False:
+            continue
+        if cfscanner.score(m) < live_score:
             better.append((rel, cfscanner.score(m), r, m))
     if not better:
         return keep(f"{len(contenders)} آدرس تأیید هر دو گوشی را گرفت ولی در تست سرور هیچ‌کدام "
@@ -211,13 +281,15 @@ async def _head_to_head(st: Store, since: int, live_ip: Optional[str],
     if not ssh:
         return None
     only = ([live_ip] if live_ip else []) + [ip for ip in ips if ip != live_ip]
+    host, sni = st.get_engine_targets(engine_id)
 
     async def hlog(t):
         log.info("[ENGINE %d] head-to-head: %s", engine_id, t)
 
     try:
         rows, _tail = await cfscanner.run_scan(
-            ssh, st.jump(), hlog, only=only, final=len(only), engine_id=engine_id)
+            ssh, st.jump(), hlog, only=only, final=len(only), engine_id=engine_id,
+            host=host, sni=sni)
     except Exception:
         log.exception("[ENGINE %d] head-to-head measurement failed", engine_id)
         return None
@@ -341,9 +413,11 @@ class ScannerEngine:
             return 0
         log.info("[ENGINE %d] Starting scan pass", self.engine_id)
         self.set_status("scanning", "اسکن رنج کلادفلر")
+        host, sni = self.st.get_engine_targets(self.engine_id)
         results, _tail = await cfscanner.run_scan(
             ssh, self.st.jump(), log_fn, limit=SCAN_SAMPLE,
-            final=PHONE_SHORTLIST, no_speed=True, engine_id=self.engine_id)
+            final=PHONE_SHORTLIST, no_speed=True, engine_id=self.engine_id,
+            host=host, sni=sni)
         self.st.pool_add(results, engine_id=self.engine_id)
         log.info("[ENGINE %d] Candidate IPs: %d", self.engine_id, len(results))
         self.set_status("idle", f"{len(results)} آدرس به استخر اضافه شد")
@@ -367,9 +441,11 @@ class ScannerEngine:
                      f"{len(top)} برتر سنجیده می‌شوند")
 
         ssh = cfg.get("ssh")
+        host, sni = self.st.get_engine_targets(self.engine_id)
         results, _tail = await cfscanner.run_scan(
             ssh, self.st.jump(), log_fn, only=top, final=PHONE_SHORTLIST,
-            engine_id=self.engine_id)
+            engine_id=self.engine_id,
+            host=host, sni=sni)
         if not results:
             results = entries[:PHONE_SHORTLIST]
         results.sort(key=cfscanner.score)
@@ -479,32 +555,77 @@ class ScannerEngine:
                      self.engine_id, live_ip, d["voters"], d["why"])
 
         if not d["change"]:
-            if d["entry"]:
-                self.st.update_cfscan(self.engine_id, last_best_ip=d["entry"]["ip"], last_best=d["entry"])
             return
 
         chosen, why = d["entry"], d["why"]
-        log.info("[ENGINE %d] Selected IP: %s", self.engine_id, chosen["ip"])
-        self.st.update_cfscan(self.engine_id, last_best_ip=chosen["ip"], last_best=chosen)
+        target_host, target_sni = self.st.get_engine_targets(self.engine_id)
+
+        # 1. DOMAIN_PREVALIDATED: Candidate must prove domain validity BEFORE touching DNS
+        pre_ok, pre_reason = await verify_domain_ip(chosen["ip"], host=target_host, sni=target_sni)
+        if not pre_ok:
+            log.warning("[ENGINE %d] DOMAIN_PREVALIDATION failed for candidate %s: %s",
+                        self.engine_id, chosen["ip"], pre_reason)
+            fail_msg = f"کاندید {chosen['ip']} در تست اعتبارسنجی دامنه رد شد ({pre_reason})"
+            self.st.set(decision_key, fail_msg)
+            return
+
+        log.info("[ENGINE %d] DOMAIN_PREVALIDATED for %s: %s", self.engine_id, chosen["ip"], pre_reason)
 
         applied = False
+        previous_live_ip = live_ip
+
         if cfg.get("auto_apply") and fqdn and self.st.cf_token() and cf and zone:
+            # 2. DNS_UPDATED: Apply to Cloudflare
             try:
                 if rec:
                     await cf.update_a(zone[0], rec, chosen["ip"])
                 else:
                     await cf.create_a(zone[0], fqdn, chosen["ip"], proxied=False)
                 applied = True
-                log.info("[ENGINE %d] Cloudflare update successful: %s -> %s",
-                         self.engine_id, fqdn, chosen["ip"])
-                self.st.add_found_ip({**chosen, "applied": True, "by_phone": True,
-                                      "phones": d["voters"]}, engine_id=self.engine_id)
+                log.info("[ENGINE %d] DNS_UPDATED: %s -> %s (previous: %s)",
+                         self.engine_id, fqdn, chosen["ip"], previous_live_ip)
             except Exception as e:
-                log.error("[ENGINE %d] Cloudflare update failed: %s", self.engine_id, e)
+                log.error("[ENGINE %d] DNS update failed: %s", self.engine_id, e)
                 if notify_fn:
                     await notify_fn(
-                        f"⚠️ <b>[موتور {self.engine_id}] خطای کلادفلر</b>\n\n"
+                        f"⚠️ <b>[موتور {self.engine_id}] خطای کلادفلر در اعمال DNS</b>\n\n"
                         f"دامنه: <code>{fqdn}</code>\nخطا: <code>{html.escape(str(e)[:200])}</code>")
+                return
+
+            # 3. DOMAIN_POSTCONFIRMED: Post-DNS confirmation with automated rollback
+            await asyncio.sleep(6.0)
+            post_ok, post_reason = await verify_domain_ip(chosen["ip"], host=target_host, sni=target_sni)
+            if not post_ok:
+                log.error("[ENGINE %d] DOMAIN_POSTCONFIRMED failed for %s: %s. Initiating automatic rollback!",
+                          self.engine_id, chosen["ip"], post_reason)
+                rollback_done = False
+                if previous_live_ip:
+                    try:
+                        cur_rec = await cf.find_a_record(zone[0], fqdn)
+                        if cur_rec:
+                            await cf.update_a(zone[0], cur_rec, previous_live_ip)
+                            rollback_done = True
+                            log.info("[ENGINE %d] Automatic rollback to %s succeeded", self.engine_id, previous_live_ip)
+                    except Exception as rb_err:
+                        log.error("[ENGINE %d] Automatic rollback failed: %s", self.engine_id, rb_err)
+                if notify_fn:
+                    rb_txt = f"بازگشت خودکار به <code>{previous_live_ip}</code> انجام شد." if rollback_done else "بازگشت خودکار ناموفق بود!"
+                    await notify_fn(
+                        f"🚨 <b>[موتور {self.engine_id}] خطا در تست پس از DNS — بازگشت خودکار</b>\n\n"
+                        f"دامنه: <code>{fqdn}</code>\n"
+                        f"آدرس کاندید: <code>{chosen['ip']}</code>\n"
+                        f"علت: <code>{html.escape(post_reason)}</code>\n"
+                        f"{rb_txt}")
+                return
+
+            log.info("[ENGINE %d] DOMAIN_POSTCONFIRMED succeeded for %s", self.engine_id, chosen["ip"])
+
+        # 4. BEST_CONFIRMED: Only reached if domain prevalidation (and post-DNS confirmation if auto_apply) passed!
+        log.info("[ENGINE %d] BEST_CONFIRMED: %s", self.engine_id, chosen["ip"])
+        self.st.update_cfscan(self.engine_id, last_best_ip=chosen["ip"], last_best=chosen)
+        if applied:
+            self.st.add_found_ip({**chosen, "applied": True, "by_phone": True,
+                                  "phones": d["voters"]}, engine_id=self.engine_id)
 
         suggested_key = f"scan_suggested_engine_{self.engine_id}"
         if not applied and self.st.get(suggested_key) == "%s|%s" % (cand.get("ts"), chosen["ip"]):
