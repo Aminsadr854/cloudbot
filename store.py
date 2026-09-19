@@ -249,11 +249,10 @@ class Store:
         fqdn = (cfg.get("fqdn") or "").strip()
         explicit_sni = (cfg.get("sni") or "").strip()
         explicit_host = (cfg.get("host") or "").strip()
+        stored_probe_sni = (self.get("probe_sni") or "").strip()
 
-        sni = explicit_sni
-        if not sni:
-            sni = (self.get("probe_sni") or fqdn or "speed.cloudflare.com").strip()
-        host = explicit_host or fqdn or sni
+        sni = explicit_sni or stored_probe_sni or fqdn or "speed.cloudflare.com"
+        host = explicit_host or explicit_sni or stored_probe_sni or fqdn
         return host, sni
 
     # ---- subscription link (encrypted: it is a bearer secret) ----------

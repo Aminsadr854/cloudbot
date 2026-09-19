@@ -259,13 +259,18 @@ def choose(results: list, live_ip: Optional[str] = None, measured: Optional[dict
                     f"از آدرس فعلی بهتر نبود — آدرس فعلی ماند", len(voters))
 
     better.sort(key=lambda x: (x[0], x[1]))
-    rel, sc, r, m = better[0]
-    entry = dict(r, **m)
-    entry["ip"] = r["ip"]
     live_txt = ("%.0f" % live_score) if live_m else "بی‌پاسخ"
-    why = (f"هر دو گوشی تأییدش کردند ({rel:.2f}) و در تست سرور از آدرس فعلی بهتر بود "
-           f"(امتیاز {sc:.0f} در برابر {live_txt})")
+    contenders_ranked = []
+    for rel, sc, r, m in better:
+        entry = dict(r, **m)
+        entry["ip"] = r["ip"]
+        why = (f"هر دو گوشی تأییدش کردند ({rel:.2f}) و در تست سرور از آدرس فعلی بهتر بود "
+               f"(امتیاز {sc:.0f} در برابر {live_txt})")
+        contenders_ranked.append((entry, why))
+
+    entry, why = contenders_ranked[0]
     return {"change": True, "entry": entry, "why": why,
+            "contenders": contenders_ranked,
             "voters": len(voters), "needs_measure": []}
 
 
@@ -557,19 +562,31 @@ class ScannerEngine:
         if not d["change"]:
             return
 
-        chosen, why = d["entry"], d["why"]
+        contenders_to_try = d.get("contenders") or ([(d["entry"], d["why"])] if d.get("entry") else [])
         target_host, target_sni = self.st.get_engine_targets(self.engine_id)
+        confirmed_chosen = None
+        confirmed_why = None
 
-        # 1. DOMAIN_PREVALIDATED: Candidate must prove domain validity BEFORE touching DNS
-        pre_ok, pre_reason = await verify_domain_ip(chosen["ip"], host=target_host, sni=target_sni)
-        if not pre_ok:
-            log.warning("[ENGINE %d] DOMAIN_PREVALIDATION failed for candidate %s: %s",
-                        self.engine_id, chosen["ip"], pre_reason)
-            fail_msg = f"کاندید {chosen['ip']} در تست اعتبارسنجی دامنه رد شد ({pre_reason})"
+        for chosen_cand, why_cand in contenders_to_try:
+            # 1. DOMAIN_PREVALIDATED: Candidate must prove domain validity BEFORE touching DNS
+            pre_ok, pre_reason = await verify_domain_ip(chosen_cand["ip"], host=target_host, sni=target_sni)
+            if not pre_ok:
+                log.warning("[ENGINE %d] DOMAIN_PREVALIDATION failed for candidate %s: %s (trying next contender)",
+                            self.engine_id, chosen_cand["ip"], pre_reason)
+                continue
+
+            log.info("[ENGINE %d] DOMAIN_PREVALIDATED for %s: %s", self.engine_id, chosen_cand["ip"], pre_reason)
+            confirmed_chosen = chosen_cand
+            confirmed_why = why_cand
+            break
+
+        if not confirmed_chosen:
+            fail_msg = f"هیچ‌کدام از {len(contenders_to_try)} کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند"
             self.st.set(decision_key, fail_msg)
+            log.warning("[ENGINE %d] %s", self.engine_id, fail_msg)
             return
 
-        log.info("[ENGINE %d] DOMAIN_PREVALIDATED for %s: %s", self.engine_id, chosen["ip"], pre_reason)
+        chosen, why = confirmed_chosen, confirmed_why
 
         applied = False
         previous_live_ip = live_ip

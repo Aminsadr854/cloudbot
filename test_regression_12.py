@@ -154,7 +154,7 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
         h2, s2 = self.st.get_engine_targets(2)
         h3, s3 = self.st.get_engine_targets(3)
 
-        self.assertEqual(h1, "c1.dom1.com")
+        self.assertEqual(h1, "sni1.dom1.com")
         self.assertEqual(s1, "sni1.dom1.com")
 
         self.assertEqual(h2, "host2.dom2.com")
@@ -424,6 +424,154 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
         # Decision must NOT change because candidate is invalid!
         self.assertFalse(dec["change"])
         self.assertIn("هیچ‌کدام از آدرس فعلی بهتر نبود", dec["why"])
+
+    # ----------------------------------------------------------------------
+    # Test 13: Target resolution and host precedence
+    # ----------------------------------------------------------------------
+    def test_13_target_resolution_and_precedence(self):
+        """All 3 engines resolve Host and SNI to stored probe_sni when explicit values are absent."""
+        self.st.set("probe_sni", "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+        self.st.update_cfscan(1, fqdn="c1c1c1c1c1c1.rjwarehousing.ir")
+        self.st.update_cfscan(2, fqdn="c2c2c2c2c2.rjwarehousing.ir")
+        self.st.update_cfscan(3, fqdn="c3c3c3c3.rjwarehousing.ir")
+
+        h1, s1 = self.st.get_engine_targets(1)
+        h2, s2 = self.st.get_engine_targets(2)
+        h3, s3 = self.st.get_engine_targets(3)
+
+        self.assertEqual(h1, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+        self.assertEqual(s1, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+        self.assertEqual(h2, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+        self.assertEqual(s2, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+        self.assertEqual(h3, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+        self.assertEqual(s3, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+
+        # Explicit host override takes priority
+        self.st.update_cfscan(1, host="custom-override.rjwarehousing.ir")
+        h1_over, s1_over = self.st.get_engine_targets(1)
+        self.assertEqual(h1_over, "custom-override.rjwarehousing.ir")
+        self.assertEqual(s1_over, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+
+    # ----------------------------------------------------------------------
+    # Test 14: Contender fallback on domain prevalidation failure
+    # ----------------------------------------------------------------------
+    async def test_14_contender_fallback_on_domain_prevalidation_failure(self):
+        """When contender #1 fails domain prevalidation, contender #2 is evaluated and deployed."""
+        eng = scanner_engine.ScannerEngine(engine_id=1, store=self.st)
+        self.st.update_cfscan(1, fqdn="c1.dom.ir", auto_apply=True, last_best_ip="1.1.1.1")
+        self.st.set_cf_token("fake_token")
+
+        cand_list = [
+            {"ip": "104.26.14.1", "rtt": 30.0, "jitter": 1.0, "loss": 0.0},
+            {"ip": "104.26.14.2", "rtt": 35.0, "jitter": 1.0, "loss": 0.0}
+        ]
+        self.st.set_scan_candidates(cand_list, controls=["8.8.8.8"], engine_id=1)
+        self.st.save_device_report("dev1", "MCI", [
+            {"ip": "8.8.8.8", "ok": True},
+            {"ip": "104.26.14.1", "ok": True, "rtt_ms": 30.0, "loss": 0.0},
+            {"ip": "104.26.14.2", "ok": True, "rtt_ms": 35.0, "loss": 0.0}
+        ], net="cellular", engine_id=1)
+        self.st.save_device_report("dev2", "MTN", [
+            {"ip": "8.8.8.8", "ok": True},
+            {"ip": "104.26.14.1", "ok": True, "rtt_ms": 31.0, "loss": 0.0},
+            {"ip": "104.26.14.2", "ok": True, "rtt_ms": 36.0, "loss": 0.0}
+        ], net="cellular", engine_id=1)
+
+        self.st.set_scan_h2h({
+            "key": f"{self.st.scan_candidates(1)['ts']}|1.1.1.1|104.26.14.1,104.26.14.2",
+            "ts": 9999999999,
+            "measured": {
+                "1.1.1.1": {"rtt": 100.0, "jitter": 10.0, "loss": 0.0, "valid": True},
+                "104.26.14.1": {"rtt": 30.0, "jitter": 1.0, "loss": 0.0, "valid": True},
+                "104.26.14.2": {"rtt": 35.0, "jitter": 1.0, "loss": 0.0, "valid": True}
+            }
+        }, engine_id=1)
+
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(return_value=["zone_123"])
+        mock_cf.find_a_record = AsyncMock(return_value={"id": "rec_123", "content": "1.1.1.1"})
+        mock_cf.update_a = AsyncMock(return_value=True)
+
+        notify_mock = AsyncMock()
+
+        async def mock_verify(ip, host=None, sni=None):
+            if ip == "104.26.14.1":
+                return False, "Cloudflare Error 1000"
+            if ip == "104.26.14.2":
+                return True, "Valid WebSocket Backend (HTTP 400)"
+            return False, "Unknown IP"
+
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
+             patch("scanner_engine.verify_domain_ip", side_effect=mock_verify), \
+             patch("asyncio.sleep", AsyncMock()):
+            await eng.phone_recheck_pass(notify_fn=notify_mock)
+
+        # Confirm update_a was called with 104.26.14.2 (contender #2), NOT 104.26.14.1
+        self.assertEqual(mock_cf.update_a.call_count, 1)
+        self.assertEqual(mock_cf.update_a.call_args[0][2], "104.26.14.2")
+
+        # Confirm last_best_ip updated to 104.26.14.2
+        cfg = self.st.cfscan(1)
+        self.assertEqual(cfg.get("last_best_ip"), "104.26.14.2")
+
+    # ----------------------------------------------------------------------
+    # Test 15: All contenders fail domain prevalidation - no DNS update
+    # ----------------------------------------------------------------------
+    async def test_15_all_contenders_fail_domain_prevalidation_no_dns_update(self):
+        """When all contenders fail domain prevalidation, DNS is never updated and live IP is untouched."""
+        eng = scanner_engine.ScannerEngine(engine_id=1, store=self.st)
+        self.st.update_cfscan(1, fqdn="c1.dom.ir", auto_apply=True, last_best_ip="1.1.1.1")
+        self.st.set_cf_token("fake_token")
+
+        cand_list = [
+            {"ip": "104.26.14.1", "rtt": 30.0, "jitter": 1.0, "loss": 0.0},
+            {"ip": "104.26.14.2", "rtt": 35.0, "jitter": 1.0, "loss": 0.0}
+        ]
+        self.st.set_scan_candidates(cand_list, controls=["8.8.8.8"], engine_id=1)
+        self.st.save_device_report("dev1", "MCI", [
+            {"ip": "8.8.8.8", "ok": True},
+            {"ip": "104.26.14.1", "ok": True, "rtt_ms": 30.0, "loss": 0.0},
+            {"ip": "104.26.14.2", "ok": True, "rtt_ms": 35.0, "loss": 0.0}
+        ], net="cellular", engine_id=1)
+        self.st.save_device_report("dev2", "MTN", [
+            {"ip": "8.8.8.8", "ok": True},
+            {"ip": "104.26.14.1", "ok": True, "rtt_ms": 31.0, "loss": 0.0},
+            {"ip": "104.26.14.2", "ok": True, "rtt_ms": 36.0, "loss": 0.0}
+        ], net="cellular", engine_id=1)
+
+        self.st.set_scan_h2h({
+            "key": f"{self.st.scan_candidates(1)['ts']}|1.1.1.1|104.26.14.1,104.26.14.2",
+            "ts": 9999999999,
+            "measured": {
+                "1.1.1.1": {"rtt": 100.0, "jitter": 10.0, "loss": 0.0, "valid": True},
+                "104.26.14.1": {"rtt": 30.0, "jitter": 1.0, "loss": 0.0, "valid": True},
+                "104.26.14.2": {"rtt": 35.0, "jitter": 1.0, "loss": 0.0, "valid": True}
+            }
+        }, engine_id=1)
+
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(return_value=["zone_123"])
+        mock_cf.find_a_record = AsyncMock(return_value={"id": "rec_123", "content": "1.1.1.1"})
+        mock_cf.update_a = AsyncMock(return_value=True)
+
+        notify_mock = AsyncMock()
+
+        # Both candidates fail domain prevalidation
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
+             patch("scanner_engine.verify_domain_ip", AsyncMock(return_value=(False, "Cloudflare Error 1000"))), \
+             patch("asyncio.sleep", AsyncMock()):
+            await eng.phone_recheck_pass(notify_fn=notify_mock)
+
+        # Confirm update_a was NEVER called
+        self.assertEqual(mock_cf.update_a.call_count, 0)
+
+        # Confirm live IP untouched
+        cfg = self.st.cfscan(1)
+        self.assertEqual(cfg.get("last_best_ip"), "1.1.1.1")
+
+        # Confirm decision stored
+        decision = self.st.get("scan_last_decision_engine_1")
+        self.assertIn("هیچ‌کدام از 2 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند", decision)
 
 
 if __name__ == "__main__":
