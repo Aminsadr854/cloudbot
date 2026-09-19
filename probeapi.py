@@ -36,18 +36,22 @@ async def candidates(request):
     """The addresses the phones should measure: the last scan's shortlist for an explicit engine."""
     if not _auth(request):
         return web.json_response({"error": "unauthorised"}, status=401)
+    dev = request.query.get("device", "")[:64]
+    op = request.query.get("operator", "")[:48]
+    net = request.query.get("net", "")[:16]
+    app = request.query.get("app", "")[:16]
+    if dev:
+        st.touch_device(dev, op, net, app)
+
     eng_param = request.query.get("engine")
     engine_id = int(eng_param) if eng_param and eng_param.isdigit() else None
     if engine_id is None:
-        engine_id = st.active_probe_engine()
-    c = st.scan_candidates(engine_id=engine_id)
-    # Asking for work is itself proof of life; there is no separate heartbeat to
-    # get out of step with reality.
-    dev = request.query.get("device", "")
+        engine_id = st.active_probe_engine(device=dev or None, operator=op or None)
+
     if dev:
-        st.touch_device(dev[:64], request.query.get("operator", "")[:48],
-                        request.query.get("net", "")[:16],
-                        request.query.get("app", "")[:16])
+        st.record_candidate_delivery(engine_id, dev, op)
+
+    c = st.scan_candidates(engine_id=engine_id)
     # The reference addresses travel with the candidates and look no different
     # to the phone, which measures them the same way.
     ips = list(c.get("ips", []))
@@ -125,10 +129,12 @@ async def report(request):
                 engine_id = eid
                 break
     if engine_id is None:
-        engine_id = st.active_probe_engine()
+        engine_id = st.active_probe_engine(device=device or None, operator=operator or None)
 
     st.save_device_report(device, operator, clean, net, app, engine_id=engine_id)
     st.touch_device(device, operator, net, app)
+    rep_ips_list = [str(r.get("ip") or "") for r in clean if r.get("ip")]
+    st.record_candidate_report(engine_id, device, operator, rep_ips_list)
     log.info("report from %s for ENGINE %d (%s/%s app=%s): %d results",
              device, engine_id, operator, net or "?", app or "?", len(clean))
     return web.json_response({"ok": True, "accepted": len(clean), "engine_id": engine_id})
@@ -154,10 +160,11 @@ async def ping(request):
                         request.query.get("net", "")[:16],
                         request.query.get("app", "")[:16])
 
+    op = request.query.get("operator", "")[:48]
     eng_param = request.query.get("engine")
     engine_id = int(eng_param) if eng_param and eng_param.isdigit() else None
     if engine_id is None:
-        engine_id = st.active_probe_engine()
+        engine_id = st.active_probe_engine(device=dev or None, operator=op or None)
 
     cand = st.scan_candidates(engine_id=engine_id)
     current = set(cand.get("ips") or [])

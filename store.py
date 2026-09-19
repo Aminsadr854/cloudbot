@@ -1,3 +1,4 @@
+from typing import Optional
 """
 Storage for the cloud-provisioning bot.
 
@@ -394,8 +395,11 @@ class Store:
         }
         key = f"scan_candidates_engine_{engine_id}"
         self.set(key, json.dumps(payload))
-        # Keep legacy pointer updated with the latest engine's payload
-        self.set("scan_candidates", json.dumps(payload))
+        # Keep legacy pointer updated only for engine 1
+        if engine_id == 1:
+            self.set("scan_candidates", json.dumps(payload))
+        # Initialize delivery lifecycle state for this shortlist
+        self.init_delivery_state(engine_id, payload["ts"], ips, payload["controls"])
 
     def set_candidate_meta(self, engine_id: int = 1, **fields):
         """Bookkeeping that rides with the shortlist for a specific engine."""
@@ -407,20 +411,212 @@ class Store:
         d.update(fields)
         self.set(key, json.dumps(d))
 
-    def active_probe_engine(self) -> int:
-        """Find which engine currently has the freshest unmeasured shortlist."""
+    SHORTLIST_DELIVERY_TTL = 3 * 3600  # 3 hours delivery window for phones to poll
+
+    @staticmethod
+    def candidate_set_hash(ips: list, controls: list = ()) -> str:
+        import hashlib
+        ctrl_set = set(controls or [])
+        cand_ips = sorted(ip for ip in (ips or []) if ip and ip not in ctrl_set)
+        if not cand_ips:
+            return ""
+        s = ",".join(cand_ips)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+    def init_delivery_state(self, engine_id: int, cand_ts: int, ips: list, controls: list = ()):
         import json
-        best_eid = 1
-        best_ts = 0
+        cand_hash = self.candidate_set_hash(ips, controls)
+        state = {
+            "engine_id": engine_id,
+            "shortlist_timestamp": cand_ts,
+            "candidate_set_hash": cand_hash,
+            "candidate_count": len(ips),
+            "created_at": cand_ts,
+            "expires_at": cand_ts + self.SHORTLIST_DELIVERY_TTL if cand_ts else 0,
+            "devices": {},
+            "delivery_complete": False
+        }
+        self.set(f"delivery_state_engine_{engine_id}", json.dumps(state))
+        return state
+
+    def get_delivery_state(self, engine_id: int) -> dict:
+        import json, time
+        key = f"delivery_state_engine_{engine_id}"
+        v = self.get(key)
+        cand = self.scan_candidates(engine_id=engine_id)
+        cand_ts = cand.get("ts", 0)
+        cand_ips = cand.get("ips", [])
+        controls = cand.get("controls", [])
+        cand_hash = self.candidate_set_hash(cand_ips, controls)
+
+        state = json.loads(v) if v else {}
+        if not state or state.get("shortlist_timestamp") != cand_ts or state.get("candidate_set_hash") != cand_hash:
+            state = {
+                "engine_id": engine_id,
+                "shortlist_timestamp": cand_ts,
+                "candidate_set_hash": cand_hash,
+                "candidate_count": len(cand_ips),
+                "created_at": cand_ts,
+                "expires_at": cand_ts + self.SHORTLIST_DELIVERY_TTL if cand_ts else 0,
+                "devices": {},
+                "delivery_complete": False
+            }
+
+        # Sync from device reports
+        reports = self.device_reports(engine_id=engine_id)
+        complete_count = 0
+        for dev_id, rep in reports.items():
+            rep_ts = rep.get("ts", 0)
+            rep_res = rep.get("results") or []
+            rep_ips = [r.get("ip") for r in rep_res if r.get("ip")]
+            rep_hash = self.candidate_set_hash(rep_ips, controls)
+            dev_state = state["devices"].setdefault(dev_id, {})
+            dev_state["device_id"] = dev_id
+            dev_state["operator"] = rep.get("operator", "")
+            dev_state["reported_at"] = rep_ts
+            dev_state["report_candidate_set_hash"] = rep_hash
+            is_match = (rep_hash == cand_hash) and bool(cand_hash)
+            is_fresh = is_match and (rep_ts >= cand_ts)
+            dev_state["report_fresh"] = is_fresh
+            if is_fresh:
+                dev_state["status"] = "COMPLETE"
+                complete_count += 1
+            elif dev_state.get("status") != "DELIVERED":
+                dev_state["status"] = "PENDING"
+
+        if complete_count >= 2:
+            state["delivery_complete"] = True
+
+        self.set(key, json.dumps(state))
+        return state
+
+    def record_candidate_delivery(self, engine_id: int, device: str, operator: str = ""):
+        import json, time
+        if not device:
+            return
+        state = self.get_delivery_state(engine_id)
+        dev_state = state["devices"].setdefault(device, {})
+        dev_state["device_id"] = device
+        if operator:
+            dev_state["operator"] = operator
+        dev_state["delivered_at"] = int(time.time())
+        if dev_state.get("status") != "COMPLETE":
+            dev_state["status"] = "DELIVERED"
+        key = f"delivery_state_engine_{engine_id}"
+        self.set(key, json.dumps(state))
+
+    def record_candidate_report(self, engine_id: int, device: str, operator: str, reported_ips: list):
+        import json, time
+        if not device:
+            return
+        state = self.get_delivery_state(engine_id)
+        cand = self.scan_candidates(engine_id=engine_id)
+        cand_ts = cand.get("ts", 0)
+        cand_hash = state.get("candidate_set_hash", "")
+        controls = cand.get("controls", [])
+        rep_hash = self.candidate_set_hash(reported_ips, controls)
+
+        dev_state = state["devices"].setdefault(device, {})
+        dev_state["device_id"] = device
+        dev_state["operator"] = operator
+        dev_state["reported_at"] = int(time.time())
+        dev_state["report_candidate_set_hash"] = rep_hash
+        is_match = (rep_hash == cand_hash) and bool(cand_hash)
+        is_fresh = is_match and (dev_state["reported_at"] >= cand_ts)
+        dev_state["report_fresh"] = is_fresh
+        if is_fresh:
+            dev_state["status"] = "COMPLETE"
+
+        complete_count = sum(1 for d in state["devices"].values() if d.get("status") == "COMPLETE")
+        if complete_count >= 2:
+            state["delivery_complete"] = True
+
+        key = f"delivery_state_engine_{engine_id}"
+        self.set(key, json.dumps(state))
+
+    def active_probe_engine(self, device: Optional[str] = None, operator: Optional[str] = None) -> int:
+        """
+        Find which engine currently needs candidate delivery.
+        Considers:
+        - shortlist timestamp and expiration (SHORTLIST_DELIVERY_TTL)
+        - per-device delivery and completion state
+        - candidate set hash matching
+        - oldest pending shortlist with outstanding required devices
+        """
+        import time
+        now = time.time()
+        engine_states = {}
         for eid in (1, 2, 3):
-            v = self.get(f"scan_candidates_engine_{eid}")
-            if v:
-                d = json.loads(v)
-                ts = d.get("ts", 0)
-                if ts > best_ts:
-                    best_ts = ts
-                    best_eid = eid
-        return best_eid
+            state = self.get_delivery_state(eid)
+            cand_ts = state.get("shortlist_timestamp", 0)
+            cand_count = state.get("candidate_count", 0)
+            expires_at = state.get("expires_at", 0)
+            if cand_ts > 0 and cand_count > 0:
+                is_expired = expires_at and (now > expires_at)
+                engine_states[eid] = (state, is_expired)
+
+        if not engine_states:
+            return 1
+
+        active_states = {eid: st for eid, (st, exp) in engine_states.items() if not exp}
+        if not active_states:
+            active_states = {eid: st for eid, (st, exp) in engine_states.items()}
+
+        def _device_matches(target_key: str, dev_id: str, op: str) -> bool:
+            if not target_key:
+                return False
+            if dev_id and target_key.lower() == dev_id.lower():
+                return True
+            tk_low = target_key.lower()
+            if op:
+                op_low = op.lower()
+                if "mci" in op_low and "mci" in tk_low:
+                    return True
+                if ("irancell" in op_low or "mtn" in op_low) and ("irancell" in tk_low or "mtn" in tk_low):
+                    return True
+            if dev_id:
+                dev_low = dev_id.lower()
+                if "mci" in dev_low and "mci" in tk_low:
+                    return True
+                if ("irancell" in dev_low or "mtn" in dev_low) and ("irancell" in tk_low or "mtn" in tk_low):
+                    return True
+            return False
+
+        # 1. Device-aware selection: If device or operator is known
+        if device or operator:
+            pending_for_this_device = []
+            for eid, state in active_states.items():
+                if state.get("delivery_complete"):
+                    continue
+                dev_completed = False
+                for d_id, d_info in state.get("devices", {}).items():
+                    if _device_matches(d_id, device, operator) or _device_matches(d_info.get("operator", ""), device, operator):
+                        if d_info.get("status") == "COMPLETE":
+                            dev_completed = True
+                            break
+                if not dev_completed:
+                    cand_ts = state.get("shortlist_timestamp", 0)
+                    pending_for_this_device.append((eid, cand_ts))
+
+            if pending_for_this_device:
+                # Prefer the oldest pending shortlist that still needs this device
+                pending_for_this_device.sort(key=lambda x: x[1])
+                return pending_for_this_device[0][0]
+
+        # 2. General selection: Find engines whose delivery is not complete (< 2 phones tested)
+        incomplete_engines = []
+        for eid, state in active_states.items():
+            if not state.get("delivery_complete"):
+                cand_ts = state.get("shortlist_timestamp", 0)
+                incomplete_engines.append((eid, cand_ts))
+
+        if incomplete_engines:
+            # Prefer the oldest pending shortlist
+            incomplete_engines.sort(key=lambda x: x[1])
+            return incomplete_engines[0][0]
+
+        # 3. All active engines are delivery-complete: return the engine with newest shortlist
+        return max(active_states.keys(), key=lambda eid: active_states[eid].get("shortlist_timestamp", 0))
 
     def scan_candidates(self, engine_id=None) -> dict:
         import json
@@ -429,7 +625,14 @@ class Store:
         key = f"scan_candidates_engine_{engine_id}"
         v = self.get(key)
         if not v and engine_id == 1:
-            v = self.get("scan_candidates")
+            v_legacy = self.get("scan_candidates")
+            if v_legacy:
+                try:
+                    loaded = json.loads(v_legacy)
+                    if loaded.get("engine_id") in (1, None):
+                        v = v_legacy
+                except Exception:
+                    pass
         d = json.loads(v) if v else {}
         return {"ts": d.get("ts", 0), "engine_id": d.get("engine_id", engine_id or 1),
                 "ips": d.get("ips", []),

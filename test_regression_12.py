@@ -1,3 +1,5 @@
+import json
+import time
 """
 Comprehensive 12 Regression Tests for Cloudflare Scanner Bot Architecture Overhaul.
 Tests:
@@ -572,6 +574,142 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
         # Confirm decision stored
         decision = self.st.get("scan_last_decision_engine_1")
         self.assertIn("هیچ‌کدام از 2 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند", decision)
+
+
+
+    # ----------------------------------------------------------------------
+    # Test 16: Pending delivery lifecycle and starvation prevention
+    # ----------------------------------------------------------------------
+    def test_16_pending_delivery_lifecycle_and_starvation_prevention(self):
+        """Older pending shortlist is not clobbered by newer shortlist until all devices test it."""
+        # 1. Engine 3 creates shortlist at T = now - 600
+        e3_cands = [{"ip": f"104.26.3.{i}"} for i in range(1, 10)]
+        self.st.set_scan_candidates(e3_cands, controls=["8.8.8.8"], engine_id=3)
+        c3_data = self.st.scan_candidates(engine_id=3)
+        c3_data["ts"] = int(time.time()) - 600
+        self.st.set("scan_candidates_engine_3", json.dumps(c3_data))
+        self.st.init_delivery_state(3, c3_data["ts"], c3_data["ips"], c3_data["controls"])
+        cand_3 = self.st.scan_candidates(engine_id=3)
+        cand_3_ts = cand_3["ts"]
+
+        # 2. MCI requests candidates -> must receive Engine 3
+        mci_dev = "SM-A165F-64c1f8"
+        mci_op = "IR-MCI"
+        eid_mci = self.st.active_probe_engine(device=mci_dev, operator=mci_op)
+        self.assertEqual(eid_mci, 3)
+        self.st.record_candidate_delivery(3, mci_dev, mci_op)
+
+        # MCI reports for Engine 3 with matching candidates
+        mci_results = [{"ip": "8.8.8.8", "ok": True}] + [{"ip": c["ip"], "ok": True, "rtt_ms": 50.0} for c in e3_cands]
+        self.st.save_device_report(mci_dev, mci_op, mci_results, net="cellular", engine_id=3)
+        self.st.record_candidate_report(3, mci_dev, mci_op, [r["ip"] for r in mci_results])
+
+        # Verify Engine 3 state: MCI is COMPLETE, Irancell is PENDING, delivery_complete is False
+        state_3 = self.st.get_delivery_state(3)
+        self.assertFalse(state_3["delivery_complete"])
+        self.assertEqual(state_3["devices"][mci_dev]["status"], "COMPLETE")
+
+        # 3. Engine 2 creates a NEWER shortlist at T = 1200
+        e2_cands = [{"ip": f"104.27.2.{i}"} for i in range(1, 10)]
+        self.st.set_scan_candidates(e2_cands, controls=["8.8.8.8"], engine_id=2)
+        cand_2 = self.st.scan_candidates(engine_id=2)
+        self.assertGreater(cand_2["ts"], cand_3_ts)
+
+        # 4. Irancell requests candidates -> MUST STILL RECEIVE ENGINE 3! (Not clobbered by E2!)
+        iran_dev = "25028PC03G-00d4a4"
+        iran_op = "Irancell"
+        eid_iran = self.st.active_probe_engine(device=iran_dev, operator=iran_op)
+        self.assertEqual(eid_iran, 3, "Irancell must receive Engine 3 even though Engine 2 has newer timestamp")
+        self.st.record_candidate_delivery(3, iran_dev, iran_op)
+
+        # 5. Meanwhile, if MCI requests candidates -> MCI already completed E3, so MCI receives Engine 2!
+        eid_mci_next = self.st.active_probe_engine(device=mci_dev, operator=mci_op)
+        self.assertEqual(eid_mci_next, 2, "MCI must not waste delivery on already-completed Engine 3")
+
+        # 6. Irancell reports for Engine 3 with matching candidates
+        iran_results = [{"ip": "8.8.8.8", "ok": True}] + [{"ip": c["ip"], "ok": True, "rtt_ms": 52.0} for c in e3_cands]
+        self.st.save_device_report(iran_dev, iran_op, iran_results, net="cellular", engine_id=3)
+        self.st.record_candidate_report(3, iran_dev, iran_op, [r["ip"] for r in iran_results])
+
+        # 7. Engine 3 delivery is now COMPLETE
+        state_3_after = self.st.get_delivery_state(3)
+        self.assertTrue(state_3_after["delivery_complete"])
+
+        # 8. Now both phones receive Engine 2
+        self.assertEqual(self.st.active_probe_engine(device=iran_dev, operator=iran_op), 2)
+        self.assertEqual(self.st.active_probe_engine(device=mci_dev, operator=mci_op), 2)
+
+    # ----------------------------------------------------------------------
+    # Test 17: Candidate set hash matching and stale rejection
+    # ----------------------------------------------------------------------
+    def test_17_candidate_set_hash_matching_and_stale_rejection(self):
+        """Reports with mismatched candidate hashes or stale timestamps must not count."""
+        e3_cands = [{"ip": "104.26.3.1"}, {"ip": "104.26.3.2"}]
+        self.st.set_scan_candidates(e3_cands, controls=["8.8.8.8"], engine_id=3)
+        cand_3 = self.st.scan_candidates(engine_id=3)
+        cand_hash = self.st.candidate_set_hash([c["ip"] for c in e3_cands], ["8.8.8.8"])
+
+        # Stale report from yesterday with completely different IPs
+        stale_results = [{"ip": "8.8.8.8", "ok": True}, {"ip": "1.2.3.4", "ok": True, "rtt_ms": 40.0}]
+        self.st.save_device_report("dev_old", "Irancell", stale_results, net="cellular", engine_id=3)
+        # Manually backdate the report
+        rep = self.st.device_reports(3)["dev_old"]
+        rep["ts"] = cand_3["ts"] - 3600
+        self.st.set("device_reports_engine_3", json.dumps({"dev_old": rep}))
+
+        # Verify: _classify_reports rejects the stale report
+        trusted, aside = scanner_engine._classify_reports(self.st, engine_id=3)
+        self.assertNotIn("dev_old", trusted)
+
+        # Fresh report with wrong candidates (hash mismatch)
+        wrong_results = [{"ip": "8.8.8.8", "ok": True}, {"ip": "104.99.99.99", "ok": True, "rtt_ms": 40.0}]
+        self.st.save_device_report("dev_wrong", "MCI", wrong_results, net="cellular", engine_id=3)
+        trusted2, aside2 = scanner_engine._classify_reports(self.st, engine_id=3)
+        self.assertNotIn("dev_wrong", trusted2)
+        self.assertIn("dev_wrong", aside2)
+
+    # ----------------------------------------------------------------------
+    # Test 18: Offline phone TTL protection
+    # ----------------------------------------------------------------------
+    def test_18_offline_phone_ttl_protection(self):
+        """Expired pending shortlists must not permanently block newer engines."""
+        # Engine 3 created long ago (expired)
+        e3_cands = [{"ip": "104.26.3.1"}]
+        self.st.set_scan_candidates(e3_cands, controls=["8.8.8.8"], engine_id=3)
+        cand_3 = self.st.scan_candidates(engine_id=3)
+
+        # Force expiration of Engine 3 delivery state
+        state_3 = self.st.get_delivery_state(3)
+        state_3["expires_at"] = time.time() - 100
+        self.st.set("delivery_state_engine_3", json.dumps(state_3))
+
+        # Engine 2 has fresh candidates
+        e2_cands = [{"ip": "104.27.2.1"}]
+        self.st.set_scan_candidates(e2_cands, controls=["8.8.8.8"], engine_id=2)
+
+        # Phone requests candidates -> should get Engine 2, bypassing expired Engine 3
+        eid = self.st.active_probe_engine(device="phone_any")
+        self.assertEqual(eid, 2, "Expired engine must not block candidate delivery to newer engine")
+
+    # ----------------------------------------------------------------------
+    # Test 19: Independent multi-engine pending states
+    # ----------------------------------------------------------------------
+    def test_19_independent_multi_engine_pending_states(self):
+        """Each engine independently tracks which devices have tested its shortlist."""
+        self.st.set_scan_candidates([{"ip": "1.1.1.1"}], engine_id=1)
+        self.st.set_scan_candidates([{"ip": "2.2.2.2"}], engine_id=2)
+        self.st.set_scan_candidates([{"ip": "3.3.3.3"}], engine_id=3)
+
+        # Mark dev_A complete on Engine 1, pending on Engine 2 & 3
+        self.st.record_candidate_report(1, "dev_A", "MCI", ["1.1.1.1"])
+        # Mark dev_B complete on Engine 2, pending on Engine 1 & 3
+        self.st.record_candidate_report(2, "dev_B", "Irancell", ["2.2.2.2"])
+
+        # For dev_A: Engine 1 is complete, Engine 2 is pending (earlier ts) -> gets Engine 2
+        self.assertEqual(self.st.active_probe_engine(device="dev_A"), 2)
+
+        # For dev_B: Engine 2 is complete, Engine 1 is pending -> gets Engine 1
+        self.assertEqual(self.st.active_probe_engine(device="dev_B"), 1)
 
 
 if __name__ == "__main__":

@@ -130,15 +130,22 @@ def _classify_reports(st: Store, engine_id: int = 1):
     now = int(time.time())
     cand = st.scan_candidates(engine_id=engine_id)
     controls = set(cand.get("controls") or [])
+    cand_hash = st.candidate_set_hash(cand.get("ips", []), cand.get("controls", []))
     trusted, aside = {}, {}
     for d, r in st.device_reports(engine_id=engine_id).items():
         if now - (r.get("ts") or 0) >= REPORT_TTL:
             continue
         ok, why = _report_trusted(r, controls)
-        if ok:
-            trusted[d] = r
-        else:
+        if not ok:
             aside[d] = (r, why)
+            continue
+        # Candidate set hash verification: report must match engine's current shortlist
+        rep_ips = [x.get("ip") for x in (r.get("results") or []) if x.get("ip")]
+        rep_hash = st.candidate_set_hash(rep_ips, controls)
+        if cand_hash and rep_hash != cand_hash:
+            aside[d] = (r, f"Candidate set hash mismatch (expected {cand_hash}, got {rep_hash})")
+            continue
+        trusted[d] = r
     return trusted, aside
 
 
