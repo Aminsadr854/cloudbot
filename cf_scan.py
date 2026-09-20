@@ -152,7 +152,9 @@ def _pin(subset, full, pinned):
                            if _ip_of(e) in pinned and _ip_of(e) not in have]
 
 
-async def stage_reachable(ips, port, timeout, concurrency, progress_every=20000):
+async def stage_reachable(ips, port, timeout, concurrency, progress_every=None, retries=1):
+    if progress_every is None:
+        progress_every = max(1, len(ips) // 10)
     sem = asyncio.Semaphore(concurrency)
     alive = []
     done = 0
@@ -161,8 +163,12 @@ async def stage_reachable(ips, port, timeout, concurrency, progress_every=20000)
         nonlocal done
         async with sem:
             ms = await tcp_probe(ip, port, timeout)
+            for _ in range(retries):
+                if ms is not None:
+                    break
+                ms = await tcp_probe(ip, port, timeout)
         done += 1
-        if done % progress_every == 0:
+        if progress_every and done % progress_every == 0:
             print(f"    {done}/{len(ips)} probed, {len(alive)} answering", flush=True)
         if ms is not None:
             alive.append((ip, ms))
@@ -481,7 +487,9 @@ async def main():
     ap.add_argument("--path", default="/cdn-cgi/trace")
     ap.add_argument("--per-24", type=int, default=1, help="addresses sampled per /24")
     ap.add_argument("--limit", type=int, default=0, help="cap candidates (0 = all)")
-    ap.add_argument("--connect-timeout", type=float, default=2.0)
+    ap.add_argument("--connect-timeout", type=float, default=3.0)
+    ap.add_argument("--stage1-retries", type=int, default=1,
+                    help="retries per address if initial reachability probe fails")
     ap.add_argument("--http-timeout", type=float, default=6.0)
     ap.add_argument("--concurrency", type=int, default=400)
     ap.add_argument("--edge-keep", type=int, default=120, help="carried into the stability stage")
@@ -533,7 +541,11 @@ async def main():
         print(f"  ranges: {len(ranges)}   candidates: {len(ips)}", flush=True)
 
     print("  stage 1  reachable", flush=True)
-    alive = await stage_reachable(ips, args.port, args.connect_timeout, args.concurrency)
+    progress_every = max(1, len(ips) // 10)
+    alive = await stage_reachable(
+        ips, args.port, args.connect_timeout, args.concurrency,
+        progress_every=progress_every, retries=args.stage1_retries
+    )
     print(f"    {len(alive)} answered on {args.port}", flush=True)
     if not alive:
         print("  nothing answered - this path may block Cloudflare entirely.")

@@ -1176,6 +1176,45 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(cf_scan.is_valid_response("200", "cf-ray: abc", "ip=1.1.1.1\ncolo=FRA\n", is_trace=True))
         self.assertFalse(cf_scan.is_valid_response("200", "cf-ray: abc", "other body", is_trace=True))
 
+    # Test B5: stage_reachable retries failed probe and reports latency of successful attempt
+    async def test_b5_stage_reachable_retries(self):
+        import cf_scan
+
+        attempts = {}
+
+        async def fake_tcp_probe(ip, port, timeout):
+            attempts[ip] = attempts.get(ip, 0) + 1
+            if ip == "1.1.1.1":
+                # First attempt succeeds
+                return 15.0
+            elif ip == "2.2.2.2":
+                # First attempt fails, second attempt succeeds
+                if attempts[ip] == 1:
+                    return None
+                return 25.0
+            elif ip == "3.3.3.3":
+                # Both attempts fail
+                return None
+
+        ips = ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
+        with patch("cf_scan.tcp_probe", side_effect=fake_tcp_probe):
+            alive = await cf_scan.stage_reachable(ips, port=443, timeout=3.0, concurrency=10, retries=1)
+
+        # 1.1.1.1 took 1 attempt
+        self.assertEqual(attempts["1.1.1.1"], 1)
+        # 2.2.2.2 took 2 attempts (retried once)
+        self.assertEqual(attempts["2.2.2.2"], 2)
+        # 3.3.3.3 took 2 attempts (retried once, both failed)
+        self.assertEqual(attempts["3.3.3.3"], 2)
+
+        # alive has only 1.1.1.1 and 2.2.2.2
+        alive_dict = dict(alive)
+        self.assertIn("1.1.1.1", alive_dict)
+        self.assertEqual(alive_dict["1.1.1.1"], 15.0)
+        self.assertIn("2.2.2.2", alive_dict)
+        self.assertEqual(alive_dict["2.2.2.2"], 25.0)
+        self.assertNotIn("3.3.3.3", alive_dict)
+
 
 if __name__ == "__main__":
     unittest.main()
