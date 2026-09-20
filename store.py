@@ -52,6 +52,16 @@ CREATE TABLE IF NOT EXISTS blocked_ip_failures (
 );
 CREATE INDEX IF NOT EXISTS idx_blocked_ip_failures_ip_ts
     ON blocked_ip_failures (ip, ts);
+CREATE TABLE IF NOT EXISTS cf_prefix_stats (
+    prefix TEXT PRIMARY KEY,
+    samples REAL DEFAULT 0.0,
+    successes REAL DEFAULT 0.0,
+    score_sum REAL DEFAULT 0.0,
+    last_sampled REAL DEFAULT 0.0,
+    last_success REAL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_prefix_stats_last_sampled
+    ON cf_prefix_stats (last_sampled);
 """
 
 
@@ -799,6 +809,93 @@ class Store:
         """
         cur = self.con.execute(q, (float(BLOCK_WINDOW_SECONDS), BLOCK_FAILURES_REQUIRED, expiry_cutoff))
         return {row[0] for row in cur}
+
+    def record_prefix_stats(self, stats: dict, now=None):
+        """
+        Record prefix statistics from a scan pass in a single executemany transaction.
+        Accumulates samples, successes, and score_sum.
+        last_success only advances when this batch had successes.
+        """
+        import time
+        if not stats:
+            return
+        now_ts = float(time.time() if now is None else now)
+        rows = []
+        for prefix, s in stats.items():
+            succ = float(s.get("successes", 0.0))
+            rows.append((
+                str(prefix),
+                float(s.get("samples", 0.0)),
+                succ,
+                float(s.get("score_sum", 0.0)),
+                now_ts,
+                now_ts if succ > 0 else 0.0,
+            ))
+        with self.con:
+            self.con.executemany("""
+                INSERT INTO cf_prefix_stats (prefix, samples, successes, score_sum, last_sampled, last_success)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(prefix) DO UPDATE SET
+                    samples = cf_prefix_stats.samples + excluded.samples,
+                    successes = cf_prefix_stats.successes + excluded.successes,
+                    score_sum = cf_prefix_stats.score_sum + excluded.score_sum,
+                    last_sampled = excluded.last_sampled,
+                    last_success = CASE WHEN excluded.last_success > 0 THEN excluded.last_success ELSE cf_prefix_stats.last_success END
+            """, rows)
+
+    def get_prefix_stats(self, now=None) -> dict:
+        """
+        Return prefix stats with 24-hour half-life exponential decay applied.
+        DECAY DIFFERENTLY PER COUNTER:
+          - samples decays by (now - last_sampled): measures freshness of probe volume.
+          - successes and score_sum decay by (now - last_success): a prefix sampled recently
+            with no success since last week must not have week-old successes look fresh.
+        """
+        import time
+        now_ts = float(time.time() if now is None else now)
+        tau = 24.0 * 3600.0
+        out = {}
+        cur = self.con.execute(
+            "SELECT prefix, samples, successes, score_sum, last_sampled, last_success FROM cf_prefix_stats"
+        )
+        for prefix, samples, successes, score_sum, last_sampled, last_success in cur:
+            # samples decays by time since last sampled
+            dt_sampled = max(0.0, now_ts - (last_sampled or now_ts))
+            decay_sampled = 2.0 ** (-dt_sampled / tau)
+            decayed_samples = float(samples or 0.0) * decay_sampled
+
+            # successes and score_sum decay by time since last success
+            if last_success and last_success > 0 and successes and successes > 0:
+                dt_success = max(0.0, now_ts - last_success)
+                decay_success = 2.0 ** (-dt_success / tau)
+                decayed_successes = float(successes) * decay_success
+                decayed_score_sum = float(score_sum or 0.0) * decay_success
+            else:
+                decayed_successes = 0.0
+                decayed_score_sum = 0.0
+
+            out[prefix] = {
+                "samples": decayed_samples,
+                "successes": decayed_successes,
+                "score_sum": decayed_score_sum,
+                "last_sampled": last_sampled,
+                "last_success": last_success,
+            }
+        return out
+
+    def prune_prefix_stats(self, current_prefixes):
+        """
+        Purge subnets no longer announced by Cloudflare.
+        Uses a temp table to avoid SQLite variable limits with ~6000 prefixes.
+        """
+        if not current_prefixes:
+            return
+        with self.con:
+            self.con.execute("CREATE TEMP TABLE IF NOT EXISTS _valid_prefixes (prefix TEXT PRIMARY KEY)")
+            self.con.execute("DELETE FROM _valid_prefixes")
+            self.con.executemany("INSERT OR IGNORE INTO _valid_prefixes VALUES (?)", [(str(p),) for p in current_prefixes])
+            self.con.execute("DELETE FROM cf_prefix_stats WHERE prefix NOT IN (SELECT prefix FROM _valid_prefixes)")
+            self.con.execute("DROP TABLE _valid_prefixes")
 
     def probe_token(self) -> str:
         """Shared secret the phones authenticate with; created on first use."""

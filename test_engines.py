@@ -1677,6 +1677,69 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         f_rows = st.con.execute("SELECT ip FROM blocked_ip_failures WHERE ip IN ('10.0.0.4', '10.0.0.5')").fetchall()
         self.assertEqual(len(f_rows), 2)
 
+    def test_d2_prefix_stats_table(self):
+        st = self.st
+        base_t = 100000.0
+
+        # 1. Accumulation across two batches
+        batch1 = {
+            "104.16.1.0/24": {"samples": 2, "successes": 1, "score_sum": 50.0},
+            "104.16.2.0/24": {"samples": 3, "successes": 0, "score_sum": 0.0},
+        }
+        st.record_prefix_stats(batch1, now=base_t)
+
+        batch2 = {
+            "104.16.1.0/24": {"samples": 3, "successes": 2, "score_sum": 100.0},
+        }
+        st.record_prefix_stats(batch2, now=base_t + 3600)
+
+        stats = st.get_prefix_stats(now=base_t + 3600)
+        p1 = stats["104.16.1.0/24"]
+        self.assertAlmostEqual(p1["samples"], 5.0, places=2)
+        self.assertAlmostEqual(p1["successes"], 3.0, places=2)
+        self.assertAlmostEqual(p1["score_sum"], 150.0, places=2)
+        self.assertEqual(p1["last_sampled"], base_t + 3600)
+        self.assertEqual(p1["last_success"], base_t + 3600)
+
+        # 2. Decay maths at 0h / 24h / 48h
+        s_0h = st.get_prefix_stats(now=base_t + 3600)["104.16.1.0/24"]
+        self.assertAlmostEqual(s_0h["samples"], 5.0, places=2)
+
+        s_24h = st.get_prefix_stats(now=base_t + 3600 + 24 * 3600)["104.16.1.0/24"]
+        self.assertAlmostEqual(s_24h["samples"], 2.5, places=2)  # half-life is 24h
+        self.assertAlmostEqual(s_24h["successes"], 1.5, places=2)
+
+        s_48h = st.get_prefix_stats(now=base_t + 3600 + 48 * 3600)["104.16.1.0/24"]
+        self.assertAlmostEqual(s_48h["samples"], 1.25, places=2)
+        self.assertAlmostEqual(s_48h["successes"], 0.75, places=2)
+
+        # 3. Different decay basis for samples vs successes
+        # Probe 104.16.1.0/24 again at base_t + 3600 + 24*3600 with NO success
+        st.record_prefix_stats({"104.16.1.0/24": {"samples": 5, "successes": 0, "score_sum": 0.0}},
+                               now=base_t + 3600 + 24 * 3600)
+        s_diff = st.get_prefix_stats(now=base_t + 3600 + 24 * 3600)["104.16.1.0/24"]
+        # Raw samples was 5 + 5 = 10, just probed -> decayed_samples is 10.0
+        self.assertAlmostEqual(s_diff["samples"], 10.0, places=2)
+        # But last_success was 24 hours ago! So successes decayed by 24h: 3.0 / 2 = 1.5
+        self.assertAlmostEqual(s_diff["successes"], 1.5, places=2)
+
+        # Prefix with 0 successes never produces NaN or inf
+        p2 = st.get_prefix_stats(now=base_t + 3600)["104.16.2.0/24"]
+        self.assertEqual(p2["successes"], 0.0)
+        self.assertEqual(p2["score_sum"], 0.0)
+
+        # 4. Pruning with more than 999 prefixes
+        many_prefixes = [f"198.18.{i // 256}.{i % 256}/24" for i in range(1200)]
+        batch_many = {p: {"samples": 1, "successes": 1, "score_sum": 10.0} for p in many_prefixes}
+        st.record_prefix_stats(batch_many, now=base_t)
+        self.assertIn("198.18.0.0/24", st.get_prefix_stats(now=base_t))
+
+        kept_prefixes = set(many_prefixes[:1000]) | {"104.16.1.0/24", "104.16.2.0/24"}
+        st.prune_prefix_stats(kept_prefixes)
+        pruned_stats = st.get_prefix_stats(now=base_t)
+        self.assertIn("198.18.0.0/24", pruned_stats)
+        self.assertNotIn(many_prefixes[1100], pruned_stats)
+
 
 if __name__ == "__main__":
     unittest.main()
