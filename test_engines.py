@@ -601,6 +601,23 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         # Decision status updated with rejection reason
         self.assertIn("هیچ‌کدام", self.st.get("scan_last_decision_engine_1"))
 
+    # Test A1: Shell injection protection in _build_scan_args
+    def test_a1_shell_injection_protection_in_build_scan_args(self):
+        import shlex
+        host = "evil.com; rm -rf /"
+        sni = "evil.sni; reboot"
+        out_file = "/root/out; malicious"
+        args = cfscanner._build_scan_args("/root/cf_scan.py", out_file, host=host, sni=sni)
+        joined = shlex.join(args)
+        cmd = f"ulimit -n 65535 2>/dev/null; {joined} 2>&1 | tail -25"
+        # Assert dangerous unquoted shell commands are not present
+        self.assertNotIn("; rm -rf / ", cmd)
+        self.assertNotIn("; reboot ", cmd)
+        # Verify shlex quoted values
+        self.assertIn(shlex.quote(host), cmd)
+        self.assertIn(shlex.quote(sni), cmd)
+        self.assertIn(shlex.quote(out_file), cmd)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -13,6 +13,7 @@ because a steady 90 ms path beats a 40 ms one that stalls.
 import asyncio
 import json
 import os
+import shlex
 
 import tunnel  # reuse the SSH connector (direct, or via the Iran jump)
 
@@ -24,6 +25,33 @@ REMOTE_OUT = "/root/cf_bot_scan"
 def _load_scanner() -> str:
     with open(SCANNER_LOCAL) as f:
         return f.read()
+
+
+def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
+                     final=20, host="speed.cloudflare.com", sni: str | None = None,
+                     limit=0, only=None, no_speed=False, include=None) -> list[str]:
+    args = ["python3", remote_scanner,
+            "--per-24", str(per_24),
+            "--rounds", str(rounds),
+            "--final", str(final),
+            "--host", host,
+            "--concurrency", "500",
+            "--out", out_file]
+    if sni:
+        args += ["--sni", sni]
+    if limit:
+        args += ["--limit", str(int(limit))]
+    if only:
+        safe_only = [i for i in only if all(ch in "0123456789." for ch in i)]
+        if safe_only:
+            args += ["--only", ",".join(safe_only)]
+    if no_speed:
+        args.append("--no-speed")
+    if include:
+        safe_inc = [i for i in include if all(ch in "0123456789." for ch in i)]
+        if safe_inc:
+            args += ["--include", ",".join(safe_inc)]
+    return args
 
 
 async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
@@ -50,39 +78,19 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
 
         # Raise the fd limit inline: every probe in flight holds one, and the
         # default 1024 would silently cap concurrency and lose candidates.
-        cmd = (
-            f"ulimit -n 65535 2>/dev/null; "
-            f"python3 {REMOTE_SCANNER} --per-24 {per_24} --rounds {rounds} "
-            f"--final {final} --host {host} "
-            + (f"--sni {sni} " if sni else "")
-            + f"--concurrency 500 "
-            # A fixed sample size rather than the whole announced space: the
-            # addresses are shuffled across every /24 first, so a thousand of
-            # them is a fair picture of the whole and finishes in a minute.
-            + (f"--limit {int(limit)} " if limit else "")
-            # `only` measures a fixed list and samples nothing; `no_speed`
-            # drops the download stage, which is the whole bandwidth cost of a
-            # scan and is not worth paying on every pass of a continuous one.
-            + (("--only " + ",".join(
-                i for i in only if all(ch in "0123456789." for ch in i)) + " ")
-               if only else "")
-            + ("--no-speed " if no_speed else "") +
-            f"--out {out_file} 2>&1 | tail -25"
+        args = _build_scan_args(
+            REMOTE_SCANNER, out_file, per_24=per_24, rounds=rounds, final=final,
+            host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include
         )
-        if include:
-            # Addresses the phones vouched for. They are re-measured here every
-            # round so the relay always has fresh numbers for them, otherwise a
-            # phone-verified address could never be the one deployed.
-            safe = ",".join(i for i in include
-                            if all(ch in "0123456789." for ch in i))
-            if safe:
-                cmd = cmd.replace("--out ", f"--include {safe} --out ")
+        cmd = ("ulimit -n 65535 2>/dev/null; "
+               + shlex.join(args)
+               + " 2>&1 | tail -25")
         await log("در حال سنجش روی سرور ایران…" if only
                   else "در حال اسکن رنج کلادفلر از داخل ایران…")
         r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=600)
         tail = (r.stdout or "")[-500:]
 
-        res = await conn.run(f"cat {out_file}.json 2>/dev/null", check=False)
+        res = await conn.run(f"cat {shlex.quote(out_file + '.json')} 2>/dev/null", check=False)
         raw = (res.stdout or "").strip()
         if not raw:
             raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")
