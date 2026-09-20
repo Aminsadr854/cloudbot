@@ -1372,6 +1372,57 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         prefixes_16 = {f"{ip.exploded.split('.')[0]}.{ip.exploded.split('.')[1]}" for ip in parsed}
         self.assertGreater(len(prefixes_16), 1)
 
+    async def test_c2_bounded_worker_queue(self):
+        import cf_scan
+
+        # Test empty cases
+        self.assertEqual(await cf_scan.stage_reachable([], port=443, timeout=1.0, concurrency=5), [])
+        self.assertEqual(await cf_scan.stage_edge([], "speed.cloudflare.com", 443, "/__down", 2.0, 5), ([], [], None, False))
+
+        # 1. Test stage_reachable concurrency bounding
+        active = 0
+        max_active = 0
+
+        async def fake_tcp_probe(ip, port, timeout):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            return 12.5
+
+        with patch("cf_scan.tcp_probe", side_effect=fake_tcp_probe):
+            ips = [f"192.0.2.{i}" for i in range(25)]
+            res = await cf_scan.stage_reachable(ips, port=443, timeout=1.0, concurrency=5, progress_every=100)
+            self.assertEqual(len(res), 25)
+            self.assertLessEqual(max_active, 5)
+            self.assertGreater(max_active, 1)
+
+        # 2. Test stage_edge concurrency bounding
+        active_edge = 0
+        max_active_edge = 0
+
+        async def fake_http_probe(ip, host, port, path, timeout, **kwargs):
+            nonlocal active_edge, max_active_edge
+            active_edge += 1
+            max_active_edge = max(max_active_edge, active_edge)
+            await asyncio.sleep(0.01)
+            active_edge -= 1
+            return {
+                "status": "200", "headers": "server: cloudflare\r\ncf-ray: test123",
+                "body": "ip=1.2.3.4\ncolo=FRA", "valid": True, "cf_error": None,
+                "ttfb_ms": 15.0, "cert_ok": True
+            }
+
+        with patch("cf_scan.http_probe", side_effect=fake_http_probe):
+            alive = [(f"192.0.2.{i}", 12.0) for i in range(20)]
+            good, mediated, my_ip, broken = await cf_scan.stage_edge(
+                alive, "speed.cloudflare.com", 443, "/__down", 2.0, concurrency=4
+            )
+            self.assertEqual(len(good), 20)
+            self.assertLessEqual(max_active_edge, 4)
+            self.assertGreater(max_active_edge, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

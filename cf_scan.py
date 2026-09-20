@@ -171,27 +171,39 @@ def _pin(subset, full, pinned):
 
 
 async def stage_reachable(ips, port, timeout, concurrency, progress_every=None, retries=1):
+    if not ips:
+        return []
     if progress_every is None:
         progress_every = max(1, len(ips) // 10)
-    sem = asyncio.Semaphore(concurrency)
+    queue = asyncio.Queue()
+    for ip in ips:
+        queue.put_nowait(ip)
+
     alive = []
     done = 0
+    num_workers = min(max(1, concurrency), len(ips))
+    for _ in range(num_workers):
+        queue.put_nowait(None)
 
-    async def one(ip):
+    async def worker():
         nonlocal done
-        async with sem:
+        while True:
+            ip = await queue.get()
+            if ip is None:
+                break
             ms = await tcp_probe(ip, port, timeout)
             for _ in range(retries):
                 if ms is not None:
                     break
                 ms = await tcp_probe(ip, port, timeout)
-        done += 1
-        if progress_every and done % progress_every == 0:
-            print(f"    {done}/{len(ips)} probed, {len(alive)} answering", flush=True)
-        if ms is not None:
-            alive.append((ip, ms))
+            done += 1
+            if progress_every and done % progress_every == 0:
+                print(f"    {done}/{len(ips)} probed, {len(alive)} answering", flush=True)
+            if ms is not None:
+                alive.append((ip, ms))
 
-    await asyncio.gather(*(one(ip) for ip in ips))
+    workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
+    await asyncio.gather(*workers)
     alive.sort(key=lambda x: x[1])
     return alive
 
@@ -326,12 +338,26 @@ async def stage_edge(alive, host, port, path, timeout, concurrency, sni=None):
     """
     Keep only addresses that give a direct, unmediated, non-error path to Cloudflare.
     """
-    sem = asyncio.Semaphore(concurrency)
+    if not alive:
+        return [], [], None, False
+
     seen = []
     cert_failed = []
 
-    async def one(ip, tcp_ms):
-        async with sem:
+    queue = asyncio.Queue()
+    for item in alive:
+        queue.put_nowait(item)
+
+    num_workers = min(max(1, concurrency), len(alive))
+    for _ in range(num_workers):
+        queue.put_nowait(None)
+
+    async def worker():
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            ip, tcp_ms = item
             r = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni, verify=True)
             if r.get("cert_ok") is False:
                 # Probe permissively to see if the address otherwise responds correctly
@@ -347,7 +373,8 @@ async def stage_edge(alive, host, port, path, timeout, concurrency, sni=None):
                 seen.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": True, **r,
                              **parse_trace(r.get("body", ""))})
 
-    await asyncio.gather(*(one(ip, ms) for ip, ms in alive))
+    workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
+    await asyncio.gather(*workers)
 
     # Sanity check: if certificate verification failed for >90% of responsive addresses,
     # it indicates a local trust store failure (bad CA bundle, clock skew, unusual chain).
