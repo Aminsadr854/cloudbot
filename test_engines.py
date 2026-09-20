@@ -1041,6 +1041,63 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res["rtt_max"], 40.0)
         self.assertIsNotNone(res["jitter"])
 
+    # Test B2: Interception detection with TLS verification and cert_ok handling
+    async def test_b2_interception_detection_and_cert_verify(self):
+        import cf_scan
+        import ssl
+
+        # 1. http_probe with SSLCertVerificationError
+        with patch("asyncio.open_connection", side_effect=ssl.SSLCertVerificationError("Cert verify failed")):
+            res = await cf_scan.http_probe("1.2.3.4", "example.com", 443, "/cdn-cgi/trace", 2.0, verify=True)
+            self.assertEqual(res, {
+                "error": "CertVerify",
+                "valid": False,
+                "cf_error": False,
+                "cert_ok": False,
+            })
+
+        # 2. stage_edge separation: cert_ok False vs client IP mismatch vs clean edge
+        async def fake_http_probe(ip, host, port, path, timeout, want_body=False, sni=None, verify=False):
+            self.assertTrue(verify, "stage_edge must call http_probe with verify=True")
+            if ip in ("1.1.1.1", "1.1.1.2"):
+                # Clean edge with valid cert and correct client IP
+                return {
+                    "valid": True, "cf_error": False, "cert_ok": True, "ttfb_ms": 25.0,
+                    "body": "ip=90.0.0.1\ncolo=DUS\nloc=DE\n"
+                }
+            elif ip == "2.2.2.2":
+                # Intercepted edge with invalid certificate
+                return {
+                    "error": "CertVerify", "valid": False, "cf_error": False, "cert_ok": False
+                }
+            elif ip == "3.3.3.3":
+                # Mediated edge with valid cert but client IP mismatch (proxy/gateway)
+                return {
+                    "valid": True, "cf_error": False, "cert_ok": True, "ttfb_ms": 30.0,
+                    "body": "ip=198.51.100.99\ncolo=FRA\nloc=DE\n"
+                }
+
+        alive = [("1.1.1.1", 10.0), ("1.1.1.2", 11.0), ("2.2.2.2", 12.0), ("3.3.3.3", 15.0)]
+        with patch("cf_scan.http_probe", side_effect=fake_http_probe):
+            good, mediated, my_ip = await cf_scan.stage_edge(
+                alive, "example.com", 443, "/cdn-cgi/trace", 2.0, 5
+            )
+
+        self.assertEqual(my_ip, "90.0.0.1")
+        self.assertEqual(len(good), 2)
+        self.assertEqual(good[0]["ip"], "1.1.1.1")
+        self.assertTrue(good[0]["cert_ok"])
+
+        self.assertEqual(len(mediated), 2)
+        med_by_ip = {d["ip"]: d for d in mediated}
+        self.assertIn("2.2.2.2", med_by_ip)
+        self.assertFalse(med_by_ip["2.2.2.2"]["cert_ok"])
+        self.assertIn("certificate verification failed", med_by_ip["2.2.2.2"]["reason"])
+
+        self.assertIn("3.3.3.3", med_by_ip)
+        self.assertTrue(med_by_ip["3.3.3.3"]["cert_ok"])
+        self.assertEqual(med_by_ip["3.3.3.3"]["ip_trace"], "198.51.100.99")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -66,6 +66,10 @@ TLS_CTX.check_hostname = False
 TLS_CTX.verify_mode = ssl.CERT_NONE
 TLS_CTX.set_alpn_protocols(["http/1.1"])
 
+TLS_CTX_VERIFY = ssl.create_default_context()
+TLS_CTX_VERIFY.check_hostname = True
+TLS_CTX_VERIFY.set_alpn_protocols(["http/1.1"])
+
 
 # --------------------------------------------------------------------------
 # candidate generation
@@ -171,12 +175,13 @@ async def stage_reachable(ips, port, timeout, concurrency, progress_every=20000)
 # --------------------------------------------------------------------------
 # stage 2: is it really a Cloudflare edge that will serve traffic
 # --------------------------------------------------------------------------
-async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None):
+async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None, verify=False):
     """One HTTPS request to a named host/SNI, forced to a specific address."""
     start = time.perf_counter()
     server_name = (sni or host).strip()
+    ctx = TLS_CTX_VERIFY if verify else TLS_CTX
     try:
-        fut = asyncio.open_connection(ip, port, ssl=TLS_CTX, server_hostname=server_name)
+        fut = asyncio.open_connection(ip, port, ssl=ctx, server_hostname=server_name)
         reader, writer = await asyncio.wait_for(fut, timeout=timeout)
         tls_ms = (time.perf_counter() - start) * 1000
 
@@ -241,7 +246,10 @@ async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=Fals
         return {"tls_ms": tls_ms, "ttfb_ms": ttfb_ms, "status": status,
                 "cloudflare": ("server: cloudflare" in headers or "cf-ray" in headers),
                 "valid": valid, "cf_error": cf_error, "cf_err_code": cf_err_code,
+                "cert_ok": True if verify else None,
                 "bytes": got, "dl_ms": dl_ms, "body": body}
+    except ssl.SSLCertVerificationError:
+        return {"error": "CertVerify", "valid": False, "cf_error": False, "cert_ok": False}
     except Exception as e:
         return {"error": type(e).__name__, "valid": False, "cf_error": False}
 
@@ -272,12 +280,16 @@ async def stage_edge(alive, host, port, path, timeout, concurrency, sni=None):
     """
     sem = asyncio.Semaphore(concurrency)
     seen = []
+    cert_failed = []
 
     async def one(ip, tcp_ms):
         async with sem:
-            r = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni)
-        if "error" not in r and r.get("valid") and not r.get("cf_error"):
-            seen.append({"ip": ip, "tcp_ms": tcp_ms, **r,
+            r = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni, verify=True)
+        if r.get("cert_ok") is False:
+            cert_failed.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": False,
+                                "reason": "certificate verification failed", **r})
+        elif "error" not in r and r.get("valid") and not r.get("cf_error"):
+            seen.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": True, **r,
                          **parse_trace(r.get("body", ""))})
 
     await asyncio.gather(*(one(ip, ms) for ip, ms in alive))
@@ -286,8 +298,12 @@ async def stage_edge(alive, host, port, path, timeout, concurrency, sni=None):
     my_ip = max(set(reported), key=reported.count) if reported else None
 
     good, mediated = [], []
+    for d in cert_failed:
+        mediated.append(d)
+
     for d in seen:
         if my_ip and d.get("ip_trace") and d["ip_trace"] != my_ip:
+            d["reason"] = f"seen as {d.get('ip_trace')} via {d.get('colo', '?')}/{d.get('loc', '?')}"
             mediated.append(d)
         else:
             good.append(d)
@@ -509,10 +525,13 @@ async def main():
     print(f"    this machine appears to Cloudflare as {my_ip}", flush=True)
     print(f"    {len(good)} direct, {len(mediated)} reached through something else",
           flush=True)
+    cert_fails = sum(1 for d in mediated if d.get("cert_ok") is False)
+    ip_fails = sum(1 for d in mediated if d.get("cert_ok") is not False)
+    print(f"    excluded breakdown: {cert_fails} certificate verification failed, {ip_fails} client IP mismatch", flush=True)
     if mediated:
         for d in mediated[:5]:
-            print(f"      excluded {d['ip']:<16} seen as {d.get('ip_trace')} "
-                  f"via {d.get('colo', '?')}/{d.get('loc', '?')}", flush=True)
+            reason = d.get("reason") or f"seen as {d.get('ip_trace')} via {d.get('colo', '?')}/{d.get('loc', '?')}"
+            print(f"      excluded {d['ip']:<16} {reason}", flush=True)
     if not good:
         print("  none served a Cloudflare response - the TLS path is likely interfered with.")
         return
