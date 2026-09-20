@@ -621,6 +621,8 @@ class ScannerEngine:
 
         applied = False
         previous_live_ip = live_ip
+        record_created = False
+        created_rec_id = None
 
         if cfg.get("auto_apply") and fqdn and self.st.cf_token() and cf and zone:
             # 2. DNS_UPDATED: Apply to Cloudflare
@@ -628,7 +630,15 @@ class ScannerEngine:
                 if rec:
                     await cf.update_a(zone[0], rec, chosen["ip"])
                 else:
-                    await cf.create_a(zone[0], fqdn, chosen["ip"], proxied=False)
+                    new_rec = await cf.create_a(zone[0], fqdn, chosen["ip"], proxied=False)
+                    record_created = True
+                    if isinstance(new_rec, dict) and "id" in new_rec:
+                        created_rec_id = new_rec["id"]
+                    elif hasattr(new_rec, "get") and new_rec.get("id"):
+                        created_rec_id = new_rec.get("id")
+                    else:
+                        refetch = await cf.find_a_record(zone[0], fqdn)
+                        created_rec_id = refetch.get("id") if refetch else None
                 applied = True
                 log.info("[ENGINE %d] DNS_UPDATED: %s -> %s (previous: %s)",
                          self.engine_id, fqdn, chosen["ip"], previous_live_ip)
@@ -659,7 +669,25 @@ class ScannerEngine:
                 log.error("[ENGINE %d] DOMAIN_POSTCONFIRMED failed for %s: %s. Initiating automatic rollback!",
                           self.engine_id, chosen["ip"], post_reason)
                 rollback_done = False
-                if previous_live_ip:
+                manual_needed = False
+                rb_mode = None
+
+                if record_created:
+                    rb_mode = "deleted"
+                    try:
+                        cur_rec = await cf.find_a_record(zone[0], fqdn)
+                        if cur_rec and created_rec_id and cur_rec.get("id") == created_rec_id:
+                            await cf.delete_record(zone[0], cur_rec["id"])
+                            rollback_done = True
+                            log.info("[ENGINE %d] Automatic rollback deleted created record %s", self.engine_id, cur_rec["id"])
+                        else:
+                            log.warning("[ENGINE %d] Record ID mismatch during rollback delete for %s: expected %s, found %s",
+                                        self.engine_id, fqdn, created_rec_id, cur_rec.get("id") if cur_rec else None)
+                            manual_needed = True
+                    except Exception as rb_err:
+                        log.error("[ENGINE %d] Automatic rollback delete failed: %s", self.engine_id, rb_err)
+                elif previous_live_ip:
+                    rb_mode = "restored"
                     try:
                         cur_rec = await cf.find_a_record(zone[0], fqdn)
                         if cur_rec:
@@ -668,8 +696,18 @@ class ScannerEngine:
                             log.info("[ENGINE %d] Automatic rollback to %s succeeded", self.engine_id, previous_live_ip)
                     except Exception as rb_err:
                         log.error("[ENGINE %d] Automatic rollback failed: %s", self.engine_id, rb_err)
+
                 if notify_fn:
-                    rb_txt = f"بازگشت خودکار به <code>{previous_live_ip}</code> انجام شد." if rollback_done else "بازگشت خودکار ناموفق بود!"
+                    if manual_needed:
+                        rb_txt = "⚠️ تغییر غیرمنتظره رکورد در کلادفلر — رکورد حذف نشد و نیاز به بررسی دستی دارد."
+                    elif rollback_done:
+                        if rb_mode == "deleted":
+                            rb_txt = "رکورد تازه ایجاد شده به‌دلیل عدم تأیید حذف گردید."
+                        else:
+                            rb_txt = f"بازگشت خودکار به <code>{previous_live_ip}</code> انجام شد."
+                    else:
+                        rb_txt = "بازگشت خودکار ناموفق بود!"
+
                     await notify_fn(
                         f"🚨 <b>[موتور {self.engine_id}] خطا در تست پس از DNS — بازگشت خودکار</b>\n\n"
                         f"دامنه: <code>{fqdn}</code>\n"

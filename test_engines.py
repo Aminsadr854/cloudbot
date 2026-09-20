@@ -717,6 +717,56 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(mock_cf.update_a.call_args_list[1][0][2], "1.1.1.1")
 
 
+    # Test A6: Rollback on freshly created record deletes it, verifies ID before deletion
+    async def test_a6_rollback_by_deleting_freshly_created_record(self):
+        self.st.update_cfscan(1, fqdn="test.domain.com", auto_apply=True, last_best_ip="")
+        self.st.set_cf_token("fake_token")
+        self.st.set_scan_candidates([{"ip": "104.16.1.10", "rtt": 40}], engine_id=1)
+
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(return_value=["zone1", "domain.com"])
+        mock_cf.create_a = AsyncMock(return_value={"id": "new_rec_123", "name": "test.domain.com", "content": "104.16.1.10"})
+        mock_cf.delete_record = AsyncMock(return_value=True)
+        mock_cf.update_a = AsyncMock(return_value=True)
+
+        fail_verifier = AsyncMock(side_effect=[(True, "HTTP 200 OK"), (False, "HTTP 500 Post Check Failed")])
+        notify_mock = AsyncMock()
+
+        # Case 1: Fresh record created, post check fails, ID matches -> delete_record called
+        # Initially find_a_record returns None (so create_a is used)
+        # On rollback, find_a_record returns the record with same ID new_rec_123
+        mock_cf.find_a_record = AsyncMock(side_effect=[None, {"id": "new_rec_123", "content": "104.16.1.10"}])
+
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
+             patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.16.1.10", "rtt": 40}, "why": "ok", "voters": 2}), \
+             patch("asyncio.sleep", AsyncMock()):
+            await self.e1.phone_recheck_pass(notify_fn=notify_mock, verifier=fail_verifier)
+
+            self.assertEqual(mock_cf.create_a.call_count, 1)
+            self.assertEqual(mock_cf.delete_record.call_count, 1)
+            mock_cf.delete_record.assert_called_once_with("zone1", "new_rec_123")
+            self.assertEqual(mock_cf.update_a.call_count, 0)
+            self.assertIn("حذف گردید", notify_mock.call_args[0][0])
+
+        # Case 2: Fresh record created, post check fails, but record ID changed in the meantime -> do NOT delete
+        mock_cf.create_a.reset_mock()
+        mock_cf.delete_record.reset_mock()
+        notify_mock.reset_mock()
+        fail_verifier = AsyncMock(side_effect=[(True, "HTTP 200 OK"), (False, "HTTP 500 Post Check Failed")])
+        mock_cf.find_a_record = AsyncMock(side_effect=[None, {"id": "tampered_rec_999", "content": "1.2.3.4"}])
+
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
+             patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.16.1.10", "rtt": 40}, "why": "ok", "voters": 2}), \
+             patch("asyncio.sleep", AsyncMock()), \
+             self.assertLogs("scanner_engine", level="WARNING") as cm:
+            await self.e1.phone_recheck_pass(notify_fn=notify_mock, verifier=fail_verifier)
+
+            self.assertEqual(mock_cf.create_a.call_count, 1)
+            self.assertEqual(mock_cf.delete_record.call_count, 0)  # NOT deleted
+            self.assertTrue(any("Record ID mismatch" in msg for msg in cm.output))
+            self.assertIn("نیاز به بررسی دستی دارد", notify_mock.call_args[0][0])
+
+
 if __name__ == "__main__":
     unittest.main()
 
