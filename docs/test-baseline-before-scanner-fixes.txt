@@ -1,0 +1,494 @@
+# Pre-change test baseline
+# Known-bad: test_providers.py (13 failures) and test_store.py (1 failure) concern out-of-scope files and are left failing.
+
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-7.4.4, pluggy-1.4.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /root/cloudbot
+plugins: asyncio-0.20.3
+asyncio: mode=Mode.STRICT
+collecting ... collected 59 items
+
+test_engines.py::ThreeEngineScannerTests::test_a_independent_startup PASSED [  1%]
+test_engines.py::ThreeEngineScannerTests::test_b_concurrent_parallel_scanning PASSED [  3%]
+test_engines.py::ThreeEngineScannerTests::test_c_independent_result_storage PASSED [  5%]
+test_engines.py::ThreeEngineScannerTests::test_d_engine_1_domain_isolation FAILED [  6%]
+test_engines.py::ThreeEngineScannerTests::test_e_engine_2_domain_isolation FAILED [  8%]
+test_engines.py::ThreeEngineScannerTests::test_f_engine_3_domain_isolation FAILED [ 10%]
+test_engines.py::ThreeEngineScannerTests::test_g_phone_delivery_5min_offset PASSED [ 11%]
+test_engines.py::ThreeEngineScannerTests::test_h_engine_1_failure_isolation PASSED [ 13%]
+test_engines.py::ThreeEngineScannerTests::test_i_engine_2_failure_isolation PASSED [ 15%]
+test_engines.py::ThreeEngineScannerTests::test_j_cloudflare_update_failure_isolation FAILED [ 16%]
+test_engines.py::ThreeEngineScannerTests::test_k_restart_persistence PASSED [ 18%]
+test_engines.py::ThreeEngineScannerTests::test_l_backward_compatibility_engine_1 PASSED [ 20%]
+test_engines.py::ThreeEngineScannerTests::test_regression_10_control_ips_precedence_probe_base PASSED [ 22%]
+test_engines.py::ThreeEngineScannerTests::test_regression_11_control_ips_legacy_probe_fallback PASSED [ 23%]
+test_engines.py::ThreeEngineScannerTests::test_regression_12_report_trusted_behavior_unchanged PASSED [ 25%]
+test_engines.py::ThreeEngineScannerTests::test_regression_13_phone_report_trusted_with_control_success PASSED [ 27%]
+test_engines.py::ThreeEngineScannerTests::test_regression_14_phone_report_untrusted_when_control_fails PASSED [ 28%]
+test_engines.py::ThreeEngineScannerTests::test_regression_1_fake_dns_ip_rejected PASSED [ 30%]
+test_engines.py::ThreeEngineScannerTests::test_regression_2_dns_ip_not_in_shortlist PASSED [ 32%]
+test_engines.py::ThreeEngineScannerTests::test_regression_3_valid_existing_ip PASSED [ 33%]
+test_engines.py::ThreeEngineScannerTests::test_regression_4_new_confirmed_candidate FAILED [ 35%]
+test_engines.py::ThreeEngineScannerTests::test_regression_5_preserve_legitimate_best_ip PASSED [ 37%]
+test_engines.py::ThreeEngineScannerTests::test_regression_6_three_engines_isolation PASSED [ 38%]
+test_engines.py::ThreeEngineScannerTests::test_regression_7_telegram_display_placeholder PASSED [ 40%]
+test_engines.py::ThreeEngineScannerTests::test_regression_8_control_ips_never_localhost_by_default PASSED [ 42%]
+test_engines.py::ThreeEngineScannerTests::test_regression_9_control_ips_default_resolves_status_etesalpaya PASSED [ 44%]
+test_providers.py::ProxyParsingTests::test_bracketed_ipv6_proxy_is_accepted FAILED [ 45%]
+test_providers.py::LocationFormattingTests::test_country_flag_is_added_to_region_choices FAILED [ 47%]
+test_providers.py::LocationFormattingTests::test_country_flag_uses_iso_regional_indicators FAILED [ 49%]
+test_providers.py::LocationFormattingTests::test_location_text_uses_provider_region_fallback FAILED [ 50%]
+test_providers.py::PlanFormattingTests::test_linode_plan_shows_monthly_transfer FAILED [ 52%]
+test_providers.py::ProxyFamilyTests::test_ipv4_replaces_dual_stack_proxy_hostname FAILED [ 54%]
+test_providers.py::ProxyFamilyTests::test_ipv6_replaces_dual_stack_proxy_hostname FAILED [ 55%]
+test_providers.py::ProxyFamilyTests::test_requested_missing_family_has_clear_error FAILED [ 57%]
+test_providers.py::VultrIpTests::test_add_ipv4_requests_reboot FAILED    [ 59%]
+test_providers.py::VultrIpTests::test_create_and_attach_floating_ip FAILED [ 61%]
+test_providers.py::VultrIpTests::test_get_floating_ip_uses_its_id FAILED [ 62%]
+test_providers.py::VultrIpTests::test_lists_only_floating_ips_for_requested_instance FAILED [ 64%]
+test_providers.py::VultrIpTests::test_power_and_delete_use_correct_vultr_endpoints FAILED [ 66%]
+test_regression_12.py::TestRegression12::test_01_error_1034_rejection PASSED [ 67%]
+test_regression_12.py::TestRegression12::test_02_error_1000_rejection PASSED [ 69%]
+test_regression_12.py::TestRegression12::test_03_valid_protocol_websocket_response PASSED [ 71%]
+test_regression_12.py::TestRegression12::test_04_android_engine_isolation PASSED [ 72%]
+test_regression_12.py::TestRegression12::test_05_sni_isolation PASSED    [ 74%]
+test_regression_12.py::TestRegression12::test_06_two_of_two_consensus_enforcement PASSED [ 76%]
+test_regression_12.py::TestRegression12::test_07_dns_api_failure_handling PASSED [ 77%]
+test_regression_12.py::TestRegression12::test_08_post_dns_failure_and_rollback PASSED [ 79%]
+test_regression_12.py::TestRegression12::test_09_successful_deployment_flow PASSED [ 81%]
+test_regression_12.py::TestRegression12::test_10_three_engine_isolation PASSED [ 83%]
+test_regression_12.py::TestRegression12::test_11_fake_ip_protection PASSED [ 84%]
+test_regression_12.py::TestRegression12::test_12_current_live_ip_protection_against_generic_candidates PASSED [ 86%]
+test_regression_12.py::TestRegression12::test_13_target_resolution_and_precedence PASSED [ 88%]
+test_regression_12.py::TestRegression12::test_14_contender_fallback_on_domain_prevalidation_failure PASSED [ 89%]
+test_regression_12.py::TestRegression12::test_15_all_contenders_fail_domain_prevalidation_no_dns_update PASSED [ 91%]
+test_regression_12.py::TestRegression12::test_16_pending_delivery_lifecycle_and_starvation_prevention PASSED [ 93%]
+test_regression_12.py::TestRegression12::test_17_candidate_set_hash_matching_and_stale_rejection PASSED [ 94%]
+test_regression_12.py::TestRegression12::test_18_offline_phone_ttl_protection PASSED [ 96%]
+test_regression_12.py::TestRegression12::test_19_independent_multi_engine_pending_states PASSED [ 98%]
+test_store.py::AccountStoreTests::test_rename_preserves_account_settings FAILED [100%]
+
+=================================== FAILURES ===================================
+___________ ThreeEngineScannerTests.test_d_engine_1_domain_isolation ___________
+
+self = <test_engines.ThreeEngineScannerTests testMethod=test_d_engine_1_domain_isolation>
+
+    async def test_d_engine_1_domain_isolation(self):
+        self.st.set_cf_token("fake_cf_token")
+        self.st.update_cfscan(1, fqdn="scanner1.domain.com", auto_apply=True)
+        self.st.update_cfscan(2, fqdn="scanner2.domain.com", auto_apply=True)
+        self.st.update_cfscan(3, fqdn="scanner3.domain.com", auto_apply=True)
+    
+        cf_updates = []
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(side_effect=lambda fqdn: (f"zone_{fqdn}", "zone_name"))
+        mock_cf.find_a_record = AsyncMock(side_effect=lambda zid, fqdn: {"id": f"rec_{fqdn}", "content": "1.1.1.1"})
+        async def mock_update_a(zid, rec, ip):
+            cf_updates.append((rec["id"], ip))
+        mock_cf.update_a = AsyncMock(side_effect=mock_update_a)
+    
+        self.st.set_scan_candidates([{"ip": "104.16.1.10", "rtt": 40}], engine_id=1)
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf):
+            with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.16.1.10", "rtt": 40}, "why": "ok", "voters": 2}):
+                await self.e1.phone_recheck_pass()
+    
+>       self.assertEqual(len(cf_updates), 1)
+E       AssertionError: 0 != 1
+
+test_engines.py:176: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  scanner_engine:scanner_engine.py:581 [ENGINE 1] DOMAIN_PREVALIDATION failed for candidate 104.16.1.10: Cloudflare 403 Edge Restriction (trying next contender)
+WARNING  scanner_engine:scanner_engine.py:593 [ENGINE 1] هیچ‌کدام از 1 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند
+___________ ThreeEngineScannerTests.test_e_engine_2_domain_isolation ___________
+
+self = <test_engines.ThreeEngineScannerTests testMethod=test_e_engine_2_domain_isolation>
+
+    async def test_e_engine_2_domain_isolation(self):
+        self.st.set_cf_token("fake_cf_token")
+        self.st.update_cfscan(1, fqdn="scanner1.domain.com", auto_apply=True)
+        self.st.update_cfscan(2, fqdn="scanner2.domain.com", auto_apply=True)
+        self.st.update_cfscan(3, fqdn="scanner3.domain.com", auto_apply=True)
+    
+        cf_updates = []
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(side_effect=lambda fqdn: (f"zone_{fqdn}", "zone_name"))
+        mock_cf.find_a_record = AsyncMock(side_effect=lambda zid, fqdn: {"id": f"rec_{fqdn}", "content": "1.1.1.1"})
+        async def mock_update_a(zid, rec, ip):
+            cf_updates.append((rec["id"], ip))
+        mock_cf.update_a = AsyncMock(side_effect=mock_update_a)
+    
+        self.st.set_scan_candidates([{"ip": "104.17.2.20", "rtt": 45}], engine_id=2)
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf):
+            with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.17.2.20", "rtt": 45}, "why": "ok", "voters": 2}):
+                await self.e2.phone_recheck_pass()
+    
+>       self.assertEqual(len(cf_updates), 1)
+E       AssertionError: 0 != 1
+
+test_engines.py:202: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  scanner_engine:scanner_engine.py:581 [ENGINE 2] DOMAIN_PREVALIDATION failed for candidate 104.17.2.20: Unexpected response: HTTP 403 (trying next contender)
+WARNING  scanner_engine:scanner_engine.py:593 [ENGINE 2] هیچ‌کدام از 1 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند
+___________ ThreeEngineScannerTests.test_f_engine_3_domain_isolation ___________
+
+self = <test_engines.ThreeEngineScannerTests testMethod=test_f_engine_3_domain_isolation>
+
+    async def test_f_engine_3_domain_isolation(self):
+        self.st.set_cf_token("fake_cf_token")
+        self.st.update_cfscan(1, fqdn="scanner1.domain.com", auto_apply=True)
+        self.st.update_cfscan(2, fqdn="scanner2.domain.com", auto_apply=True)
+        self.st.update_cfscan(3, fqdn="scanner3.domain.com", auto_apply=True)
+    
+        cf_updates = []
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(side_effect=lambda fqdn: (f"zone_{fqdn}", "zone_name"))
+        mock_cf.find_a_record = AsyncMock(side_effect=lambda zid, fqdn: {"id": f"rec_{fqdn}", "content": "1.1.1.1"})
+        async def mock_update_a(zid, rec, ip):
+            cf_updates.append((rec["id"], ip))
+        mock_cf.update_a = AsyncMock(side_effect=mock_update_a)
+    
+        self.st.set_scan_candidates([{"ip": "104.18.3.30", "rtt": 42}], engine_id=3)
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf):
+            with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.18.3.30", "rtt": 42}, "why": "ok", "voters": 2}):
+                await self.e3.phone_recheck_pass()
+    
+>       self.assertEqual(len(cf_updates), 1)
+E       AssertionError: 0 != 1
+
+test_engines.py:228: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  scanner_engine:scanner_engine.py:581 [ENGINE 3] DOMAIN_PREVALIDATION failed for candidate 104.18.3.30: Unexpected response: HTTP 403 (trying next contender)
+WARNING  scanner_engine:scanner_engine.py:593 [ENGINE 3] هیچ‌کدام از 1 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند
+______ ThreeEngineScannerTests.test_j_cloudflare_update_failure_isolation ______
+
+self = <test_engines.ThreeEngineScannerTests testMethod=test_j_cloudflare_update_failure_isolation>
+
+    async def test_j_cloudflare_update_failure_isolation(self):
+        self.st.set_cf_token("fake_token")
+        self.st.update_cfscan(1, fqdn="scanner1.domain.com", auto_apply=True)
+        self.st.update_cfscan(2, fqdn="scanner2.domain.com", auto_apply=True)
+        self.st.update_cfscan(3, fqdn="scanner3.domain.com", auto_apply=True)
+    
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(return_value=("zone1", "domain.com"))
+        mock_cf.find_a_record = AsyncMock(return_value={"id": "rec1", "content": "1.1.1.1"})
+    
+        async def mock_update_a(zid, rec, ip):
+            if ip == "104.17.2.20":
+                raise RuntimeError("Cloudflare API error for Engine 2")
+    
+        mock_cf.update_a = AsyncMock(side_effect=mock_update_a)
+    
+        self.st.set_scan_candidates([{"ip": "104.16.1.10", "rtt": 40}], engine_id=1)
+        self.st.set_scan_candidates([{"ip": "104.17.2.20", "rtt": 45}], engine_id=2)
+        self.st.set_scan_candidates([{"ip": "104.18.3.30", "rtt": 42}], engine_id=3)
+    
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf):
+            # Engine 1 update
+            with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.16.1.10", "rtt": 40}, "why": "ok", "voters": 2}):
+                await self.e1.phone_recheck_pass()
+    
+            # Engine 2 update (fails Cloudflare)
+            with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.17.2.20", "rtt": 45}, "why": "ok", "voters": 2}):
+                await self.e2.phone_recheck_pass()
+    
+            # Engine 3 update
+            with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.18.3.30", "rtt": 42}, "why": "ok", "voters": 2}):
+                await self.e3.phone_recheck_pass()
+    
+        # Engine 1 and 3 should have succeeded and recorded found IP
+>       self.assertEqual(len(self.st.found_ips(1)), 1)
+E       AssertionError: 0 != 1
+
+test_engines.py:366: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  scanner_engine:scanner_engine.py:581 [ENGINE 1] DOMAIN_PREVALIDATION failed for candidate 104.16.1.10: Unexpected response: HTTP 403 (trying next contender)
+WARNING  scanner_engine:scanner_engine.py:593 [ENGINE 1] هیچ‌کدام از 1 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند
+WARNING  scanner_engine:scanner_engine.py:581 [ENGINE 2] DOMAIN_PREVALIDATION failed for candidate 104.17.2.20: Unexpected response: HTTP 403 (trying next contender)
+WARNING  scanner_engine:scanner_engine.py:593 [ENGINE 2] هیچ‌کدام از 1 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند
+WARNING  scanner_engine:scanner_engine.py:581 [ENGINE 3] DOMAIN_PREVALIDATION failed for candidate 104.18.3.30: Unexpected response: HTTP 403 (trying next contender)
+WARNING  scanner_engine:scanner_engine.py:593 [ENGINE 3] هیچ‌کدام از 1 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند
+______ ThreeEngineScannerTests.test_regression_4_new_confirmed_candidate _______
+
+self = <test_engines.ThreeEngineScannerTests testMethod=test_regression_4_new_confirmed_candidate>
+
+    async def test_regression_4_new_confirmed_candidate(self):
+        self.st.update_cfscan(2, fqdn="eng2.test.com", auto_apply=True, last_best_ip=None)
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(return_value=["zone2", "eng2.test.com"])
+        mock_cf.find_a_record = AsyncMock(return_value={"id": "rec2", "content": "85.9.109.98"})
+        mock_cf.update_a = AsyncMock(return_value=True)
+    
+        cand = {"ts": int(time.time()), "ips": ["104.17.2.50"], "metrics": {"104.17.2.50": {"rtt": 35, "ok": True}}}
+        self.st.set_scan_candidates([{"ip": "104.17.2.50", "rtt": 35, "tcp_ms": 20, "tls_ms": 15, "ttfb_ms": 35}],
+                                    controls=[], keep=10, engine_id=2)
+    
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf):
+            with patch("store.Store.cf_token", return_value="dummy_token"):
+                with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.17.2.50", "rtt": 35}, "why": "both approved", "voters": 2}):
+                    await self.e2.phone_recheck_pass()
+    
+>       self.assertEqual(self.st.cfscan(2).get("last_best_ip"), "104.17.2.50")
+E       AssertionError: None != '104.17.2.50'
+
+test_engines.py:473: AssertionError
+------------------------------ Captured log call -------------------------------
+WARNING  scanner_engine:scanner_engine.py:581 [ENGINE 2] DOMAIN_PREVALIDATION failed for candidate 104.17.2.50: Connection/TLS failed: SSLError ([SSL: SSLV3_ALERT_HANDSHAKE_FAILURE] sslv3 alert handshake failure (_ssl.c:1000)) (trying next contender)
+WARNING  scanner_engine:scanner_engine.py:593 [ENGINE 2] هیچ‌کدام از 1 کاندید برتر در تست اعتبارسنجی دامنه تأیید نشدند
+___________ ProxyParsingTests.test_bracketed_ipv6_proxy_is_accepted ____________
+
+self = <test_providers.ProxyParsingTests testMethod=test_bracketed_ipv6_proxy_is_accepted>
+
+    def test_bracketed_ipv6_proxy_is_accepted(self):
+        self.assertEqual(
+>           providers.proxy_url("[2001:db8::1]:1080:user:pass"),
+            "http://user:pass@[2001:db8::1]:1080",
+        )
+
+test_providers.py:11: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+proxy = '[2001:db8::1]:1080:user:pass'
+
+    def proxy_url(proxy: str | None) -> str | None:
+        """
+        Turn the user's proxy string into a full proxy URL.
+    
+        Accepts, in order of preference:
+          scheme://host:port:user:pass   (scheme = http/https/socks5/socks4)
+          scheme://user:pass@host:port
+          host:port:user:pass            (assumed http - the format the user gives)
+          host:port
+    
+        A bare host:port:user:pass is treated as HTTP because that is what the user
+        was asked for; a SOCKS proxy can be selected by prefixing socks5://.
+        """
+        if not proxy:
+            return None
+        proxy = proxy.strip()
+        scheme = "http"
+        if "://" in proxy:
+            scheme, proxy = proxy.split("://", 1)
+        # already in url auth form?
+        if "@" in proxy:
+            return f"{scheme}://{proxy}"
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            return f"{scheme}://{user}:{pw}@{host}:{port}"
+        if len(parts) == 2:
+            host, port = parts
+            return f"{scheme}://{host}:{port}"
+>       raise ValueError("proxy must be host:port or host:port:user:pass "
+                         "(optionally prefixed with socks5://)")
+E       ValueError: proxy must be host:port or host:port:user:pass (optionally prefixed with socks5://)
+
+providers.py:59: ValueError
+_____ LocationFormattingTests.test_country_flag_is_added_to_region_choices _____
+
+self = <test_providers.LocationFormattingTests testMethod=test_country_flag_is_added_to_region_choices>
+
+    async def test_country_flag_is_added_to_region_choices(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={
+            "regions": [{"id": "fra", "city": "Frankfurt", "country": "DE"}]
+        })
+        regions = await p.regions()
+>       self.assertEqual(regions, [("fra", "🇩🇪 Frankfurt DE")])
+E       AssertionError: Lists differ: [('fra', 'Frankfurt DE')] != [('fra', '🇩🇪 Frankfurt DE')]
+E       
+E       First differing element 0:
+E       ('fra', 'Frankfurt DE')
+E       ('fra', '🇩🇪 Frankfurt DE')
+E       
+E       - [('fra', 'Frankfurt DE')]
+E       + [('fra', '🇩🇪 Frankfurt DE')]
+E       ?           +++
+
+test_providers.py:31: AssertionError
+____ LocationFormattingTests.test_country_flag_uses_iso_regional_indicators ____
+
+self = <test_providers.LocationFormattingTests testMethod=test_country_flag_uses_iso_regional_indicators>
+
+    def test_country_flag_uses_iso_regional_indicators(self):
+>       self.assertEqual(providers.country_flag("de"), "🇩🇪")
+E       AttributeError: module 'providers' has no attribute 'country_flag'
+
+test_providers.py:18: AttributeError
+___ LocationFormattingTests.test_location_text_uses_provider_region_fallback ___
+
+self = <test_providers.LocationFormattingTests testMethod=test_location_text_uses_provider_region_fallback>
+
+    def test_location_text_uses_provider_region_fallback(self):
+>       self.assertEqual(providers.location_text("vultr", "fra"), "🇩🇪 fra")
+E       AttributeError: module 'providers' has no attribute 'location_text'
+
+test_providers.py:22: AttributeError
+_________ PlanFormattingTests.test_linode_plan_shows_monthly_transfer __________
+
+self = <test_providers.PlanFormattingTests testMethod=test_linode_plan_shows_monthly_transfer>
+
+    async def test_linode_plan_shows_monthly_transfer(self):
+        p = providers.Provider({"provider": "linode", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"data": [{
+            "id": "g6-standard-1", "label": "Linode 2GB", "transfer": 2000,
+            "price": {"monthly": 12},
+        }]})
+    
+>       self.assertEqual(await p.plans(), [
+            ("g6-standard-1", "Linode 2GB · 📡 2000 GB traffic - $12/mo")
+        ])
+E       AssertionError: Lists differ: [('g6-standard-1', 'Linode 2GB - $12/mo')] != [('g6-standard-1', 'Linode 2GB · 📡 2000 GB traffic - $12/mo')]
+E       
+E       First differing element 0:
+E       ('g6-standard-1', 'Linode 2GB - $12/mo')
+E       ('g6-standard-1', 'Linode 2GB · 📡 2000 GB traffic - $12/mo')
+E       
+E       - [('g6-standard-1', 'Linode 2GB - $12/mo')]
+E       + [('g6-standard-1', 'Linode 2GB · 📡 2000 GB traffic - $12/mo')]
+E       ?                                ++++++++++++++++++++
+
+test_providers.py:42: AssertionError
+________ ProxyFamilyTests.test_ipv4_replaces_dual_stack_proxy_hostname _________
+
+self = <test_providers.ProxyFamilyTests testMethod=test_ipv4_replaces_dual_stack_proxy_hostname>
+
+    async def test_ipv4_replaces_dual_stack_proxy_hostname(self):
+        loop = __import__("asyncio").get_running_loop()
+        rows = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.9", 8080))]
+        with patch.object(loop, "getaddrinfo", new=AsyncMock(return_value=rows)):
+            self.assertEqual(
+>               await providers.proxy_for_family("http://user:pass@proxy.example:8080", "ipv4"),
+                "http://user:pass@192.0.2.9:8080",
+            )
+E           AttributeError: module 'providers' has no attribute 'proxy_for_family'
+
+test_providers.py:53: AttributeError
+________ ProxyFamilyTests.test_ipv6_replaces_dual_stack_proxy_hostname _________
+
+self = <test_providers.ProxyFamilyTests testMethod=test_ipv6_replaces_dual_stack_proxy_hostname>
+
+    async def test_ipv6_replaces_dual_stack_proxy_hostname(self):
+        loop = __import__("asyncio").get_running_loop()
+        rows = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::9", 8080, 0, 0))]
+        with patch.object(loop, "getaddrinfo", new=AsyncMock(return_value=rows)):
+            self.assertEqual(
+>               await providers.proxy_for_family("socks5://proxy.example:8080", "ipv6"),
+                "socks5://[2001:db8::9]:8080",
+            )
+E           AttributeError: module 'providers' has no attribute 'proxy_for_family'
+
+test_providers.py:62: AttributeError
+________ ProxyFamilyTests.test_requested_missing_family_has_clear_error ________
+
+self = <test_providers.ProxyFamilyTests testMethod=test_requested_missing_family_has_clear_error>
+
+    async def test_requested_missing_family_has_clear_error(self):
+        loop = __import__("asyncio").get_running_loop()
+        with patch.object(loop, "getaddrinfo", new=AsyncMock(side_effect=socket.gaierror())):
+            with self.assertRaisesRegex(providers.ProviderError, "no IPV6 address"):
+>               await providers.proxy_for_family("http://proxy.example:8080", "ipv6")
+E               AttributeError: module 'providers' has no attribute 'proxy_for_family'
+
+test_providers.py:70: AttributeError
+__________________ VultrIpTests.test_add_ipv4_requests_reboot __________________
+
+self = <test_providers.VultrIpTests testMethod=test_add_ipv4_requests_reboot>
+
+    async def test_add_ipv4_requests_reboot(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={"ip": "198.51.100.10"})
+>       self.assertEqual(await p.add_vultr_ipv4("instance-1"), {"ip": "198.51.100.10"})
+E       AttributeError: 'Provider' object has no attribute 'add_vultr_ipv4'
+
+test_providers.py:80: AttributeError
+_______________ VultrIpTests.test_create_and_attach_floating_ip ________________
+
+self = <test_providers.VultrIpTests testMethod=test_create_and_attach_floating_ip>
+
+    async def test_create_and_attach_floating_ip(self):
+        p = self._provider()
+        p._req = AsyncMock(side_effect=[
+            {"reserved_ip": {"id": "rip-1", "ip_address": "198.51.100.20"}}, {}
+        ])
+>       got = await p.create_and_attach_vultr_floating_ip("instance-1", "ewr", "cloudbot-test")
+E       AttributeError: 'Provider' object has no attribute 'create_and_attach_vultr_floating_ip'
+
+test_providers.py:88: AttributeError
+________________ VultrIpTests.test_get_floating_ip_uses_its_id _________________
+
+self = <test_providers.VultrIpTests testMethod=test_get_floating_ip_uses_its_id>
+
+    async def test_get_floating_ip_uses_its_id(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={"reserved_ip": {"id": "rip-1", "subnet": "198.51.100.20"}})
+>       self.assertEqual(await p.vultr_floating_ip("rip-1"),
+                         {"id": "rip-1", "subnet": "198.51.100.20"})
+E       AttributeError: 'Provider' object has no attribute 'vultr_floating_ip'
+
+test_providers.py:118: AttributeError
+_______ VultrIpTests.test_lists_only_floating_ips_for_requested_instance _______
+
+self = <test_providers.VultrIpTests testMethod=test_lists_only_floating_ips_for_requested_instance>
+
+    async def test_lists_only_floating_ips_for_requested_instance(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={"reserved_ips": [
+            {"id": "one", "instance_id": "instance-1"},
+            {"id": "two", "instance_id": "instance-2"},
+        ]})
+>       self.assertEqual(await p.vultr_floating_ips("instance-1"),
+                         [{"id": "one", "instance_id": "instance-1"}])
+E       AttributeError: 'Provider' object has no attribute 'vultr_floating_ips'
+
+test_providers.py:103: AttributeError
+________ VultrIpTests.test_power_and_delete_use_correct_vultr_endpoints ________
+
+self = <test_providers.VultrIpTests testMethod=test_power_and_delete_use_correct_vultr_endpoints>
+
+    async def test_power_and_delete_use_correct_vultr_endpoints(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={})
+>       await p.vultr_power("instance-1", "reboot")
+E       AttributeError: 'Provider' object has no attribute 'vultr_power'
+
+test_providers.py:110: AttributeError
+___________ AccountStoreTests.test_rename_preserves_account_settings ___________
+
+self = <test_store.AccountStoreTests testMethod=test_rename_preserves_account_settings>
+
+    def test_rename_preserves_account_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_db = os.environ.get("CLOUDBOT_DB")
+            old_key = os.environ.get("CLOUDBOT_KEY")
+            os.environ["CLOUDBOT_DB"] = f"{d}/cloudbot.db"
+            os.environ["CLOUDBOT_KEY"] = f"{d}/secret.key"
+            try:
+                import store
+                st = store.Store()
+>               acc_id = st.add_account("old", "linode", "token", "proxy:80:u:p", "ipv4")
+E               TypeError: Store.add_account() takes from 4 to 5 positional arguments but 6 were given
+
+test_store.py:16: TypeError
+=========================== short test summary info ============================
+FAILED test_engines.py::ThreeEngineScannerTests::test_d_engine_1_domain_isolation
+FAILED test_engines.py::ThreeEngineScannerTests::test_e_engine_2_domain_isolation
+FAILED test_engines.py::ThreeEngineScannerTests::test_f_engine_3_domain_isolation
+FAILED test_engines.py::ThreeEngineScannerTests::test_j_cloudflare_update_failure_isolation
+FAILED test_engines.py::ThreeEngineScannerTests::test_regression_4_new_confirmed_candidate
+FAILED test_providers.py::ProxyParsingTests::test_bracketed_ipv6_proxy_is_accepted
+FAILED test_providers.py::LocationFormattingTests::test_country_flag_is_added_to_region_choices
+FAILED test_providers.py::LocationFormattingTests::test_country_flag_uses_iso_regional_indicators
+FAILED test_providers.py::LocationFormattingTests::test_location_text_uses_provider_region_fallback
+FAILED test_providers.py::PlanFormattingTests::test_linode_plan_shows_monthly_transfer
+FAILED test_providers.py::ProxyFamilyTests::test_ipv4_replaces_dual_stack_proxy_hostname
+FAILED test_providers.py::ProxyFamilyTests::test_ipv6_replaces_dual_stack_proxy_hostname
+FAILED test_providers.py::ProxyFamilyTests::test_requested_missing_family_has_clear_error
+FAILED test_providers.py::VultrIpTests::test_add_ipv4_requests_reboot - Attri...
+FAILED test_providers.py::VultrIpTests::test_create_and_attach_floating_ip - ...
+FAILED test_providers.py::VultrIpTests::test_get_floating_ip_uses_its_id - At...
+FAILED test_providers.py::VultrIpTests::test_lists_only_floating_ips_for_requested_instance
+FAILED test_providers.py::VultrIpTests::test_power_and_delete_use_correct_vultr_endpoints
+FAILED test_store.py::AccountStoreTests::test_rename_preserves_account_settings
+======================== 19 failed, 40 passed in 7.10s =========================
