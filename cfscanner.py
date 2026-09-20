@@ -214,5 +214,9 @@ def _score(d: dict) -> float:
     jit = float(d.get("jitter") or 0.0)
     loss = float(d.get("loss") or 0.0)
     tls_loss = float(d.get("tls_loss") or 0.0)
+    tls_jitter = float(d.get("tls_jitter") or 0.0)
     mbps = float(d.get("mbps") or 0.0)
-    return rtt + 2.0 * jit + 1000.0 * loss + 1200.0 * tls_loss - min(mbps, 100.0) * 0.5
+    cost = float(rtt) + 2.0 * jit + 1000.0 * loss + 1200.0 * tls_loss + 0.5 * tls_jitter
+    if d.get("mbps"):
+        cost -= min(float(d["mbps"]), 100.0) * 0.5
+    return cost

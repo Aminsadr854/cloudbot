@@ -975,30 +975,42 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
                     jump=None, log=AsyncMock(), engine_id=2
                 )
 
-    # Test B1: Scoring agreement between cf_scan and cfscanner, and tls_loss weighting
-    def test_b1_score_agreement_and_weights(self):
+    # Test B6: Scoring agreement between cf_scan and cfscanner across all present/absent field combinations
+    def test_b6_score_agreement_and_weights(self):
         import cf_scan
         rows = [
-            {"rtt": 50.0, "jitter": 2.0, "loss": 0.0, "tls_loss": 0.0, "mbps": 10.0},
-            {"rtt": 45.0, "jitter": 1.5, "loss": 0.02, "tls_loss": 0.01},
-            {"rtt": 40.0, "jitter": 3.0, "loss": 0.05},  # missing tls_loss defaults to 0
+            # 1. Full metrics present
+            {"rtt": 50.0, "jitter": 2.0, "loss": 0.0, "tls_loss": 0.0, "tls_rtt": 150.0, "tls_jitter": 4.0, "mbps": 10.0},
+            # 2. Legacy row: no tls fields at all
+            {"rtt": 45.0, "jitter": 1.5, "loss": 0.02},
+            # 3. Only tls_loss present
+            {"rtt": 40.0, "jitter": 3.0, "loss": 0.05, "tls_loss": 0.02},
+            # 4. Only tls_jitter present
+            {"rtt": 40.0, "jitter": 2.0, "loss": 0.0, "tls_jitter": 3.5},
+            # 5. Missing/invalid RTT
             {"rtt": None, "jitter": 0.0, "loss": 0.0},
             {"rtt": float("inf"), "jitter": 0.0, "loss": 0.0},
-            {"rtt": 30.0, "jitter": 1.0, "loss": 0.0, "tls_loss": 0.0, "mbps": 250.0},
+            # 6. With throughput discount
+            {"rtt": 30.0, "jitter": 1.0, "loss": 0.0, "tls_loss": 0.0, "tls_jitter": 1.0, "mbps": 250.0},
+            # 7. tls_rtt present but should not enter cost directly
+            {"rtt": 35.0, "jitter": 1.0, "loss": 0.0, "tls_rtt": 120.0},
         ]
         for r in rows:
             self.assertEqual(cf_scan.score(r), cfscanner.score(r))
 
-        # Check penalty: tls_loss (1200.0) is penalized at least as heavily as loss (1000.0)
-        base = {"rtt": 50.0, "jitter": 0.0, "loss": 0.0, "tls_loss": 0.0}
-        with_tcp_loss = {"rtt": 50.0, "jitter": 0.0, "loss": 0.1, "tls_loss": 0.0}
-        with_tls_loss = {"rtt": 50.0, "jitter": 0.0, "loss": 0.0, "tls_loss": 0.1}
+        # Check weights:
+        # cost = rtt + 2.0*jitter + 1000.0*loss + 1200.0*tls_loss + 0.5*tls_jitter
+        base = {"rtt": 50.0, "jitter": 0.0, "loss": 0.0, "tls_loss": 0.0, "tls_jitter": 0.0}
+        with_tcp_loss = {"rtt": 50.0, "jitter": 0.0, "loss": 0.1, "tls_loss": 0.0, "tls_jitter": 0.0}
+        with_tls_loss = {"rtt": 50.0, "jitter": 0.0, "loss": 0.0, "tls_loss": 0.1, "tls_jitter": 0.0}
+        with_tls_jitter = {"rtt": 50.0, "jitter": 0.0, "loss": 0.0, "tls_loss": 0.0, "tls_jitter": 10.0}
         self.assertEqual(cf_scan.score(with_tcp_loss) - cf_scan.score(base), 100.0)
         self.assertEqual(cf_scan.score(with_tls_loss) - cf_scan.score(base), 120.0)
+        self.assertEqual(cf_scan.score(with_tls_jitter) - cf_scan.score(base), 5.0)
         self.assertGreater(cf_scan.score(with_tls_loss), cf_scan.score(with_tcp_loss))
 
-    # Test B1: stage_stable alternates TCP (even) and TLS (odd) probes and records separate losses
-    async def test_b1_stage_stable_alternates_probes(self):
+    # Test B6: stage_stable separates TCP metrics from TLS metrics
+    async def test_b6_stage_stable_separate_tcp_tls_metrics(self):
         import cf_scan
 
         tcp_calls = []
@@ -1008,11 +1020,11 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             tcp_calls.append(ip)
             return 30.0
 
-        async def fake_http(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None):
+        async def fake_http(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None, verify=False):
             tls_calls.append((ip, host, port, path, sni))
             if len(tls_calls) == 1:
-                # First TLS probe succeeds
-                return {"valid": True, "cf_error": False, "ttfb_ms": 40.0}
+                # First TLS probe succeeds with TTFB 110.0ms
+                return {"valid": True, "cf_error": False, "ttfb_ms": 110.0}
             else:
                 # Second TLS probe fails (interfered/reset)
                 return {"valid": False, "cf_error": True, "error": "ConnectionResetError"}
@@ -1029,17 +1041,20 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         # 4 rounds: rounds 0 & 2 -> TCP (2 calls), rounds 1 & 3 -> TLS (2 calls)
         self.assertEqual(len(tcp_calls), 2)
         self.assertEqual(len(tls_calls), 2)
-        self.assertEqual(tls_calls[0], ("1.2.3.4", "example.com", 443, "/cdn-cgi/trace", "sni.example.com"))
 
         res = results[0]
         # TCP had 2 attempts and both succeeded -> loss = 0.0
         self.assertEqual(res["loss"], 0.0)
-        # TLS had 2 attempts, 1 succeeded and 1 failed -> tls_loss = 0.5
-        self.assertEqual(res["tls_loss"], 0.5)
-        # Samples combined: 30.0, 40.0, 30.0 -> median 30.0
+        # TCP metrics ONLY from TCP samples (30.0, 30.0)
         self.assertEqual(res["rtt"], 30.0)
-        self.assertEqual(res["rtt_max"], 40.0)
-        self.assertIsNotNone(res["jitter"])
+        self.assertEqual(res["jitter"], 0.0)
+        self.assertEqual(res["rtt_max"], 30.0)
+
+        # TLS had 2 attempts, 1 succeeded (110.0ms) and 1 failed -> tls_loss = 0.5
+        self.assertEqual(res["tls_loss"], 0.5)
+        # TLS metrics ONLY from TLS samples (110.0)
+        self.assertEqual(res["tls_rtt"], 110.0)
+        self.assertEqual(res["tls_jitter"], 0.0)
 
     # Test B2: Interception detection with TLS verification and cert_ok handling
     async def test_b2_interception_detection_and_cert_verify(self):

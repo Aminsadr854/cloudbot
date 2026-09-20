@@ -374,15 +374,21 @@ async def stage_stable(rows, port, timeout, rounds, concurrency,
         row["loss"] = (len(tcp_samples) - len(tcp_ok)) / len(tcp_samples) if tcp_samples else 0.0
         row["tls_loss"] = (len(tls_samples) - len(tls_ok)) / len(tls_samples) if tls_samples else 0.0
 
-        all_ok = tcp_ok + tls_ok
-        if all_ok:
-            row["rtt"] = statistics.median(all_ok)
+        if tcp_ok:
+            row["rtt"] = statistics.median(tcp_ok)
             # Mean absolute deviation rather than stdev: a single stalled probe
             # should register, not be squared into dominating the figure.
-            row["jitter"] = statistics.mean(abs(x - row["rtt"]) for x in all_ok)
-            row["rtt_max"] = max(all_ok)
+            row["jitter"] = statistics.mean(abs(x - row["rtt"]) for x in tcp_ok)
+            row["rtt_max"] = max(tcp_ok)
         else:
             row["rtt"] = row["jitter"] = row["rtt_max"] = None
+
+        if tls_ok:
+            row["tls_rtt"] = statistics.median(tls_ok)
+            row["tls_jitter"] = statistics.mean(abs(x - row["tls_rtt"]) for x in tls_ok)
+        else:
+            row["tls_rtt"] = row["tls_jitter"] = None
+
         return row
 
     return await asyncio.gather(*(one(r) for r in rows))
@@ -423,7 +429,8 @@ def score(row):
     jitter = float(row.get("jitter") or 0.0)
     loss = float(row.get("loss") or 0.0)
     tls_loss = float(row.get("tls_loss") or 0.0)
-    cost = row["rtt"] + 2.0 * jitter + 1000.0 * loss + 1200.0 * tls_loss
+    tls_jitter = float(row.get("tls_jitter") or 0.0)
+    cost = float(row["rtt"]) + 2.0 * jitter + 1000.0 * loss + 1200.0 * tls_loss + 0.5 * tls_jitter
     if row.get("mbps"):
         # A fast edge earns a discount, capped so throughput cannot outweigh
         # a path that is unstable.
@@ -601,14 +608,19 @@ async def main():
 
     print()
     print(f"  {'#':<4}{'address':<17}{'rtt':>8}{'jitter':>9}{'loss':>7}"
-          f"{'worst':>9}{'speed':>11}   colo")
+          f"{'tls_loss':>9}{'tls/tcp':>8}{'worst':>9}{'speed':>11}   colo")
     for i, r in enumerate(finalists[:args.final], 1):
         speed = f"{r['mbps']:.1f} Mbps" if r.get("mbps") else "-"
         rtt_s = f"{r['rtt']:>7.1f}ms" if (r.get("rtt") is not None and math.isfinite(r["rtt"])) else f"{'-':>9}"
         jit_s = f"{r['jitter']:>8.1f}ms" if (r.get("jitter") is not None and math.isfinite(r["jitter"])) else f"{'-':>10}"
         loss_s = f"{r['loss'] * 100:>6.0f}%" if (r.get("loss") is not None and math.isfinite(r["loss"])) else f"{'-':>7}"
+        tls_loss_s = f"{r['tls_loss'] * 100:>8.0f}%" if (r.get("tls_loss") is not None and math.isfinite(r["tls_loss"])) else f"{'-':>9}"
+        if r.get("tls_rtt") is not None and r.get("rtt") and r["rtt"] > 0 and math.isfinite(r["tls_rtt"]) and math.isfinite(r["rtt"]):
+            ratio_s = f"{r['tls_rtt'] / r['rtt']:>7.2f}x"
+        else:
+            ratio_s = f"{'-':>8}"
         max_s = f"{r['rtt_max']:>8.1f}ms" if (r.get("rtt_max") is not None and math.isfinite(r["rtt_max"])) else f"{'-':>10}"
-        print(f"  {i:<4}{r['ip']:<17}{rtt_s}{jit_s}{loss_s}{max_s}{speed:>11}   "
+        print(f"  {i:<4}{r['ip']:<17}{rtt_s}{jit_s}{loss_s}{tls_loss_s}{ratio_s}{max_s}{speed:>11}   "
               f"{r.get('colo', '?')}")
 
     write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id)
