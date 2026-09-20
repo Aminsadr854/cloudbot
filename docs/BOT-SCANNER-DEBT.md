@@ -189,3 +189,20 @@ Collides with Engine 1's remote script, output file, and `pkill` cleanup. If Eng
 ## Final Recommendation
 
 The legacy call sites in `bot.py` should be migrated to the multi-engine architecture by deprecating `_scan_pass`, `_close_window`, and `_head_to_head` in `bot.py` and delegating them directly to the corresponding `ScannerEngine` instance, while assigning emergency watchdog scans (`_heal_target`) a dedicated `engine_id=0` with a shared A5/A6 verified-update-and-rollback helper so emergency healing never collides with background engine scans or leaves production domains pointed at unconfirmed IPs. Whatever the migration, call site 3 must go through the same verified-update-and-rollback helper as the engine path, because an emergency is when you need the safety checks most, not least.
+
+---
+
+## Module-Level Initialization Side Effects in `bot.py`
+
+### What happens on import
+At module level (`bot.py:49–70`), `bot.py` directly executes initialization code upon import:
+- Resolves `st = Store()`: connects to SQLite (`CLOUDBOT_DB`), executes `SCHEMA` DDL scripts, and opens/creates the encryption key at `CLOUDBOT_KEY` (`secret.key`).
+- Instantiates `ScannerEngine` instances 1, 2, and 3.
+- Instantiates `Panel` client with SSL context.
+- Instantiates `aiogram.Bot` and `Dispatcher(storage=MemoryStorage())`.
+
+### Why this is technical debt
+Importing `bot.py` is not side-effect free. Any test or utility script that imports or reloads `bot` without explicitly patching `CLOUDBOT_DB` and `CLOUDBOT_KEY` in `os.environ` will inadvertently connect to and execute DDL queries on the live production database path `/etc/cloudbot/cloudbot.db`.
+
+### Required Architectural Fix
+Move module-level client and database instantiation into an initialization function (e.g. `init_app()` or setup within `async def main()`), exporting module-level accessors or passing application state via dependency injection, so that importing `bot.py` is purely declarative and safe for testing without environment patching.

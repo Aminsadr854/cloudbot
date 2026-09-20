@@ -575,6 +575,13 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
 
     # Test 11b — Setting only legacy CLOUDBOT_PROBE produces same resolved value in bot.py and scanner_engine.py
     def test_legacy_probe_unified_resolution(self):
+        """
+        WARNING: Importing or reloading bot.py executes module-level side effects:
+        it calls st = Store() which connects to SQLite and executes DDL scripts.
+        Any test importing/reloading bot.py MUST patch CLOUDBOT_DB and CLOUDBOT_KEY
+        to temporary isolated paths (self.db_path, self.key_path) before importing,
+        to prevent mutating the live production database /etc/cloudbot/cloudbot.db.
+        """
         env = {
             "CLOUDBOT_PROBE": "https://legacy.probe.example.com",
             "CLOUDBOT_TOKEN": "mock:token",
