@@ -76,8 +76,8 @@ Followed immediately by `st.set_scan_candidates(shortlist, ...)` and `st.pool_re
 Duplicates [`ScannerEngine.close_window(log_fn)`](file:///root/cloudbot/scanner_engine.py#L464-L508).
 
 ### What goes wrong when run concurrently with Engine 1
-1. **Remote file and process collisions**: Runs as `engine_id=1`, colliding with Engine 1's active scan files and killing running probes via `pkill`.
-2. **State destruction**: Calls `st.pool_reset()` without holding Engine 1's lock, wiping out Engine 1's accumulated pool while Engine 1 may be midway through a multi-pass window.
+1. **Silent state destruction (Critical Severity)**: Calls `st.pool_reset()` without holding Engine 1's lock. A manual scan can therefore wipe a scan pool that has been accumulating for hours, mid-window, with no warning to anyone. That is silent destruction of work, not just a collision.
+2. **Remote file and process collisions**: Runs as `engine_id=1`, colliding with Engine 1's active scan files and killing running probes via `pkill`.
 3. **Candidate overwrites**: Overwrites `st.set_scan_candidates` for Engine 1 with an unsynchronized shortlist, breaking multi-engine phone delivery coordination.
 
 ### Which A-group safety guarantees it bypasses
@@ -125,6 +125,7 @@ Does not directly duplicate a `ScannerEngine` method, but replaces the entire de
 ### What goes wrong when run concurrently with Engine 1
 1. **Critical remote kill**: If Engine 1 is running its regular scheduled scan, watchdog triggering `_heal_target` will invoke `run_scan(..., engine_id=1)` which executes `pkill -TERM -f /root/.cf_scan_engine_1.py`, abruptly terminating Engine 1's scan.
 2. **File and timestamp races**: Both read and write `/root/cf_bot_scan_engine_1.json`, resulting in corrupt reads or `StaleResultError`.
+3. **Broken healing failure (Critical Severity)**: Call site 3 is on the watchdog healing path, which by definition runs when something is already broken. It repoints a production domain with none of the A5 prevalidation, DNS confirmation, or A6 rollback. The worst-case is: a config goes down, the watchdog "heals" it onto a filtered address, and now it is down in a way that looks healed.
 
 ### Which A-group safety guarantees it bypasses
 - **CRITICAL: Bypasses A5 (DNS resolution & propagation confirmation)**: `_apply_ip` blindly modifies Cloudflare DNS and returns. It never verifies that DNS resolves to the new IP or that the new IP responds.
@@ -187,4 +188,4 @@ Collides with Engine 1's remote script, output file, and `pkill` cleanup. If Eng
 
 ## Final Recommendation
 
-The legacy call sites in `bot.py` should be migrated to the multi-engine architecture by deprecating `_scan_pass`, `_close_window`, and `_head_to_head` in `bot.py` and delegating them directly to the corresponding `ScannerEngine` instance, while assigning emergency watchdog scans (`_heal_target`) a dedicated `engine_id=0` with a shared A5/A6 verified-update-and-rollback helper so emergency healing never collides with background engine scans or leaves production domains pointed at unconfirmed IPs.
+The legacy call sites in `bot.py` should be migrated to the multi-engine architecture by deprecating `_scan_pass`, `_close_window`, and `_head_to_head` in `bot.py` and delegating them directly to the corresponding `ScannerEngine` instance, while assigning emergency watchdog scans (`_heal_target`) a dedicated `engine_id=0` with a shared A5/A6 verified-update-and-rollback helper so emergency healing never collides with background engine scans or leaves production domains pointed at unconfirmed IPs. Whatever the migration, call site 3 must go through the same verified-update-and-rollback helper as the engine path, because an emergency is when you need the safety checks most, not least.
