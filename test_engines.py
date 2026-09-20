@@ -517,7 +517,7 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
 
     # Test 7 — Telegram display: Never displays current DNS placeholder as Best IP unless validated.
     async def test_regression_7_telegram_display_placeholder(self):
-        cfg_unvalidated = {"fqdn": "c2c2c2c2c2.rjwarehousing.ir", "last_best_ip": None}
+        cfg_unvalidated = {"fqdn": "c2c2c2c2c2.example.com", "last_best_ip": None}
         best_ip_display = cfg_unvalidated.get("last_best_ip") or "—"
         self.assertEqual(best_ip_display, "—")
         self.assertNotEqual(best_ip_display, "85.9.109.98")
@@ -528,13 +528,13 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             ctrls = scanner_engine._control_ips()
             self.assertNotIn("127.0.0.1", ctrls)
 
-    # Test 9 — Default control host resolves from https://status.etesalpaya.com
-    def test_regression_9_control_ips_default_resolves_status_etesalpaya(self):
+    # Test 9 — Default control host resolves from https://status.example.com
+    def test_regression_9_control_ips_default_resolves_status_example(self):
         with patch.dict(os.environ, {}, clear=True):
-            with patch("socket.gethostbyname", return_value="91.108.145.140") as mock_dns:
+            with patch("socket.gethostbyname", return_value="93.184.216.34") as mock_dns:
                 ctrls = scanner_engine._control_ips()
-                mock_dns.assert_called_once_with("status.etesalpaya.com")
-                self.assertEqual(ctrls, ["91.108.145.140"])
+                mock_dns.assert_called_once_with("status.example.com")
+                self.assertEqual(ctrls, ["93.184.216.34"])
 
     # Test 10 — CLOUDBOT_PROBE_BASE takes precedence when defined
     def test_regression_10_control_ips_precedence_probe_base(self):

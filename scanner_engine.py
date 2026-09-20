@@ -115,9 +115,11 @@ async def verify_domain_ip(ip: str, host: str, sni: str, port: int = 443, timeou
 
 def _control_ips() -> list:
     """The reference address handed to phones alongside real candidates."""
+    # Control IP probe base URL. In production, this must be supplied via the
+    # CLOUDBOT_PROBE (or CLOUDBOT_PROBE_BASE) environment variable.
     probe_base = os.environ.get(
         "CLOUDBOT_PROBE_BASE",
-        os.environ.get("CLOUDBOT_PROBE", "https://status.etesalpaya.com")
+        os.environ.get("CLOUDBOT_PROBE", "https://status.example.com")
     )
     host = probe_base.split("//", 1)[-1].split("/")[0].split(":")[0]
     try:
