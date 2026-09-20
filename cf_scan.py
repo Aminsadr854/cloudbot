@@ -101,7 +101,7 @@ def cloudflare_ranges(ranges_file=None):
     return [l.strip() for l in CF_V4_FALLBACK.splitlines() if l.strip()]
 
 
-def candidates(ranges, per_24, seed=None, limit=0):
+def candidates(ranges, per_24, seed=None, limit=0, exclude=None):
     """
     Sample addresses spread across every /24 rather than taken at random.
 
@@ -111,6 +111,7 @@ def candidates(ranges, per_24, seed=None, limit=0):
     repeatedly and miss others completely.
     """
     rng = random.Random(seed)
+    exclude_set = set(exclude) if exclude else None
     subnets = []
     for cidr in ranges:
         net = ipaddress.ip_network(cidr)
@@ -133,7 +134,10 @@ def candidates(ranges, per_24, seed=None, limit=0):
         k = min(per_24, num_avail)
         offsets = rng.sample(range(1, num_avail + 1), k=k)
         for offset in offsets:
-            out.append(str(ipaddress.IPv4Address(base + offset)))
+            ip_str = str(ipaddress.IPv4Address(base + offset))
+            if exclude_set and ip_str in exclude_set:
+                continue
+            out.append(ip_str)
             if limit > 0 and len(out) >= limit:
                 break
         if limit > 0 and len(out) >= limit:
@@ -618,6 +622,10 @@ async def main():
                          "stage (used for addresses the phones vouched for)")
     ap.add_argument("--ranges-file", default="",
                     help="path to local file containing Cloudflare CIDR ranges")
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated addresses to exclude from scanning")
+    ap.add_argument("--exclude-file", default="",
+                    help="path to local file containing addresses to exclude")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -635,13 +643,25 @@ async def main():
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, sigterm_handler)
 
+    exclude = {ip.strip() for ip in args.exclude.split(",") if ip.strip()}
+    if args.exclude_file:
+        try:
+            with open(args.exclude_file) as f:
+                for line in f:
+                    for part in line.replace(",", " ").split():
+                        p = part.strip()
+                        if p and not p.startswith("#"):
+                            exclude.add(p)
+        except Exception as e:
+            print(f"  (could not read exclude file {args.exclude_file}: {e})", file=sys.stderr)
+
     only = [x.strip() for x in args.only.split(",") if x.strip()]
     if only:
         ranges, ips = [], only
         print(f"  measuring a fixed list of {len(ips)} address(es)", flush=True)
     else:
         ranges = cloudflare_ranges(args.ranges_file)
-        ips = candidates(ranges, args.per_24, args.seed, limit=args.limit)
+        ips = candidates(ranges, args.per_24, args.seed, limit=args.limit, exclude=exclude)
     pinned = {ip.strip() for ip in args.include.split(",") if ip.strip()}
     if pinned:
         ips = list(pinned) + [i for i in ips if i not in pinned]

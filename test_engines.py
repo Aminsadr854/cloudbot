@@ -1571,6 +1571,43 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         idx = args.index("--ranges-file")
         self.assertEqual(args[idx + 1], "/root/ranges.txt")
 
+    async def test_d2_step1_exclude_handling(self):
+        import cf_scan
+        import cfscanner
+
+        ranges = ["104.16.0.0/24"]
+
+        # 1. candidates with exclude parameter
+        excluded_ip = "104.16.0.10"
+        ips = cf_scan.candidates(ranges, per_24=254, limit=0, exclude=[excluded_ip])
+        self.assertNotIn(excluded_ip, ips)
+
+        # 2. _build_scan_args with inline exclude and shell injection filtering
+        evil_ip = "1.2.3.4; rm -rf /"
+        good_ip = "5.6.7.8"
+        args = cfscanner._build_scan_args("scan.py", "out", exclude=[evil_ip, good_ip])
+        self.assertIn("--exclude", args)
+        idx = args.index("--exclude")
+        self.assertEqual(args[idx + 1], "5.6.7.8")
+
+        # 3. _build_scan_args with exclude_file
+        args_file = cfscanner._build_scan_args("scan.py", "out", exclude_file="/root/exclude.txt")
+        self.assertIn("--exclude-file", args_file)
+        idx = args_file.index("--exclude-file")
+        self.assertEqual(args_file[idx + 1], "/root/exclude.txt")
+
+        # 4. scanner_engine.scan_pass passes blocked IPs to run_scan
+        st = self.st
+        st.set_cfscan({"ssh": {"host": "1.2.3.4", "user": "u", "password": "p"}}, 1)
+        engine = ScannerEngine(engine_id=1, store=st)
+        mock_run = AsyncMock(return_value=([{"ip": "104.16.1.1", "rtt": 20.0}], ""))
+        with patch.object(st, "blocked_ips", return_value={"198.51.100.1", "198.51.100.2"}), \
+             patch("cfscanner.run_scan", mock_run):
+            await engine.scan_pass(AsyncMock())
+            self.assertTrue(mock_run.called)
+            passed_exclude = mock_run.call_args.kwargs.get("exclude")
+            self.assertEqual(set(passed_exclude), {"198.51.100.1", "198.51.100.2"})
+
 
 if __name__ == "__main__":
     unittest.main()

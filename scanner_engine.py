@@ -451,10 +451,11 @@ class ScannerEngine:
         log.info("[ENGINE %d] Starting scan pass", self.engine_id)
         self.set_status("scanning", "اسکن رنج کلادفلر")
         host, sni = self.st.get_engine_targets(self.engine_id)
+        blocked = list(self.st.blocked_ips())
         results, _tail = await cfscanner.run_scan(
             ssh, self.st.jump(), log_fn, limit=SCAN_SAMPLE,
             final=PHONE_SHORTLIST, no_speed=True, engine_id=self.engine_id,
-            host=host, sni=sni)
+            host=host, sni=sni, exclude=blocked)
         self.st.pool_add(results, engine_id=self.engine_id)
         log.info("[ENGINE %d] Candidate IPs: %d", self.engine_id, len(results))
         self.set_status("idle", f"{len(results)} آدرس به استخر اضافه شد")

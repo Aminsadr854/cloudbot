@@ -89,6 +89,9 @@ def _get_cached_ranges() -> str:
     return CF_V4_FALLBACK.strip()
 
 
+EXCLUDE_FILE_THRESHOLD = 250  # IPs (~4KB); above this threshold, ship as a file to avoid ARG_MAX
+
+
 def _load_scanner() -> str:
     with open(SCANNER_LOCAL) as f:
         return f.read()
@@ -98,7 +101,8 @@ def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
                      final=20, host="speed.cloudflare.com", sni: str | None = None,
                      limit=0, only=None, no_speed=False, include=None, engine_id: int = 0,
                      concurrency: int = DEFAULT_CONCURRENCY,
-                     ranges_file: str | None = None) -> list[str]:
+                     ranges_file: str | None = None,
+                     exclude=None, exclude_file: str | None = None) -> list[str]:
     args = ["python3", remote_scanner,
             "--per-24", str(per_24),
             "--rounds", str(rounds),
@@ -114,6 +118,12 @@ def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
         args += ["--limit", str(int(limit))]
     if ranges_file:
         args += ["--ranges-file", ranges_file]
+    if exclude_file:
+        args += ["--exclude-file", exclude_file]
+    if exclude:
+        safe_exc = [i for i in exclude if all(ch in "0123456789." for ch in i)]
+        if safe_exc:
+            args += ["--exclude", ",".join(safe_exc)]
     if only:
         safe_only = [i for i in only if all(ch in "0123456789." for ch in i)]
         if safe_only:
@@ -130,7 +140,8 @@ def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
 async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                    final=20, host="speed.cloudflare.com", sni: str | None = None,
                    include=None, limit=0, only=None, no_speed=False, engine_id: int = 1,
-                   remote_out: str | None = None, concurrency: int = DEFAULT_CONCURRENCY):
+                   remote_out: str | None = None, concurrency: int = DEFAULT_CONCURRENCY,
+                   exclude=None):
     """
     SSH to `ssh` (optionally via `jump`), run the scanner, return the ranked
     result list (best first). Each item: ip, rtt, jitter, loss, rtt_max, mbps.
@@ -143,6 +154,16 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
     remote_ranges_file = f"/root/.cf_ranges_engine_{engine_id}.txt"
     tmp_ranges_path = f"{remote_ranges_file}.tmp.{os.getpid()}"
     out_file = remote_out or (f"/root/cf_bot_scan_engine_{engine_id}" if engine_id else REMOTE_OUT)
+
+    safe_exclude = [i for i in (exclude or []) if all(ch in "0123456789." for ch in i)]
+    remote_exclude_file = None
+    tmp_exclude_path = None
+    exclude_inline = None
+    if len(safe_exclude) > EXCLUDE_FILE_THRESHOLD:
+        remote_exclude_file = f"/root/.cf_exclude_engine_{engine_id}.txt"
+        tmp_exclude_path = f"{remote_exclude_file}.tmp.{os.getpid()}"
+    elif safe_exclude:
+        exclude_inline = safe_exclude
 
     # Lock ordering and deadlock prevention:
     # In ScannerEngine.scan_loop, each engine first acquires its per-engine lock (`self.lock`).
@@ -181,21 +202,29 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
             await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
             script = _load_scanner()
             ranges_content = _get_cached_ranges()
-            # Write scanner and cached ranges via SFTP to unique temp paths, then atomically rename
+            # Write scanner, cached ranges, and optional exclude file via SFTP to unique temp paths, then atomically rename
             async with conn.start_sftp_client() as sftp:
                 async with sftp.open(tmp_path, "w") as f:
                     await f.write(script)
                 async with sftp.open(tmp_ranges_path, "w") as f:
                     await f.write(ranges_content + "\n")
-            await conn.run(f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)} && "
-                           f"mv {shlex.quote(tmp_ranges_path)} {shlex.quote(remote_ranges_file)}", check=False)
+                if remote_exclude_file and tmp_exclude_path:
+                    async with sftp.open(tmp_exclude_path, "w") as f:
+                        await f.write("\n".join(safe_exclude) + "\n")
+
+            rename_cmd = (f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)} && "
+                          f"mv {shlex.quote(tmp_ranges_path)} {shlex.quote(remote_ranges_file)}")
+            if remote_exclude_file and tmp_exclude_path:
+                rename_cmd += f" && mv {shlex.quote(tmp_exclude_path)} {shlex.quote(remote_exclude_file)}"
+            await conn.run(rename_cmd, check=False)
 
             # Raise the fd limit inline: every probe in flight holds one, and the
             # default 1024 would silently cap concurrency and lose candidates.
             args = _build_scan_args(
                 remote_script, out_file, per_24=per_24, rounds=rounds, final=final,
                 host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include,
-                engine_id=engine_id, concurrency=concurrency, ranges_file=remote_ranges_file
+                engine_id=engine_id, concurrency=concurrency, ranges_file=remote_ranges_file,
+                exclude=exclude_inline, exclude_file=remote_exclude_file
             )
             cmd = ("ulimit -n 65535 2>/dev/null; "
                    f"timeout -k 10 {REMOTE_TIMEOUT} "
