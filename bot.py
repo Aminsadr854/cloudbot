@@ -4097,6 +4097,12 @@ async def main():
         h, p, u, pw = os.environ["CLOUDBOT_JUMP"].split(":", 3)
         st.set_jump(h, int(p), u, pw)
         log.info("iran jump host seeded: %s", h)
+    probe_val = os.environ.get("CLOUDBOT_PROBE_BASE") or os.environ.get("CLOUDBOT_PROBE")
+    if not probe_val or "example.com" in probe_val:
+        log.warning(
+            "Control probe host is unconfigured: CLOUDBOT_PROBE_BASE (or CLOUDBOT_PROBE) is unset, empty, or using placeholder. "
+            "Phone consensus check cannot work because control addresses will never resolve."
+        )
     log.info("cloudbot up, owner=%s panel=%s core=%s", OWNER, PANEL_URL, SNI_CORE_ID)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
