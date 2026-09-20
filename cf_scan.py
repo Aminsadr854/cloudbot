@@ -233,7 +233,7 @@ async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=Fals
 
         is_trace = "/cdn-cgi/trace" in path
         valid = False
-        if not cf_error:
+        if not cf_error and ("cf-ray" in headers):
             if is_trace:
                 valid = ("ip=" in body and "colo=" in body) or ("server: cloudflare" in headers and status == "200")
             elif status in ("200", "101"):

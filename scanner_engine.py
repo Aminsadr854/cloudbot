@@ -96,7 +96,11 @@ async def verify_domain_ip(ip: str, host: str, sni: str, port: int = 443, timeou
         if status == "403" and ("cloudflare" in headers or "cf-ray" in headers) and "error" in body:
             return False, "Cloudflare 403 Edge Restriction"
 
-        # 2. Check for valid origin / application responses
+        # 2. Require cf-ray header
+        if "cf-ray" not in headers:
+            return False, "No cf-ray header (not a Cloudflare edge)"
+
+        # 3. Check for valid origin / application responses
         if status in ("200", "101"):
             return True, f"HTTP {status} OK"
         if status == "400" and ("sec-websocket-version" in headers or "bad request" in body):

@@ -1098,6 +1098,45 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(med_by_ip["3.3.3.3"]["cert_ok"])
         self.assertEqual(med_by_ip["3.3.3.3"]["ip_trace"], "198.51.100.99")
 
+    # Test B3: cf-ray header required for valid to be True
+    async def test_b3_cf_ray_required(self):
+        import cf_scan
+        import scanner_engine
+
+        # 1. http_probe without cf-ray returns valid=False even for 200 OK
+        reader = AsyncMock()
+        reader.readuntil.return_value = b"HTTP/1.1 200 OK\r\nServer: nginx\r\n\r\n"
+        reader.read.return_value = b"Hello world"
+        writer = MagicMock()
+        writer.drain = AsyncMock()
+        writer.wait_closed = AsyncMock()
+
+        with patch("asyncio.open_connection", return_value=(reader, writer)):
+            res = await cf_scan.http_probe("1.2.3.4", "example.com", 443, "/", 2.0, want_body=True)
+            self.assertFalse(res["valid"])
+
+        # 2. http_probe with cf-ray returns valid=True for 200 OK
+        reader.readuntil.return_value = b"HTTP/1.1 200 OK\r\nServer: cloudflare\r\nCF-RAY: 12345-FRA\r\n\r\n"
+        with patch("asyncio.open_connection", return_value=(reader, writer)):
+            res = await cf_scan.http_probe("1.2.3.4", "example.com", 443, "/", 2.0, want_body=True)
+            self.assertTrue(res["valid"])
+
+        # 3. verify_domain_ip without cf-ray returns (False, "No cf-ray header (not a Cloudflare edge)")
+        reader.readuntil.return_value = b"HTTP/1.1 404 Not Found\r\nServer: apache\r\n\r\n"
+        reader.read.return_value = b"Not Found"
+        with patch("asyncio.open_connection", return_value=(reader, writer)):
+            valid, reason = await scanner_engine.verify_domain_ip("1.2.3.4", "example.com", "example.com")
+            self.assertFalse(valid)
+            self.assertEqual(reason, "No cf-ray header (not a Cloudflare edge)")
+
+        # 4. verify_domain_ip with cf-ray on 200 OK returns True
+        reader.readuntil.return_value = b"HTTP/1.1 200 OK\r\nServer: cloudflare\r\nCF-RAY: 12345-FRA\r\n\r\n"
+        reader.read.return_value = b"OK"
+        with patch("asyncio.open_connection", return_value=(reader, writer)):
+            valid, reason = await scanner_engine.verify_domain_ip("1.2.3.4", "example.com", "example.com")
+            self.assertTrue(valid)
+            self.assertEqual(reason, "HTTP 200 OK")
+
 
 if __name__ == "__main__":
     unittest.main()

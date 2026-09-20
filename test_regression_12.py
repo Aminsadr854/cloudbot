@@ -111,6 +111,7 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
         """Backend returning HTTP 400 Bad Request with Sec-WebSocket-Version header is valid."""
         fake_head = (b"HTTP/1.1 400 Bad Request\r\n"
                      b"Server: cloudflare\r\n"
+                     b"CF-RAY: 8e123456789abcde-FRA\r\n"
                      b"Sec-WebSocket-Version: 13\r\n\r\n")
         fake_body = b"Bad Request"
 
