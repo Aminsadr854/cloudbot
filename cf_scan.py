@@ -473,6 +473,8 @@ async def stage_stable(rows, port, timeout, rounds, concurrency,
 async def stage_speed(rows, host, port, size_bytes, timeout, concurrency):
     # Deliberately low concurrency: parallel downloads compete for the same
     # uplink and would measure the server's own limit rather than each edge.
+    # Note: host is hardcoded to "speed.cloudflare.com" because /__down only
+    # exists on Cloudflare's speed test infrastructure.
     sem = asyncio.Semaphore(concurrency)
     path = f"/__down?bytes={size_bytes}"
 
@@ -585,6 +587,8 @@ async def main():
     ap.add_argument("--final", type=int, default=20, help="carried into the speed stage")
     ap.add_argument("--rounds", type=int, default=12, help="probes per address for jitter")
     ap.add_argument("--speed-bytes", type=int, default=2_000_000)
+    ap.add_argument("--speed-max", type=int, default=10,
+                    help="maximum candidates to test in the speed stage")
     ap.add_argument("--no-speed", action="store_true", help="skip the download stage")
     ap.add_argument("--out", default="/root/cf_results")
     ap.add_argument("--engine-id", type=int, default=0, help="scanner engine ID")
@@ -680,9 +684,13 @@ async def main():
 
     if not args.no_speed:
         top = finalists if only else _pin(finalists[:args.final], finalists, pinned)
+        if args.speed_max > 0:
+            top = top[:args.speed_max]
         mb = args.speed_bytes / 1e6
         print(f"  stage 4  download {mb:.1f} MB from the best {len(top)}"
               f"  (~{mb * len(top):.0f} MB total)", flush=True)
+        # stage_speed deliberately hardcodes "speed.cloudflare.com" because
+        # /__down only exists there on Cloudflare's speed test infrastructure
         top = await stage_speed(top, "speed.cloudflare.com", args.port,
                                 args.speed_bytes, max(args.http_timeout, 25), 3)
         done = {r["ip"] for r in top}

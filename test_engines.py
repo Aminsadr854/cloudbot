@@ -1423,6 +1423,38 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             self.assertLessEqual(max_active_edge, 4)
             self.assertGreater(max_active_edge, 1)
 
+    async def test_c3_cap_speed_stage_finalists(self):
+        import cf_scan
+
+        captured_speed_rows = []
+
+        async def fake_speed(rows, host, port, size, timeout, concurrency):
+            captured_speed_rows.extend(rows)
+            return rows
+
+        # Test with default speed-max (10) when only=... has 20 IPs
+        ips_20 = [f"104.16.1.{i}" for i in range(20)]
+        with patch.object(sys, "argv", ["cf_scan.py", "--only", ",".join(ips_20), "--out", "/tmp/test_c3_out"]), \
+             patch("cf_scan.stage_reachable", return_value=[(ip, 20.0) for ip in ips_20]), \
+             patch("cf_scan.stage_edge", return_value=([{"ip": ip, "ttfb_ms": 15.0} for ip in ips_20], [], "1.2.3.4", False)), \
+             patch("cf_scan.stage_stable", return_value=[{"ip": ip, "rtt": 20.0, "jitter": 1.0, "loss": 0.0} for ip in ips_20]), \
+             patch("cf_scan.stage_speed", side_effect=fake_speed), \
+             patch("cf_scan.write_results"):
+            captured_speed_rows.clear()
+            await cf_scan.main()
+            self.assertEqual(len(captured_speed_rows), 10)
+
+        # Test with custom --speed-max 5
+        with patch.object(sys, "argv", ["cf_scan.py", "--only", ",".join(ips_20), "--speed-max", "5", "--out", "/tmp/test_c3_out"]), \
+             patch("cf_scan.stage_reachable", return_value=[(ip, 20.0) for ip in ips_20]), \
+             patch("cf_scan.stage_edge", return_value=([{"ip": ip, "ttfb_ms": 15.0} for ip in ips_20], [], "1.2.3.4", False)), \
+             patch("cf_scan.stage_stable", return_value=[{"ip": ip, "rtt": 20.0, "jitter": 1.0, "loss": 0.0} for ip in ips_20]), \
+             patch("cf_scan.stage_speed", side_effect=fake_speed), \
+             patch("cf_scan.write_results"):
+            captured_speed_rows.clear()
+            await cf_scan.main()
+            self.assertEqual(len(captured_speed_rows), 5)
+
 
 if __name__ == "__main__":
     unittest.main()
