@@ -32,11 +32,21 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
 
         self.st = store.Store()
         self.coordinator = PhoneDeliveryCoordinator(offset_seconds=300)
-        self.e1 = ScannerEngine(1, store=self.st, coordinator=self.coordinator)
-        self.e2 = ScannerEngine(2, store=self.st, coordinator=self.coordinator)
-        self.e3 = ScannerEngine(3, store=self.st, coordinator=self.coordinator)
+
+        async def fake_verifier(ip, host=None, sni=None, port=443, timeout=6.0):
+            return True, "HTTP 200 OK"
+
+        self.fake_verifier = AsyncMock(side_effect=fake_verifier)
+        self.e1 = ScannerEngine(1, store=self.st, coordinator=self.coordinator, verifier=self.fake_verifier)
+        self.e2 = ScannerEngine(2, store=self.st, coordinator=self.coordinator, verifier=self.fake_verifier)
+        self.e3 = ScannerEngine(3, store=self.st, coordinator=self.coordinator, verifier=self.fake_verifier)
+
+        # Block any real network socket creation in tests
+        self._open_conn_patch = patch("asyncio.open_connection", side_effect=AssertionError("Real socket opened in unit test!"))
+        self._open_conn_patch.start()
 
     async def asyncTearDown(self):
+        self._open_conn_patch.stop()
         self.st.close()
         if self.orig_db is not None:
             os.environ["CLOUDBOT_DB"] = self.orig_db
@@ -571,6 +581,25 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         ok, why = scanner_engine._report_trusted(rep, controls)
         self.assertFalse(ok)
         self.assertIn("سرور ایران هم از این گوشی جواب نداد", why)
+
+
+    # Test 15 — Verifier injection: custom verifier passed to phone_recheck_pass is respected
+    async def test_verifier_injection_custom_override(self):
+        self.st.update_cfscan(1, fqdn="test.domain.com", auto_apply=False)
+        self.st.set_scan_candidates([{"ip": "104.16.1.99", "rtt": 30}], engine_id=1)
+        calls = []
+
+        async def custom_verifier(ip, host=None, sni=None, port=443, timeout=6.0):
+            calls.append((ip, host, sni))
+            return False, "Custom rejection"
+
+        with patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.16.1.99", "rtt": 30}, "why": "ok", "voters": 2}):
+            await self.e1.phone_recheck_pass(verifier=custom_verifier)
+
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], "104.16.1.99")
+        # Decision status updated with rejection reason
+        self.assertIn("هیچ‌کدام", self.st.get("scan_last_decision_engine_1"))
 
 
 if __name__ == "__main__":

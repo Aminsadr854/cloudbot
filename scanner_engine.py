@@ -398,11 +398,13 @@ class ScannerEngine:
     Runs its own schedule, pool, candidate generation, phone delivery, and DNS updates.
     """
     def __init__(self, engine_id: int, store: Optional[Store] = None,
-                 coordinator: Optional[PhoneDeliveryCoordinator] = None):
+                 coordinator: Optional[PhoneDeliveryCoordinator] = None,
+                 verifier: Optional[Callable] = None):
         self.engine_id = engine_id
         self.name = f"ENGINE_{engine_id}"
         self.st = store or Store()
         self.coordinator = coordinator or delivery_coordinator
+        self.verifier = verifier
         self.lock = asyncio.Lock()  # Per-engine scan lock
         self._running = False
 
@@ -520,8 +522,10 @@ class ScannerEngine:
         await log_fn(f"[ENGINE {self.engine_id}] لیست جایگزین #{rounds + 1}: {len(batch)} آدرس تازه")
         return True
 
-    async def phone_recheck_pass(self, notify_fn: Optional[Callable] = None):
+    async def phone_recheck_pass(self, notify_fn: Optional[Callable] = None,
+                                 verifier: Optional[Callable] = None):
         """Evaluate phone reports, choose best IP, and update Cloudflare domain for this engine."""
+        _verify = verifier or self.verifier or verify_domain_ip
         cfg = self.st.cfscan(self.engine_id)
         cand = self.st.scan_candidates(engine_id=self.engine_id)
         if time.time() - (cand.get("ts") or 0) > 12 * 3600:
@@ -576,7 +580,7 @@ class ScannerEngine:
 
         for chosen_cand, why_cand in contenders_to_try:
             # 1. DOMAIN_PREVALIDATED: Candidate must prove domain validity BEFORE touching DNS
-            pre_ok, pre_reason = await verify_domain_ip(chosen_cand["ip"], host=target_host, sni=target_sni)
+            pre_ok, pre_reason = await _verify(chosen_cand["ip"], host=target_host, sni=target_sni)
             if not pre_ok:
                 log.warning("[ENGINE %d] DOMAIN_PREVALIDATION failed for candidate %s: %s (trying next contender)",
                             self.engine_id, chosen_cand["ip"], pre_reason)
@@ -618,7 +622,7 @@ class ScannerEngine:
 
             # 3. DOMAIN_POSTCONFIRMED: Post-DNS confirmation with automated rollback
             await asyncio.sleep(6.0)
-            post_ok, post_reason = await verify_domain_ip(chosen["ip"], host=target_host, sni=target_sni)
+            post_ok, post_reason = await _verify(chosen["ip"], host=target_host, sni=target_sni)
             if not post_ok:
                 log.error("[ENGINE %d] DOMAIN_POSTCONFIRMED failed for %s: %s. Initiating automatic rollback!",
                           self.engine_id, chosen["ip"], post_reason)
