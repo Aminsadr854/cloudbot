@@ -788,9 +788,10 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
 
             with open(out_base + ".json") as f:
                 saved_json = json.load(f)
-            self.assertEqual(len(saved_json), 2)
-            self.assertEqual(saved_json[0]["ip"], "104.16.1.1")
-            self.assertEqual(saved_json[1]["ip"], "104.16.1.2")
+            saved_rows = saved_json.get("results", saved_json)
+            self.assertEqual(len(saved_rows), 2)
+            self.assertEqual(saved_rows[0]["ip"], "104.16.1.1")
+            self.assertEqual(saved_rows[1]["ip"], "104.16.1.2")
 
             with open(out_base + ".txt") as f:
                 saved_txt = f.read().splitlines()
@@ -862,6 +863,118 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             calls = [c[0][0] for c in mock_conn.run.call_args_list]
             self.assertTrue(any("pkill -15 -f /root/.cf_scan_engine_3.py" in c for c in calls))
             self.assertTrue(any("pkill -9 -f /root/.cf_scan_engine_3.py" in c for c in calls))
+
+
+    # Test A8: Atomic writes, truncated-file resistance, and stale result rejection
+    async def test_a8_atomic_writes_and_stale_result_rejection(self):
+        import cf_scan
+        # 1. Truncated-file resistance and atomic replacement
+        with tempfile.TemporaryDirectory() as td:
+            out_base = os.path.join(td, "atomic_test")
+            # Write initial valid file
+            initial_rows = [{"ip": "1.1.1.1", "rtt": 20.0, "loss": 0.0}]
+            cf_scan.write_results(initial_rows, out_base, scan_start=1000, engine_id=1)
+            self.assertTrue(os.path.exists(out_base + ".json"))
+
+            # Simulate an interrupted run leaving a corrupt .tmp file behind
+            with open(out_base + ".json.tmp", "w") as f:
+                f.write('{"scan_start": 2000, "corrupt_data": [')
+
+            # Verify original .json is completely intact and readable
+            with open(out_base + ".json") as f:
+                intact_json = json.load(f)
+            self.assertEqual(intact_json["results"][0]["ip"], "1.1.1.1")
+
+            # Successful write_results atomically replaces .json and cleans up .tmp
+            new_rows = [{"ip": "2.2.2.2", "rtt": 25.0, "loss": 0.0}]
+            cf_scan.write_results(new_rows, out_base, scan_start=3000, engine_id=1)
+            with open(out_base + ".json") as f:
+                updated_json = json.load(f)
+            self.assertEqual(updated_json["results"][0]["ip"], "2.2.2.2")
+            self.assertFalse(os.path.exists(out_base + ".json.tmp"))
+
+            # Re-entrancy guard test: when _write_lock is True, write_results safely exits
+            try:
+                cf_scan._write_lock = True
+                cf_scan.write_results([{"ip": "9.9.9.9", "rtt": 10.0}], out_base)
+                with open(out_base + ".json") as f:
+                    guarded_json = json.load(f)
+                # File remains with 2.2.2.2, not overwritten by re-entrant call
+                self.assertEqual(guarded_json["results"][0]["ip"], "2.2.2.2")
+            finally:
+                cf_scan._write_lock = False
+
+        # 2. Stale-result rejection and output cleanup in cfscanner.run_scan
+        mock_conn = MagicMock()
+        mock_sftp = AsyncMock()
+        mock_file = AsyncMock()
+        mock_sftp.open = MagicMock(return_value=mock_file)
+        mock_file.__aenter__ = AsyncMock(return_value=mock_file)
+        mock_file.__aexit__ = AsyncMock(return_value=None)
+        mock_sftp.__aenter__ = AsyncMock(return_value=mock_sftp)
+        mock_sftp.__aexit__ = AsyncMock(return_value=None)
+        mock_conn.start_sftp_client = MagicMock(return_value=mock_sftp)
+
+        cmd_history = []
+        # Simulate returning a stale results file (from 1 hour ago)
+        async def mock_run_stale(cmd, check=False):
+            cmd_history.append(cmd)
+            res = MagicMock()
+            if "pgrep" in cmd:
+                res.stdout = ""
+            elif "rm -f" in cmd:
+                res.stdout = ""
+            elif "cat " in cmd:
+                # Results with scan_start older than current time
+                stale_payload = {
+                    "scan_start": int(time.time()) - 3600,
+                    "engine_id": 2,
+                    "results": [{"ip": "104.16.1.1", "rtt": 35.0}]
+                }
+                res.stdout = json.dumps(stale_payload)
+            else:
+                res.stdout = "scan output..."
+            res.exit_status = 0
+            return res
+
+        mock_conn.run = AsyncMock(side_effect=mock_run_stale)
+        with patch("cfscanner.tunnel.connect", AsyncMock(return_value=mock_conn)), \
+             patch("asyncio.sleep", AsyncMock()):
+            # Verify stale results are rejected
+            with self.assertRaises(cfscanner.StaleResultError):
+                await cfscanner.run_scan(
+                    {"host": "remote.ir", "user": "root", "password": "p"},
+                    jump=None, log=AsyncMock(), engine_id=2
+                )
+            # Verify rm -f was executed for engine 2 outputs
+            self.assertTrue(any("rm -f /root/cf_bot_scan_engine_2.json" in c for c in cmd_history))
+
+        # 3. Engine ID mismatch rejection
+        cmd_history.clear()
+        async def mock_run_mismatch(cmd, check=False):
+            cmd_history.append(cmd)
+            res = MagicMock()
+            if "cat " in cmd:
+                mismatch_payload = {
+                    "scan_start": int(time.time()),
+                    "engine_id": 1,  # Belongs to Engine 1, but running for Engine 2!
+                    "results": [{"ip": "104.16.1.1", "rtt": 35.0}]
+                }
+                res.stdout = json.dumps(mismatch_payload)
+            else:
+                res.stdout = ""
+            res.exit_status = 0
+            return res
+
+        mock_conn.run = AsyncMock(side_effect=mock_run_mismatch)
+        with patch("cfscanner.tunnel.connect", AsyncMock(return_value=mock_conn)), \
+             patch("asyncio.sleep", AsyncMock()):
+            with self.assertRaises(cfscanner.StaleResultError):
+                await cfscanner.run_scan(
+                    {"host": "remote.ir", "user": "root", "password": "p"},
+                    jump=None, log=AsyncMock(), engine_id=2
+                )
+
 
 
 if __name__ == "__main__":

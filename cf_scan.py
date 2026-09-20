@@ -33,6 +33,7 @@ import asyncio
 import ipaddress
 import json
 import math
+import os
 import random
 import signal
 import ssl
@@ -365,23 +366,49 @@ def score(row):
     return cost
 
 
-def write_results(rows: list[dict], out_base: str):
+_write_lock = False
+
+
+def write_results(rows: list[dict], out_base: str, scan_start: float | None = None, engine_id: int = 0):
     """
-    Write ranked candidates to out_base.json and out_base.txt.
-    Used by normal finish, stage-3 checkpoint, and SIGTERM handler.
+    Write ranked candidates to out_base.json and out_base.txt atomically.
+    Guarded against signal handler re-entrancy.
     """
-    if not rows:
+    global _write_lock
+    if _write_lock:
         return
-    valid_rows = [
-        r for r in rows
-        if isinstance(r, dict) and r.get("ip") and r.get("rtt") is not None and math.isfinite(r["rtt"])
-    ]
-    if not valid_rows:
-        return
-    with open(out_base + ".json", "w") as f:
-        json.dump(valid_rows, f, indent=1, allow_nan=False)
-    with open(out_base + ".txt", "w") as f:
-        f.write("\n".join(r["ip"] for r in valid_rows if r.get("loss") == 0) + "\n")
+    _write_lock = True
+    try:
+        if not rows:
+            return
+        valid_rows = [
+            r for r in rows
+            if isinstance(r, dict) and r.get("ip") and r.get("rtt") is not None and math.isfinite(r["rtt"])
+        ]
+        if not valid_rows:
+            return
+
+        payload = {
+            "scan_start": int(scan_start) if scan_start is not None else int(time.time()),
+            "engine_id": int(engine_id),
+            "results": valid_rows,
+        }
+
+        tmp_json = f"{out_base}.json.tmp"
+        with open(tmp_json, "w") as f:
+            json.dump(payload, f, indent=1, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_json, f"{out_base}.json")
+
+        tmp_txt = f"{out_base}.txt.tmp"
+        with open(tmp_txt, "w") as f:
+            f.write("\n".join(r["ip"] for r in valid_rows if r.get("loss") == 0) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_txt, f"{out_base}.txt")
+    finally:
+        _write_lock = False
 
 
 async def main():
@@ -404,6 +431,7 @@ async def main():
     ap.add_argument("--speed-bytes", type=int, default=2_000_000)
     ap.add_argument("--no-speed", action="store_true", help="skip the download stage")
     ap.add_argument("--out", default="/root/cf_results")
+    ap.add_argument("--engine-id", type=int, default=0, help="scanner engine ID")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--only", default="",
                     help="measure exactly these addresses and sample nothing; "
@@ -415,19 +443,19 @@ async def main():
                          "stage (used for addresses the phones vouched for)")
     args = ap.parse_args()
 
+    t0 = time.time()
     current_candidates: list[dict] = []
     current_out: str = args.out
 
     def sigterm_handler(signum, frame):
         if current_candidates:
             print("\n  SIGTERM received; saving partial results...", file=sys.stderr, flush=True)
-            write_results(current_candidates, current_out)
+            write_results(current_candidates, current_out, scan_start=t0, engine_id=args.engine_id)
         sys.exit(0)
 
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, sigterm_handler)
 
-    t0 = time.time()
     only = [x.strip() for x in args.only.split(",") if x.strip()]
     if only:
         ranges, ips = [], only
@@ -480,7 +508,7 @@ async def main():
     current_candidates = list(finalists)
 
     # Stage 3 checkpoint: write partial results immediately before stage 4 starts
-    write_results(finalists, args.out)
+    write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id)
 
     if not args.no_speed:
         top = finalists if only else _pin(finalists[:args.final], finalists, pinned)
@@ -506,7 +534,7 @@ async def main():
         print(f"  {i:<4}{r['ip']:<17}{rtt_s}{jit_s}{loss_s}{max_s}{speed:>11}   "
               f"{r.get('colo', '?')}")
 
-    write_results(finalists, args.out)
+    write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id)
     print(f"\n  full results: {args.out}.json")
     print(f"  loss-free addresses only: {args.out}.txt")
     print(f"  took {time.time() - t0:.0f}s")

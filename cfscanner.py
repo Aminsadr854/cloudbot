@@ -15,6 +15,7 @@ import json
 import math
 import os
 import shlex
+import time
 
 import tunnel  # reuse the SSH connector (direct, or via the Iran jump)
 
@@ -29,6 +30,10 @@ class ScanTimeoutError(TimeoutError):
     pass
 
 
+class StaleResultError(RuntimeError):
+    pass
+
+
 def _load_scanner() -> str:
     with open(SCANNER_LOCAL) as f:
         return f.read()
@@ -36,7 +41,7 @@ def _load_scanner() -> str:
 
 def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
                      final=20, host="speed.cloudflare.com", sni: str | None = None,
-                     limit=0, only=None, no_speed=False, include=None) -> list[str]:
+                     limit=0, only=None, no_speed=False, include=None, engine_id: int = 0) -> list[str]:
     args = ["python3", remote_scanner,
             "--per-24", str(per_24),
             "--rounds", str(rounds),
@@ -44,6 +49,8 @@ def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
             "--host", host,
             "--concurrency", "500",
             "--out", out_file]
+    if engine_id:
+        args += ["--engine-id", str(engine_id)]
     if sni:
         args += ["--sni", sni]
     if limit:
@@ -91,6 +98,15 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
             if check_still.stdout and check_still.stdout.strip():
                 await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
 
+        # Delete previous outputs for this engine only (including .tmp siblings)
+        clean_cmd = (f"rm -f {shlex.quote(out_file + '.json')} "
+                     f"{shlex.quote(out_file + '.txt')} "
+                     f"{shlex.quote(out_file + '.json.tmp')} "
+                     f"{shlex.quote(out_file + '.txt.tmp')}")
+        await conn.run(clean_cmd, check=False)
+
+        scan_start_time = int(time.time())
+
         await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
         script = _load_scanner()
         # Write the scanner via SFTP to a unique temp path, then atomically rename into per-engine path
@@ -103,7 +119,8 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
         # default 1024 would silently cap concurrency and lose candidates.
         args = _build_scan_args(
             remote_script, out_file, per_24=per_24, rounds=rounds, final=final,
-            host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include
+            host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include,
+            engine_id=engine_id
         )
         cmd = ("ulimit -n 65535 2>/dev/null; "
                f"timeout -k 10 {REMOTE_TIMEOUT} "
@@ -130,7 +147,26 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
             if getattr(r, "exit_status", None) == 124:
                 raise ScanTimeoutError(f"Scan timed out after {REMOTE_TIMEOUT}s on engine {engine_id}.\n{tail[-300:]}")
             raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")
-        data = json.loads(raw)
+
+        payload = json.loads(raw)
+        if isinstance(payload, dict):
+            file_start = payload.get("scan_start")
+            file_engine = payload.get("engine_id")
+            if file_start is not None and file_start < (scan_start_time - 5):
+                raise StaleResultError(
+                    f"Stale scan results for engine {engine_id}: result timestamp {file_start} "
+                    f"is older than scan start {scan_start_time}"
+                )
+            if file_engine is not None and file_engine != engine_id and file_engine != 0:
+                raise StaleResultError(
+                    f"Engine ID mismatch in scan results: expected {engine_id}, got {file_engine}"
+                )
+            data = payload.get("results", [])
+        elif isinstance(payload, list):
+            data = payload
+        else:
+            raise RuntimeError(f"Unexpected scan result format: {type(payload)}")
+
         # keep only genuinely usable finalists (finite rtt), best first
         data = [d for d in data
                 if isinstance(d.get("rtt"), (int, float))
