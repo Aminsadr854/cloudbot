@@ -619,8 +619,8 @@ class ScannerEngine:
         decision_key = f"scan_last_decision_engine_{self.engine_id}"
         if d["why"] != self.st.get(decision_key):
             self.st.set(decision_key, d["why"])
-            log.info("[ENGINE %d] Decision (live %s, %d phones): %s",
-                     self.engine_id, live_ip, d["voters"], d["why"])
+            log.info("[ENGINE %d] Decision (engine=%d, live %s, %d phones): %s",
+                     self.engine_id, self.engine_id, live_ip, d["voters"], d["why"])
 
         if not d["change"]:
             return
