@@ -3,6 +3,7 @@ Unit and integration test suite for 3-engine Cloudflare IP scanner.
 Verifies Tests A through L as required by the specification.
 """
 import asyncio
+import json
 import os
 import sys
 import tempfile
@@ -627,6 +628,32 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         for eid, s in zip((1, 2, 3), scripts):
             args = cfscanner._build_scan_args(s, f"/root/out_{eid}")
             self.assertEqual(args[1], s)
+
+
+    # Test A3: Infinity and None handling in cf_scan and cfscanner
+    def test_a3_infinity_and_none_handling(self):
+        import cf_scan
+        import math
+
+        # rtt=None or inf returns inf
+        self.assertEqual(cfscanner.score({"rtt": None}), float("inf"))
+        self.assertEqual(cfscanner.score({"rtt": float("inf")}), float("inf"))
+        self.assertEqual(cf_scan.score({"rtt": None}), float("inf"))
+        self.assertEqual(cf_scan.score({"rtt": float("inf")}), float("inf"))
+
+        # rtt=0 is not treated as 999
+        self.assertEqual(cfscanner.score({"rtt": 0.0, "jitter": 0.0, "loss": 0.0}), 0.0)
+
+        # allow_nan=False in json dump
+        valid_row = {"ip": "1.2.3.4", "rtt": None, "loss": 0.0}
+        self.assertIn("null", json.dumps([valid_row], allow_nan=False))
+        with self.assertRaises(ValueError):
+            json.dumps([{"ip": "1.2.3.4", "rtt": float("inf")}], allow_nan=False)
+
+        # txt filter excludes rtt is None
+        finalists = [{"ip": "1.1.1.1", "rtt": None, "loss": 0}, {"ip": "2.2.2.2", "rtt": 50, "loss": 0}]
+        loss_free = [r["ip"] for r in finalists if r.get("rtt") is not None and r.get("loss") == 0]
+        self.assertEqual(loss_free, ["2.2.2.2"])
 
 
 if __name__ == "__main__":

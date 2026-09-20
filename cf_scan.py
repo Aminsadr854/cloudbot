@@ -32,6 +32,7 @@ import argparse
 import asyncio
 import ipaddress
 import json
+import math
 import random
 import ssl
 import statistics
@@ -314,7 +315,7 @@ async def stage_stable(rows, port, timeout, rounds, concurrency):
             row["jitter"] = statistics.mean(abs(x - row["rtt"]) for x in ok)
             row["rtt_max"] = max(ok)
         else:
-            row["rtt"] = row["jitter"] = row["rtt_max"] = float("inf")
+            row["rtt"] = row["jitter"] = row["rtt_max"] = None
         return row
 
     return await asyncio.gather(*(one(r) for r in rows))
@@ -353,7 +354,7 @@ def score(row):
     30 ms, so loss is weighted far above anything else; ranking on the average
     alone would put exactly that address at the top.
     """
-    if row["rtt"] == float("inf"):
+    if not row.get("rtt") or not math.isfinite(row["rtt"]):
         return float("inf")
     cost = row["rtt"] + 2.0 * row["jitter"] + 1000.0 * row["loss"]
     if row.get("mbps"):
@@ -457,14 +458,17 @@ async def main():
           f"{'worst':>9}{'speed':>11}   colo")
     for i, r in enumerate(finalists[:args.final], 1):
         speed = f"{r['mbps']:.1f} Mbps" if r.get("mbps") else "-"
-        print(f"  {i:<4}{r['ip']:<17}{r['rtt']:>7.1f}ms{r['jitter']:>8.1f}ms"
-              f"{r['loss'] * 100:>6.0f}%{r['rtt_max']:>8.1f}ms{speed:>11}   "
+        rtt_s = f"{r['rtt']:>7.1f}ms" if (r.get("rtt") is not None and math.isfinite(r["rtt"])) else f"{'-':>9}"
+        jit_s = f"{r['jitter']:>8.1f}ms" if (r.get("jitter") is not None and math.isfinite(r["jitter"])) else f"{'-':>10}"
+        loss_s = f"{r['loss'] * 100:>6.0f}%" if (r.get("loss") is not None and math.isfinite(r["loss"])) else f"{'-':>7}"
+        max_s = f"{r['rtt_max']:>8.1f}ms" if (r.get("rtt_max") is not None and math.isfinite(r["rtt_max"])) else f"{'-':>10}"
+        print(f"  {i:<4}{r['ip']:<17}{rtt_s}{jit_s}{loss_s}{max_s}{speed:>11}   "
               f"{r.get('colo', '?')}")
 
     with open(args.out + ".json", "w") as f:
-        json.dump(finalists, f, indent=1)
+        json.dump(finalists, f, indent=1, allow_nan=False)
     with open(args.out + ".txt", "w") as f:
-        f.write("\n".join(r["ip"] for r in finalists if r["loss"] == 0) + "\n")
+        f.write("\n".join(r["ip"] for r in finalists if r.get("rtt") is not None and r.get("loss") == 0) + "\n")
     print(f"\n  full results: {args.out}.json")
     print(f"  loss-free addresses only: {args.out}.txt")
     print(f"  took {time.time() - t0:.0f}s")

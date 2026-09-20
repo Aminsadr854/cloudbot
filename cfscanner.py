@@ -12,6 +12,7 @@ because a steady 90 ms path beats a 40 ms one that stalls.
 """
 import asyncio
 import json
+import math
 import os
 import shlex
 
@@ -98,7 +99,9 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
             raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")
         data = json.loads(raw)
         # keep only genuinely usable finalists (finite rtt), best first
-        data = [d for d in data if isinstance(d.get("rtt"), (int, float))]
+        data = [d for d in data
+                if isinstance(d.get("rtt"), (int, float))
+                and math.isfinite(d["rtt"])]
         return data, tail
     finally:
         conn.close()
@@ -135,7 +138,9 @@ def score(d: dict) -> float:
 
 
 def _score(d: dict) -> float:
-    rtt = d.get("rtt") or 999
+    rtt = d.get("rtt")
+    if rtt is None or not math.isfinite(rtt):
+        return float("inf")
     jit = d.get("jitter") or 0
     loss = d.get("loss") or 0
     mbps = d.get("mbps") or 0
