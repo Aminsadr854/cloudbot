@@ -1,3 +1,4 @@
+from typing import Optional
 """
 Storage for the cloud-provisioning bot.
 
@@ -44,23 +45,32 @@ CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
 """
 
 
-def _fernet():
-    if not os.path.exists(KEY_PATH):
-        os.makedirs(os.path.dirname(KEY_PATH), exist_ok=True)
-        fd = os.open(KEY_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+def _fernet(key_path=None):
+    kp = key_path or os.environ.get("CLOUDBOT_KEY", KEY_PATH)
+    if not os.path.exists(kp):
+        os.makedirs(os.path.dirname(kp), exist_ok=True)
+        fd = os.open(kp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "wb") as f:
             f.write(Fernet.generate_key())
-    with open(KEY_PATH, "rb") as f:
+    with open(kp, "rb") as f:
         return Fernet(f.read())
 
 
 class Store:
-    def __init__(self):
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        self.con = sqlite3.connect(DB_PATH, check_same_thread=False)
+    def __init__(self, db_path=None, key_path=None):
+        self.db_path = db_path or os.environ.get("CLOUDBOT_DB", DB_PATH)
+        self.key_path = key_path or os.environ.get("CLOUDBOT_KEY", KEY_PATH)
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
+        self.con = sqlite3.connect(self.db_path, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
         self.con.executescript(SCHEMA)
-        self.f = _fernet()
+        self.f = _fernet(self.key_path)
+
+    def close(self):
+        try:
+            self.con.close()
+        except Exception:
+            pass
 
     # ---- accounts ------------------------------------------------------
     def add_account(self, label, provider, token, proxy=None):
@@ -170,33 +180,81 @@ class Store:
         return self.f.decrypt(v.encode()).decode() if v else None
 
     # ---- clean-IP scanner config (encrypted; holds the scan server SSH) -
-    def set_cfscan(self, cfg: dict):
+    def set_cfscan(self, cfg: dict, engine_id: int = 1):
         import json
-        self.set("cfscan", self.f.encrypt(json.dumps(cfg).encode()).decode())
+        key = f"cfscan_engine_{engine_id}"
+        enc = self.f.encrypt(json.dumps(cfg).encode()).decode()
+        self.set(key, enc)
+        if engine_id == 1:
+            self.set("cfscan", enc)
 
-    def cfscan(self) -> dict:
+    def cfscan(self, engine_id: int = 1) -> dict:
         import json
-        v = self.get("cfscan")
-        return json.loads(self.f.decrypt(v.encode()).decode()) if v else {}
+        key = f"cfscan_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("cfscan")
+        if v:
+            try:
+                return json.loads(self.f.decrypt(v.encode()).decode())
+            except Exception:
+                pass
+        # Default configuration for Engine 2 or 3: inherit scan server (ssh),
+        # interval_hours, and auto_apply from Engine 1 by default, but maintain
+        # separate domain and result states.
+        if engine_id != 1:
+            base = self.cfscan(engine_id=1)
+            return {
+                "ssh": base.get("ssh"),
+                "interval_hours": base.get("interval_hours", 6),
+                "auto_apply": base.get("auto_apply", False),
+                "zone_id": None,
+                "zone_name": None,
+                "fqdn": None,
+                "last_scan_ts": 0,
+                "last_best_ip": None,
+                "last_best": None,
+            }
+        return {}
 
-    def update_cfscan(self, **fields):
-        cfg = self.cfscan()
+    def update_cfscan(self, engine_id: int = 1, **fields):
+        engine_id = fields.pop("engine_id", engine_id)
+        cfg = self.cfscan(engine_id=engine_id)
         cfg.update(fields)
-        self.set_cfscan(cfg)
+        self.set_cfscan(cfg, engine_id=engine_id)
         return cfg
 
-    def add_found_ip(self, entry: dict, keep=20):
+    def add_found_ip(self, entry: dict, keep=20, engine_id: int = 1):
         """Record a newly chosen best IP (metrics only, no secrets)."""
         import json, time
-        hist = self.found_ips()
-        entry = {**entry, "ts": int(time.time())}
+        engine_id = entry.get("engine_id", engine_id)
+        hist = self.found_ips(engine_id=engine_id)
+        entry = {**entry, "ts": int(time.time()), "engine_id": engine_id}
         hist.insert(0, entry)
-        self.set("cfscan_found", json.dumps(hist[:keep]))
+        key = f"cfscan_found_engine_{engine_id}"
+        self.set(key, json.dumps(hist[:keep]))
+        if engine_id == 1:
+            self.set("cfscan_found", json.dumps(hist[:keep]))
 
-    def found_ips(self) -> list:
+    def found_ips(self, engine_id: int = 1) -> list:
         import json
-        v = self.get("cfscan_found")
+        key = f"cfscan_found_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("cfscan_found")
         return json.loads(v) if v else []
+
+    def get_engine_targets(self, engine_id: int = 1) -> tuple[str, str]:
+        """Returns (host, sni) for a specific engine, fully isolated."""
+        cfg = self.cfscan(engine_id)
+        fqdn = (cfg.get("fqdn") or "").strip()
+        explicit_sni = (cfg.get("sni") or "").strip()
+        explicit_host = (cfg.get("host") or "").strip()
+        stored_probe_sni = (self.get("probe_sni") or "").strip()
+
+        sni = explicit_sni or stored_probe_sni or fqdn or "speed.cloudflare.com"
+        host = explicit_host or explicit_sni or stored_probe_sni or fqdn
+        return host, sni
 
     # ---- subscription link (encrypted: it is a bearer secret) ----------
     def set_sub_url(self, url):
@@ -315,14 +373,10 @@ class Store:
     # see a different one, and an address that is only clean where the relay
     # sits is not clean for the customers. These tables hold what the phones
     # were asked to test and what they found.
-    def set_scan_candidates(self, entries: list, controls=None, keep=45):
+    def set_scan_candidates(self, entries: list, controls=None, keep=45, engine_id: int = 1):
         """
         The shortlist handed to the phones, with the relay's own numbers kept.
-
-        Storing the metrics beside the addresses is what lets the phone verdicts
-        be ranked across the whole shortlist later, instead of across the short
-        history of addresses that happened to be applied. Plain IP strings are
-        still accepted, for callers that have nothing more to say.
+        Isolated strictly per engine: scan_candidates_engine_{engine_id}.
         """
         import json, time
         ips, metrics = [], {}
@@ -335,26 +389,253 @@ class Store:
                     metrics[ip] = {k: v for k, v in e.items() if k != "ip"}
             if ip:
                 ips.append(ip)
-        self.set("scan_candidates", json.dumps(
-            {"ts": int(time.time()), "ips": ips, "metrics": metrics,
-             # Reference addresses, handed to the phones mixed in with the real
-             # candidates but never judged as candidates themselves.
-             "controls": [c for c in (controls or []) if c]}))
+        payload = {
+            "ts": int(time.time()), "engine_id": engine_id, "ips": ips, "metrics": metrics,
+            "controls": [c for c in (controls or []) if c]
+        }
+        key = f"scan_candidates_engine_{engine_id}"
+        self.set(key, json.dumps(payload))
+        # Keep legacy pointer updated only for engine 1
+        if engine_id == 1:
+            self.set("scan_candidates", json.dumps(payload))
+        # Initialize delivery lifecycle state for this shortlist
+        self.init_delivery_state(engine_id, payload["ts"], ips, payload["controls"])
 
-    def set_candidate_meta(self, **fields):
-        """Bookkeeping that rides with the shortlist: what has been tried this
-        window, and how many replacement lists have gone out."""
+    def set_candidate_meta(self, engine_id: int = 1, **fields):
+        """Bookkeeping that rides with the shortlist for a specific engine."""
         import json
-        v = self.get("scan_candidates")
+        engine_id = fields.pop("engine_id", engine_id)
+        key = f"scan_candidates_engine_{engine_id}"
+        v = self.get(key)
         d = json.loads(v) if v else {}
         d.update(fields)
-        self.set("scan_candidates", json.dumps(d))
+        self.set(key, json.dumps(d))
 
-    def scan_candidates(self) -> dict:
+    SHORTLIST_DELIVERY_TTL = 3 * 3600  # 3 hours delivery window for phones to poll
+
+    @staticmethod
+    def candidate_set_hash(ips: list, controls: list = ()) -> str:
+        import hashlib
+        ctrl_set = set(controls or [])
+        cand_ips = sorted(ip for ip in (ips or []) if ip and ip not in ctrl_set)
+        if not cand_ips:
+            return ""
+        s = ",".join(cand_ips)
+        return hashlib.sha256(s.encode("utf-8")).hexdigest()[:12]
+
+    def init_delivery_state(self, engine_id: int, cand_ts: int, ips: list, controls: list = ()):
         import json
-        v = self.get("scan_candidates")
+        cand_hash = self.candidate_set_hash(ips, controls)
+        state = {
+            "engine_id": engine_id,
+            "shortlist_timestamp": cand_ts,
+            "candidate_set_hash": cand_hash,
+            "candidate_count": len(ips),
+            "created_at": cand_ts,
+            "expires_at": cand_ts + self.SHORTLIST_DELIVERY_TTL if cand_ts else 0,
+            "devices": {},
+            "delivery_complete": False
+        }
+        self.set(f"delivery_state_engine_{engine_id}", json.dumps(state))
+        return state
+
+    def get_delivery_state(self, engine_id: int) -> dict:
+        import json, time
+        key = f"delivery_state_engine_{engine_id}"
+        v = self.get(key)
+        cand = self.scan_candidates(engine_id=engine_id)
+        cand_ts = cand.get("ts", 0)
+        cand_ips = cand.get("ips", [])
+        controls = cand.get("controls", [])
+        cand_hash = self.candidate_set_hash(cand_ips, controls)
+
+        state = json.loads(v) if v else {}
+        if not state or state.get("shortlist_timestamp") != cand_ts or state.get("candidate_set_hash") != cand_hash:
+            state = {
+                "engine_id": engine_id,
+                "shortlist_timestamp": cand_ts,
+                "candidate_set_hash": cand_hash,
+                "candidate_count": len(cand_ips),
+                "created_at": cand_ts,
+                "expires_at": cand_ts + self.SHORTLIST_DELIVERY_TTL if cand_ts else 0,
+                "devices": {},
+                "delivery_complete": False
+            }
+
+        # Sync from device reports
+        reports = self.device_reports(engine_id=engine_id)
+        complete_count = 0
+        for dev_id, rep in reports.items():
+            rep_ts = rep.get("ts", 0)
+            rep_res = rep.get("results") or []
+            rep_ips = [r.get("ip") for r in rep_res if r.get("ip")]
+            rep_hash = self.candidate_set_hash(rep_ips, controls)
+            dev_state = state["devices"].setdefault(dev_id, {})
+            dev_state["device_id"] = dev_id
+            dev_state["operator"] = rep.get("operator", "")
+            dev_state["reported_at"] = rep_ts
+            dev_state["report_candidate_set_hash"] = rep_hash
+            is_match = (rep_hash == cand_hash) and bool(cand_hash)
+            is_fresh = is_match and (rep_ts >= cand_ts)
+            dev_state["report_fresh"] = is_fresh
+            if is_fresh:
+                dev_state["status"] = "COMPLETE"
+                complete_count += 1
+            elif dev_state.get("status") != "DELIVERED":
+                dev_state["status"] = "PENDING"
+
+        if complete_count >= 2:
+            state["delivery_complete"] = True
+
+        self.set(key, json.dumps(state))
+        return state
+
+    def record_candidate_delivery(self, engine_id: int, device: str, operator: str = ""):
+        import json, time
+        if not device:
+            return
+        state = self.get_delivery_state(engine_id)
+        dev_state = state["devices"].setdefault(device, {})
+        dev_state["device_id"] = device
+        if operator:
+            dev_state["operator"] = operator
+        dev_state["delivered_at"] = int(time.time())
+        if dev_state.get("status") != "COMPLETE":
+            dev_state["status"] = "DELIVERED"
+        key = f"delivery_state_engine_{engine_id}"
+        self.set(key, json.dumps(state))
+
+    def record_candidate_report(self, engine_id: int, device: str, operator: str, reported_ips: list):
+        import json, time
+        if not device:
+            return
+        state = self.get_delivery_state(engine_id)
+        cand = self.scan_candidates(engine_id=engine_id)
+        cand_ts = cand.get("ts", 0)
+        cand_hash = state.get("candidate_set_hash", "")
+        controls = cand.get("controls", [])
+        rep_hash = self.candidate_set_hash(reported_ips, controls)
+
+        dev_state = state["devices"].setdefault(device, {})
+        dev_state["device_id"] = device
+        dev_state["operator"] = operator
+        dev_state["reported_at"] = int(time.time())
+        dev_state["report_candidate_set_hash"] = rep_hash
+        is_match = (rep_hash == cand_hash) and bool(cand_hash)
+        is_fresh = is_match and (dev_state["reported_at"] >= cand_ts)
+        dev_state["report_fresh"] = is_fresh
+        if is_fresh:
+            dev_state["status"] = "COMPLETE"
+
+        complete_count = sum(1 for d in state["devices"].values() if d.get("status") == "COMPLETE")
+        if complete_count >= 2:
+            state["delivery_complete"] = True
+
+        key = f"delivery_state_engine_{engine_id}"
+        self.set(key, json.dumps(state))
+
+    def active_probe_engine(self, device: Optional[str] = None, operator: Optional[str] = None) -> int:
+        """
+        Find which engine currently needs candidate delivery.
+        Considers:
+        - shortlist timestamp and expiration (SHORTLIST_DELIVERY_TTL)
+        - per-device delivery and completion state
+        - candidate set hash matching
+        - oldest pending shortlist with outstanding required devices
+        """
+        import time
+        now = time.time()
+        engine_states = {}
+        for eid in (1, 2, 3):
+            state = self.get_delivery_state(eid)
+            cand_ts = state.get("shortlist_timestamp", 0)
+            cand_count = state.get("candidate_count", 0)
+            expires_at = state.get("expires_at", 0)
+            if cand_ts > 0 and cand_count > 0:
+                is_expired = expires_at and (now > expires_at)
+                engine_states[eid] = (state, is_expired)
+
+        if not engine_states:
+            return 1
+
+        active_states = {eid: st for eid, (st, exp) in engine_states.items() if not exp}
+        if not active_states:
+            active_states = {eid: st for eid, (st, exp) in engine_states.items()}
+
+        def _device_matches(target_key: str, dev_id: str, op: str) -> bool:
+            if not target_key:
+                return False
+            if dev_id and target_key.lower() == dev_id.lower():
+                return True
+            tk_low = target_key.lower()
+            if op:
+                op_low = op.lower()
+                if "mci" in op_low and "mci" in tk_low:
+                    return True
+                if ("irancell" in op_low or "mtn" in op_low) and ("irancell" in tk_low or "mtn" in tk_low):
+                    return True
+            if dev_id:
+                dev_low = dev_id.lower()
+                if "mci" in dev_low and "mci" in tk_low:
+                    return True
+                if ("irancell" in dev_low or "mtn" in dev_low) and ("irancell" in tk_low or "mtn" in tk_low):
+                    return True
+            return False
+
+        # 1. Device-aware selection: If device or operator is known
+        if device or operator:
+            pending_for_this_device = []
+            for eid, state in active_states.items():
+                if state.get("delivery_complete"):
+                    continue
+                dev_completed = False
+                for d_id, d_info in state.get("devices", {}).items():
+                    if _device_matches(d_id, device, operator) or _device_matches(d_info.get("operator", ""), device, operator):
+                        if d_info.get("status") == "COMPLETE":
+                            dev_completed = True
+                            break
+                if not dev_completed:
+                    cand_ts = state.get("shortlist_timestamp", 0)
+                    pending_for_this_device.append((eid, cand_ts))
+
+            if pending_for_this_device:
+                # Prefer the oldest pending shortlist that still needs this device
+                pending_for_this_device.sort(key=lambda x: x[1])
+                return pending_for_this_device[0][0]
+
+        # 2. General selection: Find engines whose delivery is not complete (< 2 phones tested)
+        incomplete_engines = []
+        for eid, state in active_states.items():
+            if not state.get("delivery_complete"):
+                cand_ts = state.get("shortlist_timestamp", 0)
+                incomplete_engines.append((eid, cand_ts))
+
+        if incomplete_engines:
+            # Prefer the oldest pending shortlist
+            incomplete_engines.sort(key=lambda x: x[1])
+            return incomplete_engines[0][0]
+
+        # 3. All active engines are delivery-complete: return the engine with newest shortlist
+        return max(active_states.keys(), key=lambda eid: active_states[eid].get("shortlist_timestamp", 0))
+
+    def scan_candidates(self, engine_id=None) -> dict:
+        import json
+        if engine_id is None:
+            engine_id = self.active_probe_engine()
+        key = f"scan_candidates_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v_legacy = self.get("scan_candidates")
+            if v_legacy:
+                try:
+                    loaded = json.loads(v_legacy)
+                    if loaded.get("engine_id") in (1, None):
+                        v = v_legacy
+                except Exception:
+                    pass
         d = json.loads(v) if v else {}
-        return {"ts": d.get("ts", 0), "ips": d.get("ips", []),
+        return {"ts": d.get("ts", 0), "engine_id": d.get("engine_id", engine_id or 1),
+                "ips": d.get("ips", []),
                 "metrics": d.get("metrics", {}),
                 "controls": d.get("controls", []),
                 "tried": d.get("tried", []),
@@ -366,9 +647,9 @@ class Store:
     # Keeping the pool rather than the last scan's output is the difference
     # between "the best of the last minute" and "the best of the last six
     # hours", which is what the whole cycle is supposed to mean.
-    def pool_add(self, entries: list, keep=200):
+    def pool_add(self, entries: list, keep=200, engine_id: int = 1):
         import json, time
-        pool = self.scan_pool()
+        pool = self.scan_pool(engine_id=engine_id)
         seen = pool.get("ips") or {}
         now = int(time.time())
         for e in entries:
@@ -387,19 +668,59 @@ class Store:
         pool["ips"] = seen
         pool.setdefault("started", now)
         pool["passes"] = int(pool.get("passes") or 0) + 1
-        self.set("scan_pool", json.dumps(pool))
+        key = f"scan_pool_engine_{engine_id}"
+        self.set(key, json.dumps(pool))
+        if engine_id == 1:
+            self.set("scan_pool", json.dumps(pool))
 
-    def scan_pool(self) -> dict:
+    def scan_pool(self, engine_id: int = 1) -> dict:
         import json
-        v = self.get("scan_pool")
+        key = f"scan_pool_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("scan_pool")
         d = json.loads(v) if v else {}
         return {"started": d.get("started") or 0, "ips": d.get("ips") or {},
                 "passes": int(d.get("passes") or 0)}
 
-    def pool_reset(self):
+    def pool_reset(self, engine_id: int = 1):
         import json, time
-        self.set("scan_pool", json.dumps(
-            {"started": int(time.time()), "ips": {}, "passes": 0}))
+        payload = {"started": int(time.time()), "ips": {}, "passes": 0}
+        key = f"scan_pool_engine_{engine_id}"
+        self.set(key, json.dumps(payload))
+        if engine_id == 1:
+            self.set("scan_pool", json.dumps(payload))
+
+    # ---- head-to-head cached measurements per engine -------------------
+    def scan_h2h(self, engine_id: int = 1) -> dict:
+        import json
+        key = f"scan_h2h_engine_{engine_id}"
+        v = self.get(key)
+        if not v and engine_id == 1:
+            v = self.get("scan_h2h")
+        return json.loads(v) if v else {}
+
+    def set_scan_h2h(self, data: dict, engine_id: int = 1):
+        import json
+        key = f"scan_h2h_engine_{engine_id}"
+        self.set(key, json.dumps(data))
+        if engine_id == 1:
+            self.set("scan_h2h", json.dumps(data))
+
+    # ---- engine runtime status tracking --------------------------------
+    def engine_status(self, engine_id: int = 1) -> dict:
+        import json
+        v = self.get(f"engine_status_{engine_id}")
+        d = json.loads(v) if v else {}
+        d.setdefault("state", "idle")
+        d.setdefault("detail", "")
+        d.setdefault("ts", 0)
+        return d
+
+    def set_engine_status(self, engine_id: int, state: str, detail: str = ""):
+        import json, time
+        payload = {"state": state, "detail": detail, "ts": int(time.time())}
+        self.set(f"engine_status_{engine_id}", json.dumps(payload))
 
     # ---- addresses a phone could not reach ------------------------------
     # An operator that cuts the TLS handshake to an address leaves it looking
@@ -439,15 +760,28 @@ class Store:
         return t
 
     def save_device_report(self, device: str, operator: str, results: list,
-                           net: str = "", app: str = "", keep_devices=12):
+                           net: str = "", app: str = "", keep_devices=12,
+                           engine_id: int = 1):
         """`net` is what the phone was actually on when it measured. A round
         taken over Wi-Fi still carries the SIM's operator name, so without this
         it would pass as a measurement of that operator's route."""
         import json, time
-        all_r = self.device_reports()
+        # Per-engine report storage
+        key = f"device_reports_engine_{engine_id}"
+        eng_r = self.device_reports(engine_id=engine_id)
+        eng_r[device] = {"operator": operator, "ts": int(time.time()),
+                         "net": net, "app": app, "results": results,
+                         "engine_id": engine_id}
+        if len(eng_r) > keep_devices:
+            for k in sorted(eng_r, key=lambda k: eng_r[k]["ts"])[:-keep_devices]:
+                eng_r.pop(k, None)
+        self.set(key, json.dumps(eng_r))
+
+        # Also update global device_reports for general heartbeat and backward compatibility
+        all_r = self.device_reports(engine_id=None)
         all_r[device] = {"operator": operator, "ts": int(time.time()),
-                         "net": net, "app": app, "results": results}
-        # Keep the newest devices only, so a lost phone cannot grow this for ever.
+                         "net": net, "app": app, "results": results,
+                         "engine_id": engine_id}
         if len(all_r) > keep_devices:
             for k in sorted(all_r, key=lambda k: all_r[k]["ts"])[:-keep_devices]:
                 all_r.pop(k, None)
@@ -503,8 +837,23 @@ class Store:
     def set_probe_interval(self, hours: int):
         self.set("probe_interval", max(1, int(hours)))
 
-    def device_reports(self) -> dict:
+    def device_reports(self, engine_id: int | None = None) -> dict:
         import json
+        if engine_id is not None:
+            key = f"device_reports_engine_{engine_id}"
+            v = self.get(key)
+            if v:
+                return json.loads(v)
+            # Fallback to filtering global reports by matching candidate IPs
+            cand = self.scan_candidates(engine_id=engine_id)
+            cand_ips = set(cand.get("ips") or [])
+            global_r = json.loads(self.get("device_reports") or "{}")
+            out = {}
+            for d, rep in global_r.items():
+                rep_ips = {r.get("ip") for r in (rep.get("results") or []) if isinstance(r, dict)}
+                if rep_ips & cand_ips or rep.get("engine_id") == engine_id:
+                    out[d] = rep
+            return out
         v = self.get("device_reports")
         return json.loads(v) if v else {}
 

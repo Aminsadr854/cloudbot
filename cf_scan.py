@@ -168,11 +168,12 @@ async def stage_reachable(ips, port, timeout, concurrency, progress_every=20000)
 # --------------------------------------------------------------------------
 # stage 2: is it really a Cloudflare edge that will serve traffic
 # --------------------------------------------------------------------------
-async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=False):
-    """One HTTPS request to a named host, forced to a specific address."""
+async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None):
+    """One HTTPS request to a named host/SNI, forced to a specific address."""
     start = time.perf_counter()
+    server_name = (sni or host).strip()
     try:
-        fut = asyncio.open_connection(ip, port, ssl=TLS_CTX, server_hostname=host)
+        fut = asyncio.open_connection(ip, port, ssl=TLS_CTX, server_hostname=server_name)
         reader, writer = await asyncio.wait_for(fut, timeout=timeout)
         tls_ms = (time.perf_counter() - start) * 1000
 
@@ -197,8 +198,6 @@ async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=Fals
                 got += len(chunk)
             dl_ms = (time.perf_counter() - dl_start) * 1000
         elif want_body:
-            # The trace response is a few hundred bytes; a bounded read keeps a
-            # misbehaving peer from holding the scan open.
             raw = await asyncio.wait_for(reader.read(4096), timeout=timeout)
             body = raw.decode("latin1", "replace")
 
@@ -209,11 +208,39 @@ async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=Fals
             pass
 
         status = head.split(b" ")[1].decode() if b" " in head else "?"
+        body_lower = body.lower()
+
+        # Reject known Cloudflare edge and origin errors
+        cf_error = False
+        cf_err_code = None
+        cf_codes = ["1034", "1000", "1001", "1002", "520", "521", "522", "523", "524", "525", "526"]
+        for code in cf_codes:
+            if f"error code: {code}" in body_lower or f"errorcode: {code}" in body_lower or f"error {code}" in body_lower:
+                cf_error = True
+                cf_err_code = code
+                break
+        if not cf_error and status == "403" and ("cloudflare" in headers or "cf-ray" in headers) and "error" in body_lower:
+            cf_error = True
+            cf_err_code = "403"
+
+        is_trace = "/cdn-cgi/trace" in path
+        valid = False
+        if not cf_error:
+            if is_trace:
+                valid = ("ip=" in body and "colo=" in body) or ("server: cloudflare" in headers and status == "200")
+            elif status in ("200", "101"):
+                valid = True
+            elif status == "400" and ("sec-websocket-version" in headers or "bad request" in body_lower):
+                valid = True
+            elif status in ("204", "301", "302", "404") and not cf_error:
+                valid = True
+
         return {"tls_ms": tls_ms, "ttfb_ms": ttfb_ms, "status": status,
                 "cloudflare": ("server: cloudflare" in headers or "cf-ray" in headers),
+                "valid": valid, "cf_error": cf_error, "cf_err_code": cf_err_code,
                 "bytes": got, "dl_ms": dl_ms, "body": body}
     except Exception as e:
-        return {"error": type(e).__name__}
+        return {"error": type(e).__name__, "valid": False, "cf_error": False}
 
 
 def parse_trace(body):
@@ -236,36 +263,22 @@ def parse_trace(body):
     return out
 
 
-async def stage_edge(alive, host, port, path, timeout, concurrency):
+async def stage_edge(alive, host, port, path, timeout, concurrency, sni=None):
     """
-    Keep only addresses that give a direct, unmediated path to Cloudflare.
-
-    Every edge is asked /cdn-cgi/trace, which reports back the client address
-    Cloudflare sees. On a direct path that is this machine's own address. When
-    it is something else, the connection is being carried by an intermediary -
-    and one of those turned up ranked first on the very first scan: 14.8 ms
-    where every genuine edge measured about 80, reporting a client address
-    belonging to somebody else and a datacentre in another country. It could
-    not complete a download either.
-
-    Ranking on speed alone would put exactly that kind of address at the top,
-    which is the opposite of what a clean address means.
+    Keep only addresses that give a direct, unmediated, non-error path to Cloudflare.
     """
     sem = asyncio.Semaphore(concurrency)
     seen = []
 
     async def one(ip, tcp_ms):
         async with sem:
-            r = await http_probe(ip, host, port, path, timeout, want_body=True)
-        if "error" not in r and r["cloudflare"]:
+            r = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni)
+        if "error" not in r and r.get("valid") and not r.get("cf_error"):
             seen.append({"ip": ip, "tcp_ms": tcp_ms, **r,
                          **parse_trace(r.get("body", ""))})
 
     await asyncio.gather(*(one(ip, ms) for ip, ms in alive))
 
-    # The machine's own public address is whatever the majority of edges report,
-    # so it needs no external lookup - useful here, where reaching an IP-echo
-    # service may itself be blocked.
     reported = [d["ip_trace"] for d in seen if d.get("ip_trace")]
     my_ip = max(set(reported), key=reported.count) if reported else None
 
@@ -355,6 +368,8 @@ async def main():
     ap.add_argument("--host", default="speed.cloudflare.com",
                     help="hostname to request; use your own Cloudflare domain "
                          "to measure exactly what your users get")
+    ap.add_argument("--sni", default="",
+                    help="TLS SNI server name to send; defaults to --host if empty")
     ap.add_argument("--port", type=int, default=443)
     ap.add_argument("--path", default="/cdn-cgi/trace")
     ap.add_argument("--per-24", type=int, default=1, help="addresses sampled per /24")
@@ -408,7 +423,7 @@ async def main():
     print(f"  stage 2  confirming Cloudflare on the {len(keep)} quickest", flush=True)
     good, mediated, my_ip = await stage_edge(
         keep, args.host, args.port, args.path,
-        args.http_timeout, min(args.concurrency, 100))
+        args.http_timeout, min(args.concurrency, 100), sni=args.sni or None)
     print(f"    this machine appears to Cloudflare as {my_ip}", flush=True)
     print(f"    {len(good)} direct, {len(mediated)} reached through something else",
           flush=True)
