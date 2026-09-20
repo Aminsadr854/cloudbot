@@ -220,9 +220,23 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                 samples = float(s.get("samples", 0.0))
                 succ = float(s.get("successes", 0.0))
                 last_samp = float(s.get("last_sampled", 0.0))
+                total_samp = float(s.get("total_samples", samples))
+                total_succ = float(s.get("total_successes", succ))
                 yield_val = (succ / samples) if samples > 0 else 0.0
-                if (samples >= 3.0 and yield_val >= 0.10) or (last_samp >= stale_cutoff):
+
+                is_exploit = (samples >= 3.0 and yield_val >= 0.10)
+                is_recent = (last_samp >= stale_cutoff)
+                is_proven_dead = (total_samp >= 3.0 and total_succ == 0)
+
+                if is_exploit or is_recent:
                     filtered[p] = s
+                elif is_proven_dead:
+                    # Compact record: prefix and two numbers
+                    filtered[p] = {
+                        "samples": samples,
+                        "total_samples": total_samp,
+                        "successes": 0.0,
+                    }
             stats_to_send = filtered
             stats_json = json.dumps(stats_to_send)
         else:

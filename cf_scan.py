@@ -152,6 +152,8 @@ def candidates(ranges, per_24, seed=None, limit=0, exclude=None, prefix_stats=No
             successes = float(p_stat.get("successes", 0.0))
             score_sum = float(p_stat.get("score_sum", 0.0))
             last_sampled = float(p_stat.get("last_sampled", 0.0))
+            total_samples = float(p_stat.get("total_samples", samples))
+            total_successes = float(p_stat.get("total_successes", successes))
             yield_val = (successes / samples) if samples > 0 else 0.0
 
             if samples >= EXPLOITATION_MIN_SAMPLES and yield_val >= EXPLOITATION_MIN_YIELD:
@@ -159,6 +161,10 @@ def candidates(ranges, per_24, seed=None, limit=0, exclude=None, prefix_stats=No
                 weight = yield_val / (mean_score + 1.0)
                 exploit_candidates.append(sub)
                 exploit_weights.append(max(weight, 1e-6))
+            elif total_samples >= EXPLOITATION_MIN_SAMPLES and total_successes == 0:
+                # Proven dead prefix (tested >= 3 times with 0 successes).
+                # Must NOT be re-explored even if stale.
+                pass
             elif samples == 0 or last_sampled < stale_cutoff:
                 explore_candidates.append(sub)
 

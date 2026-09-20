@@ -1668,14 +1668,15 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         st.mark_blocked({"10.0.0.3"}, now=base_t + 30 * 3600)
         self.assertNotIn("10.0.0.3", st.blocked_ips(now=base_t + 30 * 3600))
 
-        # 5. Migration from a scalar-format old key produces one failure row per IP and no blocks, old key gone
-        st.set("blocked_ips", json.dumps({"10.0.0.4": base_t, "10.0.0.5": base_t}))
+        # 5. Migration from scalar-format and list-format old keys produces failure rows and deletes old key
+        st.set("blocked_ips", json.dumps({"10.0.0.4": base_t, "10.0.0.5": base_t, "10.0.0.6": [base_t, base_t + 10]}))
         blocked = st.blocked_ips(now=base_t)
         self.assertNotIn("10.0.0.4", blocked)
         self.assertNotIn("10.0.0.5", blocked)
+        self.assertNotIn("10.0.0.6", blocked)
         self.assertIsNone(st.get("blocked_ips"))
-        f_rows = st.con.execute("SELECT ip FROM blocked_ip_failures WHERE ip IN ('10.0.0.4', '10.0.0.5')").fetchall()
-        self.assertEqual(len(f_rows), 2)
+        f_rows = st.con.execute("SELECT ip FROM blocked_ip_failures WHERE ip IN ('10.0.0.4', '10.0.0.5', '10.0.0.6')").fetchall()
+        self.assertEqual(len(f_rows), 4)
 
     def test_d2_prefix_stats_table(self):
         st = self.st
@@ -1804,6 +1805,55 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r, ["res1"])
         self.assertEqual(t, "tail_output")
         self.assertEqual(out.prefix_stats, {"p": 1})
+
+    def test_d2_dead_prefix_exclusion_from_exploration(self):
+        import cf_scan
+        import time
+
+        now = time.time()
+        one_week_ago = now - (7 * 24 * 3600.0)
+        dead_p = "104.16.200.0/24"
+
+        # 1. Store roundtrip: prefix with 20 samples, 0 successes, aged one week
+        st = self.st
+        st.record_prefix_stats({
+            dead_p: {"samples": 20, "successes": 0, "score_sum": 0.0}
+        }, now=one_week_ago)
+        store_stats = st.get_prefix_stats(now=now)
+        self.assertIn(dead_p, store_stats)
+        self.assertEqual(store_stats[dead_p]["total_samples"], 20.0)
+        self.assertEqual(store_stats[dead_p]["total_successes"], 0.0)
+        # Decayed samples is small (~0.156) after 7 half-lives
+        self.assertLess(store_stats[dead_p]["samples"], 0.5)
+
+        # 2. Seed 120 live prefixes so cold-start (< 100) is not triggered
+        for i in range(120):
+            p = f"104.16.{i}.0/24"
+            store_stats[p] = {
+                "samples": 5.0,
+                "total_samples": 5.0,
+                "successes": 2.0,
+                "total_successes": 2.0,
+                "score_sum": 50.0,
+                "last_sampled": now,
+                "last_success": now,
+            }
+
+        ranges = ["104.16.0.0/16"]
+
+        # Run candidate sampling: dead_p must never be selected into candidate list
+        for s in range(5):
+            ips = cf_scan.candidates(ranges, per_24=1, seed=5000 + s, limit=100, prefix_stats=store_stats)
+            prefixes_chosen = {ip.rsplit(".", 1)[0] + ".0/24" for ip in ips}
+            self.assertNotIn(dead_p, prefixes_chosen, "Proven dead prefix from store_stats was sampled into exploration pool!")
+
+        # 3. Direct dictionary format (samples: 20, successes: 0, aged 1 week)
+        direct_stats = dict(store_stats)
+        direct_stats[dead_p] = {"samples": 20, "successes": 0, "last_sampled": one_week_ago}
+        for s in range(5):
+            ips = cf_scan.candidates(ranges, per_24=1, seed=6000 + s, limit=100, prefix_stats=direct_stats)
+            prefixes_chosen = {ip.rsplit(".", 1)[0] + ".0/24" for ip in ips}
+            self.assertNotIn(dead_p, prefixes_chosen, "Proven dead prefix from direct_stats was sampled into exploration pool!")
 
 
 if __name__ == "__main__":

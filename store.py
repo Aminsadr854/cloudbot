@@ -878,6 +878,8 @@ class Store:
                 "samples": decayed_samples,
                 "successes": decayed_successes,
                 "score_sum": decayed_score_sum,
+                "total_samples": float(samples or 0.0),
+                "total_successes": float(successes or 0.0),
                 "last_sampled": last_sampled,
                 "last_success": last_success,
             }
