@@ -25,6 +25,10 @@ REMOTE_OUT = "/root/cf_bot_scan"
 REMOTE_TIMEOUT = 900
 LOCAL_TIMEOUT = 960
 
+DEFAULT_CONCURRENCY = 200
+MAX_CONCURRENT_SCANS = 1
+SCAN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+
 
 class ScanTimeoutError(TimeoutError):
     pass
@@ -41,13 +45,14 @@ def _load_scanner() -> str:
 
 def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
                      final=20, host="speed.cloudflare.com", sni: str | None = None,
-                     limit=0, only=None, no_speed=False, include=None, engine_id: int = 0) -> list[str]:
+                     limit=0, only=None, no_speed=False, include=None, engine_id: int = 0,
+                     concurrency: int = DEFAULT_CONCURRENCY) -> list[str]:
     args = ["python3", remote_scanner,
             "--per-24", str(per_24),
             "--rounds", str(rounds),
             "--final", str(final),
             "--host", host,
-            "--concurrency", "500",
+            "--concurrency", str(concurrency),
             "--out", out_file]
     if engine_id:
         args += ["--engine-id", str(engine_id)]
@@ -71,7 +76,7 @@ def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
 async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                    final=20, host="speed.cloudflare.com", sni: str | None = None,
                    include=None, limit=0, only=None, no_speed=False, engine_id: int = 1,
-                   remote_out: str | None = None):
+                   remote_out: str | None = None, concurrency: int = DEFAULT_CONCURRENCY):
     """
     SSH to `ssh` (optionally via `jump`), run the scanner, return the ranked
     result list (best first). Each item: ip, rtt, jitter, loss, rtt_max, mbps.
@@ -82,100 +87,110 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
     remote_script = f"/root/.cf_scan_engine_{engine_id}.py"
     tmp_path = f"{remote_script}.tmp.{os.getpid()}"
     out_file = remote_out or (f"/root/cf_bot_scan_engine_{engine_id}" if engine_id else REMOTE_OUT)
-    conn = await tunnel.connect(ssh["host"], int(ssh.get("port", 22)),
-                                ssh["user"], ssh["password"], jump=jump)
-    try:
-        # Before starting a new scan on an engine, verify no previous cf_scan.py is
-        # still running for that engine. If one is, terminate it before starting.
-        check_cmd = f"pgrep -f {shlex.quote(remote_script)} 2>/dev/null"
-        prev_proc = await conn.run(check_cmd, check=False)
-        if prev_proc.stdout and prev_proc.stdout.strip():
-            if callable(log):
-                await log(f"اسکن قبلی موتور {engine_id} در حال اجراست؛ متوقف می‌شود…")
-            await conn.run(f"pkill -15 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
-            await asyncio.sleep(2)
-            check_still = await conn.run(check_cmd, check=False)
-            if check_still.stdout and check_still.stdout.strip():
-                await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
 
-        # Delete previous outputs for this engine only (including .tmp siblings)
-        clean_cmd = (f"rm -f {shlex.quote(out_file + '.json')} "
-                     f"{shlex.quote(out_file + '.txt')} "
-                     f"{shlex.quote(out_file + '.json.tmp')} "
-                     f"{shlex.quote(out_file + '.txt.tmp')}")
-        await conn.run(clean_cmd, check=False)
-
-        scan_start_time = int(time.time())
-
-        await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
-        script = _load_scanner()
-        # Write the scanner via SFTP to a unique temp path, then atomically rename into per-engine path
-        async with conn.start_sftp_client() as sftp:
-            async with sftp.open(tmp_path, "w") as f:
-                await f.write(script)
-        await conn.run(f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)}", check=False)
-
-        # Raise the fd limit inline: every probe in flight holds one, and the
-        # default 1024 would silently cap concurrency and lose candidates.
-        args = _build_scan_args(
-            remote_script, out_file, per_24=per_24, rounds=rounds, final=final,
-            host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include,
-            engine_id=engine_id
-        )
-        cmd = ("ulimit -n 65535 2>/dev/null; "
-               f"timeout -k 10 {REMOTE_TIMEOUT} "
-               + shlex.join(args)
-               + " 2>&1 | tail -25")
-        await log("در حال سنجش روی سرور ایران…" if only
-                  else "در حال اسکن رنج کلادفلر از داخل ایران…")
+    # Lock ordering and deadlock prevention:
+    # In ScannerEngine.scan_loop, each engine first acquires its per-engine lock (`self.lock`).
+    # Then it calls run_scan(), which acquires the global SCAN_SEMAPHORE across all engines.
+    # Because lock acquisition order is strictly:
+    #   Level 1: Per-engine lock (ScannerEngine.lock)
+    #   Level 2: Global scan semaphore (SCAN_SEMAPHORE)
+    # and SCAN_SEMAPHORE is never held while waiting to acquire self.lock,
+    # circular wait cannot occur and deadlock is impossible.
+    async with SCAN_SEMAPHORE:
+        conn = await tunnel.connect(ssh["host"], int(ssh.get("port", 22)),
+                                    ssh["user"], ssh["password"], jump=jump)
         try:
-            r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=LOCAL_TIMEOUT)
-        except (asyncio.TimeoutError, TimeoutError):
-            try:
+            # Before starting a new scan on an engine, verify no previous cf_scan.py is
+            # still running for that engine. If one is, terminate it before starting.
+            check_cmd = f"pgrep -f {shlex.quote(remote_script)} 2>/dev/null"
+            prev_proc = await conn.run(check_cmd, check=False)
+            if prev_proc.stdout and prev_proc.stdout.strip():
+                if callable(log):
+                    await log(f"اسکن قبلی موتور {engine_id} در حال اجراست؛ متوقف می‌شود…")
                 await conn.run(f"pkill -15 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
-                await asyncio.sleep(5)
-                await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
-            except Exception:
-                pass
-            raise ScanTimeoutError(f"Scan timed out after {LOCAL_TIMEOUT}s on engine {engine_id}")
+                await asyncio.sleep(2)
+                check_still = await conn.run(check_cmd, check=False)
+                if check_still.stdout and check_still.stdout.strip():
+                    await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
 
-        tail = (r.stdout or "")[-500:]
+            # Delete previous outputs for this engine only (including .tmp siblings)
+            clean_cmd = (f"rm -f {shlex.quote(out_file + '.json')} "
+                         f"{shlex.quote(out_file + '.txt')} "
+                         f"{shlex.quote(out_file + '.json.tmp')} "
+                         f"{shlex.quote(out_file + '.txt.tmp')}")
+            await conn.run(clean_cmd, check=False)
 
-        res = await conn.run(f"cat {shlex.quote(out_file + '.json')} 2>/dev/null", check=False)
-        raw = (res.stdout or "").strip()
-        if not raw:
-            if getattr(r, "exit_status", None) == 124:
-                raise ScanTimeoutError(f"Scan timed out after {REMOTE_TIMEOUT}s on engine {engine_id}.\n{tail[-300:]}")
-            raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")
+            scan_start_time = int(time.time())
 
-        payload = json.loads(raw)
-        if isinstance(payload, dict):
-            file_start = payload.get("scan_start")
-            file_engine = payload.get("engine_id")
-            if file_start is not None and file_start < (scan_start_time - 5):
-                raise StaleResultError(
-                    f"Stale scan results for engine {engine_id}: result timestamp {file_start} "
-                    f"is older than scan start {scan_start_time}"
-                )
-            if file_engine is not None and file_engine != engine_id and file_engine != 0:
-                raise StaleResultError(
-                    f"Engine ID mismatch in scan results: expected {engine_id}, got {file_engine}"
-                )
-            if payload.get("trust_store_broken"):
-                await log("هشدار: اعتبارسنجی گواهی SSL در سرور اسکنر با خطا مواجه شد (احتمال مشکل CA bundle یا ساعت سرور)")
-            data = payload.get("results", [])
-        elif isinstance(payload, list):
-            data = payload
-        else:
-            raise RuntimeError(f"Unexpected scan result format: {type(payload)}")
+            await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
+            script = _load_scanner()
+            # Write the scanner via SFTP to a unique temp path, then atomically rename into per-engine path
+            async with conn.start_sftp_client() as sftp:
+                async with sftp.open(tmp_path, "w") as f:
+                    await f.write(script)
+            await conn.run(f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)}", check=False)
 
-        # keep only genuinely usable finalists (finite rtt), best first
-        data = [d for d in data
-                if isinstance(d.get("rtt"), (int, float))
-                and math.isfinite(d["rtt"])]
-        return data, tail
-    finally:
-        conn.close()
+            # Raise the fd limit inline: every probe in flight holds one, and the
+            # default 1024 would silently cap concurrency and lose candidates.
+            args = _build_scan_args(
+                remote_script, out_file, per_24=per_24, rounds=rounds, final=final,
+                host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include,
+                engine_id=engine_id, concurrency=concurrency
+            )
+            cmd = ("ulimit -n 65535 2>/dev/null; "
+                   f"timeout -k 10 {REMOTE_TIMEOUT} "
+                   + shlex.join(args)
+                   + " 2>&1 | tail -25")
+            await log("در حال سنجش روی سرور ایران…" if only
+                      else "در حال اسکن رنج کلادفلر از داخل ایران…")
+            try:
+                r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=LOCAL_TIMEOUT)
+            except (asyncio.TimeoutError, TimeoutError):
+                try:
+                    await conn.run(f"pkill -15 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+                    await asyncio.sleep(5)
+                    await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+                except Exception:
+                    pass
+                raise ScanTimeoutError(f"Scan timed out after {LOCAL_TIMEOUT}s on engine {engine_id}")
+
+            tail = (r.stdout or "")[-500:]
+
+            res = await conn.run(f"cat {shlex.quote(out_file + '.json')} 2>/dev/null", check=False)
+            raw = (res.stdout or "").strip()
+            if not raw:
+                if getattr(r, "exit_status", None) == 124:
+                    raise ScanTimeoutError(f"Scan timed out after {REMOTE_TIMEOUT}s on engine {engine_id}.\n{tail[-300:]}")
+                raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")
+
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                file_start = payload.get("scan_start")
+                file_engine = payload.get("engine_id")
+                if file_start is not None and file_start < (scan_start_time - 5):
+                    raise StaleResultError(
+                        f"Stale scan results for engine {engine_id}: result timestamp {file_start} "
+                        f"is older than scan start {scan_start_time}"
+                    )
+                if file_engine is not None and file_engine != engine_id and file_engine != 0:
+                    raise StaleResultError(
+                        f"Engine ID mismatch in scan results: expected {engine_id}, got {file_engine}"
+                    )
+                if payload.get("trust_store_broken"):
+                    await log("هشدار: اعتبارسنجی گواهی SSL در سرور اسکنر با خطا مواجه شد (احتمال مشکل CA bundle یا ساعت سرور)")
+                data = payload.get("results", [])
+            elif isinstance(payload, list):
+                data = payload
+            else:
+                raise RuntimeError(f"Unexpected scan result format: {type(payload)}")
+
+            # keep only genuinely usable finalists (finite rtt), best first
+            data = [d for d in data
+                    if isinstance(d.get("rtt"), (int, float))
+                    and math.isfinite(d["rtt"])]
+            return data, tail
+        finally:
+            conn.close()
 
 
 def is_better(candidate: dict, current_ip: str | None, current: dict | None,

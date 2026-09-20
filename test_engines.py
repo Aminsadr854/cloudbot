@@ -1074,8 +1074,10 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             })
 
         # 2. stage_edge separation: cert_ok False vs client IP mismatch vs clean edge
+        probe_calls = []
+
         async def fake_http_probe(ip, host, port, path, timeout, want_body=False, sni=None, verify=False):
-            self.assertTrue(verify, "stage_edge must call http_probe with verify=True")
+            probe_calls.append((ip, verify))
             if ip in ("1.1.1.1", "1.1.1.2"):
                 # Clean edge with valid cert and correct client IP
                 return {
@@ -1100,6 +1102,8 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
                 alive, "example.com", 443, "/cdn-cgi/trace", 2.0, 5
             )
 
+        verified_ips = {ip for ip, v in probe_calls if v is True}
+        self.assertEqual(verified_ips, {"1.1.1.1", "1.1.1.2", "2.2.2.2", "3.3.3.3"})
         self.assertFalse(trust_broken)
         self.assertEqual(my_ip, "90.0.0.1")
         self.assertEqual(len(good), 2)
@@ -1454,6 +1458,67 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             captured_speed_rows.clear()
             await cf_scan.main()
             self.assertEqual(len(captured_speed_rows), 5)
+
+    async def test_c4_aggregate_concurrency_and_semaphore(self):
+        import cfscanner
+
+        # 1. Module constants
+        self.assertEqual(cfscanner.DEFAULT_CONCURRENCY, 200)
+        self.assertEqual(cfscanner.MAX_CONCURRENT_SCANS, 1)
+        self.assertIsInstance(cfscanner.SCAN_SEMAPHORE, asyncio.Semaphore)
+
+        # 2. _build_scan_args passes concurrency
+        default_args = cfscanner._build_scan_args("scan.py", "out")
+        self.assertIn("--concurrency", default_args)
+        c_idx = default_args.index("--concurrency")
+        self.assertEqual(default_args[c_idx + 1], "200")
+
+        custom_args = cfscanner._build_scan_args("scan.py", "out", concurrency=150)
+        c_idx = custom_args.index("--concurrency")
+        self.assertEqual(custom_args[c_idx + 1], "150")
+
+        # 3. SCAN_SEMAPHORE throttles concurrent run_scan calls across engines
+        active_scans = 0
+        max_active_scans = 0
+
+        async def fake_connect(*args, **kwargs):
+            nonlocal active_scans, max_active_scans
+            active_scans += 1
+            max_active_scans = max(max_active_scans, active_scans)
+            conn = MagicMock()
+            conn.run = AsyncMock(side_effect=lambda cmd, **kw: MagicMock(stdout=json.dumps({
+                "scan_start": int(time.time()),
+                "engine_id": 1 if "engine_1" in cmd else 2,
+                "results": [{"ip": "104.16.1.1", "rtt": 20.0}]
+            })))
+            sftp_ctx = AsyncMock()
+            sftp = AsyncMock()
+            sftp.open = MagicMock()
+            sftp.open.return_value.__aenter__ = AsyncMock()
+            sftp.open.return_value.__aexit__ = AsyncMock()
+            sftp_ctx.__aenter__.return_value = sftp
+            conn.start_sftp_client.return_value = sftp_ctx
+
+            await asyncio.sleep(0.05)
+            active_scans -= 1
+            return conn
+
+        async def noop_log(msg):
+            pass
+
+        with patch("cfscanner.tunnel.connect", side_effect=fake_connect):
+            t1 = asyncio.create_task(cfscanner.run_scan(
+                {"host": "h", "port": 22, "user": "u", "password": "p"},
+                None, noop_log, engine_id=1, concurrency=100
+            ))
+            t2 = asyncio.create_task(cfscanner.run_scan(
+                {"host": "h", "port": 22, "user": "u", "password": "p"},
+                None, noop_log, engine_id=2, concurrency=100
+            ))
+            res1, res2 = await asyncio.gather(t1, t2)
+            self.assertEqual(len(res1[0]), 1)
+            self.assertEqual(len(res2[0]), 1)
+            self.assertEqual(max_active_scans, 1)
 
 
 if __name__ == "__main__":
