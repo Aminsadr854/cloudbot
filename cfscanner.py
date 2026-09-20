@@ -161,6 +161,8 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                 raise StaleResultError(
                     f"Engine ID mismatch in scan results: expected {engine_id}, got {file_engine}"
                 )
+            if payload.get("trust_store_broken"):
+                await log("هشدار: اعتبارسنجی گواهی SSL در سرور اسکنر با خطا مواجه شد (احتمال مشکل CA bundle یا ساعت سرور)")
             data = payload.get("results", [])
         elif isinstance(payload, list):
             data = payload

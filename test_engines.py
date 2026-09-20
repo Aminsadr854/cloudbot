@@ -3,8 +3,10 @@ Unit and integration test suite for 3-engine Cloudflare IP scanner.
 Verifies Tests A through L as required by the specification.
 """
 import asyncio
+import io
 import json
 import os
+import signal
 import sys
 import tempfile
 import time
@@ -1094,10 +1096,11 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
 
         alive = [("1.1.1.1", 10.0), ("1.1.1.2", 11.0), ("2.2.2.2", 12.0), ("3.3.3.3", 15.0)]
         with patch("cf_scan.http_probe", side_effect=fake_http_probe):
-            good, mediated, my_ip = await cf_scan.stage_edge(
+            good, mediated, my_ip, trust_broken = await cf_scan.stage_edge(
                 alive, "example.com", 443, "/cdn-cgi/trace", 2.0, 5
             )
 
+        self.assertFalse(trust_broken)
         self.assertEqual(my_ip, "90.0.0.1")
         self.assertEqual(len(good), 2)
         self.assertEqual(good[0]["ip"], "1.1.1.1")
@@ -1229,6 +1232,134 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("2.2.2.2", alive_dict)
         self.assertEqual(alive_dict["2.2.2.2"], 25.0)
         self.assertNotIn("3.3.3.3", alive_dict)
+
+    # Test B7: Local trust store failure (>90% cert fail) fallback and surfacing
+    async def test_b7_detect_local_trust_store_failure(self):
+        import cf_scan
+
+        # All 5 addresses fail cert verification, but succeed with permissive probe
+        async def mock_http_probe(ip, host, port, path, timeout, want_body=False, sni=None, verify=False):
+            if verify:
+                return {"error": "CertVerify", "valid": False, "cf_error": False, "cert_ok": False}
+            else:
+                return {
+                    "valid": True, "cf_error": False, "cert_ok": False, "ttfb_ms": 28.0,
+                    "body": "ip=90.0.0.1\ncolo=DUS\nloc=DE\n"
+                }
+
+        alive = [("104.16.1." + str(i), 20.0 + i) for i in range(5)]
+        with patch("cf_scan.http_probe", side_effect=mock_http_probe), \
+             patch("sys.stderr", new=io.StringIO()) as fake_stderr:
+            good, mediated, my_ip, trust_broken = await cf_scan.stage_edge(
+                alive, "example.com", 443, "/cdn-cgi/trace", 2.0, 5
+            )
+
+        self.assertTrue(trust_broken)
+        # Warning logged naming CA bundle, clock, certificate chain
+        stderr_val = fake_stderr.getvalue()
+        self.assertIn("trust store failure", stderr_val)
+        self.assertIn("CA bundle", stderr_val)
+        self.assertIn("clock", stderr_val)
+        self.assertIn("certificate chain", stderr_val)
+
+        # Candidates accepted with cert_ok=False
+        self.assertEqual(len(good), 5)
+        for d in good:
+            self.assertFalse(d["cert_ok"])
+
+        # write_results records trust_store_broken: True in json
+        with tempfile.TemporaryDirectory() as td:
+            out_base = os.path.join(td, "scan_out")
+            cf_scan.write_results(good, out_base, trust_store_broken=trust_broken)
+            with open(out_base + ".json") as f:
+                payload = json.load(f)
+            self.assertTrue(payload["trust_store_broken"])
+            self.assertEqual(len(payload["results"]), 5)
+
+        # cfscanner.run_scan logs warning when trust_store_broken is True
+        mock_conn = MagicMock()
+        mock_sftp = AsyncMock()
+        mock_file = AsyncMock()
+        mock_sftp.open = MagicMock(return_value=mock_file)
+        mock_file.__aenter__ = AsyncMock(return_value=mock_file)
+        mock_file.__aexit__ = AsyncMock(return_value=None)
+        mock_sftp.__aenter__ = AsyncMock(return_value=mock_sftp)
+        mock_sftp.__aexit__ = AsyncMock(return_value=None)
+        mock_conn.start_sftp_client = MagicMock(return_value=mock_sftp)
+
+        async def mock_run(cmd, check=False):
+            res = MagicMock()
+            if "cat " in cmd:
+                res.stdout = json.dumps({
+                    "scan_start": int(time.time()),
+                    "engine_id": 1,
+                    "trust_store_broken": True,
+                    "results": [{"ip": "104.16.1.1", "rtt": 25.0}]
+                })
+            else:
+                res.stdout = ""
+            res.exit_status = 0
+            return res
+
+        mock_conn.run = AsyncMock(side_effect=mock_run)
+        log_mock = AsyncMock()
+        with patch("cfscanner.tunnel.connect", AsyncMock(return_value=mock_conn)), \
+             patch("asyncio.sleep", AsyncMock()):
+            data, _ = await cfscanner.run_scan(
+                {"host": "remote.ir", "user": "root", "password": "p"},
+                jump=None, log=log_mock, engine_id=1
+            )
+            self.assertEqual(len(data), 1)
+            self.assertTrue(any("اعتبارسنجی گواهی SSL" in call[0][0] for call in log_mock.call_args_list))
+
+    # Test A7 coverage: partial write from stage-1 tuples, stage-3 data, and signal handler
+    async def test_a7_partial_results_coverage(self):
+        import cf_scan
+
+        # 1. Stage-1 partial write from tuples (ip, ms) converted to dicts
+        alive_tuples = [("104.16.1.10", 25.0), ("104.16.1.11", 30.0)]
+        stage1_candidates = [{"ip": r[0], "rtt": r[1], "jitter": 0.0, "loss": 0.0} for r in alive_tuples]
+        with tempfile.TemporaryDirectory() as td:
+            out_base = os.path.join(td, "stage1_out")
+            cf_scan.write_results(stage1_candidates, out_base)
+            with open(out_base + ".json") as f:
+                p = json.load(f)
+            self.assertEqual(len(p["results"]), 2)
+            self.assertEqual(p["results"][0]["ip"], "104.16.1.10")
+            self.assertEqual(p["results"][0]["rtt"], 25.0)
+
+        # 2. Stage-3 checkpoint partial write
+        stage3_candidates = [
+            {"ip": "104.16.1.10", "rtt": 24.5, "jitter": 1.2, "loss": 0.0, "tls_loss": 0.0}
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            out_base = os.path.join(td, "stage3_out")
+            cf_scan.write_results(stage3_candidates, out_base)
+            with open(out_base + ".json") as f:
+                p = json.load(f)
+            self.assertEqual(len(p["results"]), 1)
+            self.assertEqual(p["results"][0]["jitter"], 1.2)
+
+        # 3. SIGTERM signal handler writes current candidates and exits
+        with tempfile.TemporaryDirectory() as td:
+            out_base = os.path.join(td, "sigterm_out")
+            test_candidates = [{"ip": "104.16.1.20", "rtt": 22.0, "loss": 0.0}]
+
+            def make_handler(candidates, out_path):
+                def sigterm_handler(signum, frame):
+                    if candidates:
+                        cf_scan.write_results(candidates, out_path, scan_start=100.0, engine_id=1)
+                    sys.exit(0)
+                return sigterm_handler
+
+            handler = make_handler(test_candidates, out_base)
+            with self.assertRaises(SystemExit) as cm:
+                handler(signal.SIGTERM, None)
+            self.assertEqual(cm.exception.code, 0)
+            with open(out_base + ".json") as f:
+                p = json.load(f)
+            self.assertEqual(len(p["results"]), 1)
+            self.assertEqual(p["results"][0]["ip"], "104.16.1.20")
 
 
 if __name__ == "__main__":

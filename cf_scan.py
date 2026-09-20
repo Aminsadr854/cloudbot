@@ -315,30 +315,58 @@ async def stage_edge(alive, host, port, path, timeout, concurrency, sni=None):
     async def one(ip, tcp_ms):
         async with sem:
             r = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni, verify=True)
-        if r.get("cert_ok") is False:
-            cert_failed.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": False,
-                                "reason": "certificate verification failed", **r})
-        elif "error" not in r and r.get("valid") and not r.get("cf_error"):
-            seen.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": True, **r,
-                         **parse_trace(r.get("body", ""))})
+            if r.get("cert_ok") is False:
+                # Probe permissively to see if the address otherwise responds correctly
+                r_fallback = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni, verify=False)
+                if "error" not in r_fallback and r_fallback.get("valid") and not r_fallback.get("cf_error"):
+                    cert_failed.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": False,
+                                        "reason": "certificate verification failed", **r_fallback,
+                                        **parse_trace(r_fallback.get("body", ""))})
+                else:
+                    cert_failed.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": False,
+                                        "reason": "certificate verification failed", **r})
+            elif "error" not in r and r.get("valid") and not r.get("cf_error"):
+                seen.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": True, **r,
+                             **parse_trace(r.get("body", ""))})
 
     await asyncio.gather(*(one(ip, ms) for ip, ms in alive))
 
-    reported = [d["ip_trace"] for d in seen if d.get("ip_trace")]
+    # Sanity check: if certificate verification failed for >90% of responsive addresses,
+    # it indicates a local trust store failure (bad CA bundle, clock skew, unusual chain).
+    responsive_cert_failed = [d for d in cert_failed if d.get("valid") and not d.get("cf_error")]
+    total_responsive = len(seen) + len(responsive_cert_failed)
+    trust_store_broken = False
+    if total_responsive > 0 and (len(responsive_cert_failed) / total_responsive) > 0.90:
+        trust_store_broken = True
+        print(
+            "\n  [WARNING] Local trust store failure detected! Over 90% of responsive addresses failed\n"
+            "  certificate verification. Likely causes: outdated CA bundle, incorrect system clock, or\n"
+            "  an unusual domain certificate chain. Falling back to accepting candidates with cert_ok=False.\n",
+            file=sys.stderr, flush=True
+        )
+
+    if trust_store_broken:
+        candidates_to_check = seen + responsive_cert_failed
+        other_cert_failed = [d for d in cert_failed if d not in responsive_cert_failed]
+    else:
+        candidates_to_check = seen
+        other_cert_failed = cert_failed
+
+    reported = [d["ip_trace"] for d in candidates_to_check if d.get("ip_trace")]
     my_ip = max(set(reported), key=reported.count) if reported else None
 
     good, mediated = [], []
-    for d in cert_failed:
+    for d in other_cert_failed:
         mediated.append(d)
 
-    for d in seen:
+    for d in candidates_to_check:
         if my_ip and d.get("ip_trace") and d["ip_trace"] != my_ip:
             d["reason"] = f"seen as {d.get('ip_trace')} via {d.get('colo', '?')}/{d.get('loc', '?')}"
             mediated.append(d)
         else:
             good.append(d)
     good.sort(key=lambda d: d["ttfb_ms"])
-    return good, mediated, my_ip
+    return good, mediated, my_ip, trust_store_broken
 
 
 # --------------------------------------------------------------------------
@@ -441,7 +469,8 @@ def score(row):
 _write_lock = False
 
 
-def write_results(rows: list[dict], out_base: str, scan_start: float | None = None, engine_id: int = 0):
+def write_results(rows: list[dict], out_base: str, scan_start: float | None = None, engine_id: int = 0,
+                  trust_store_broken: bool = False):
     """
     Write ranked candidates to out_base.json and out_base.txt atomically.
     Guarded against signal handler re-entrancy.
@@ -453,16 +482,24 @@ def write_results(rows: list[dict], out_base: str, scan_start: float | None = No
     try:
         if not rows:
             return
-        valid_rows = [
-            r for r in rows
-            if isinstance(r, dict) and r.get("ip") and r.get("rtt") is not None and math.isfinite(r["rtt"])
-        ]
+        valid_rows = []
+        for r in rows:
+            if not isinstance(r, dict) or not r.get("ip"):
+                continue
+            rtt = r.get("rtt")
+            if rtt is None and r.get("tcp_ms") is not None:
+                rtt = r["tcp_ms"]
+            if rtt is not None and math.isfinite(rtt):
+                row_copy = dict(r)
+                row_copy.setdefault("rtt", rtt)
+                valid_rows.append(row_copy)
         if not valid_rows:
             return
 
         payload = {
             "scan_start": int(scan_start) if scan_start is not None else int(time.time()),
             "engine_id": int(engine_id),
+            "trust_store_broken": bool(trust_store_broken),
             "results": valid_rows,
         }
 
@@ -520,11 +557,13 @@ async def main():
     t0 = time.time()
     current_candidates: list[dict] = []
     current_out: str = args.out
+    current_trust_store_broken: bool = False
 
     def sigterm_handler(signum, frame):
         if current_candidates:
             print("\n  SIGTERM received; saving partial results...", file=sys.stderr, flush=True)
-            write_results(current_candidates, current_out, scan_start=t0, engine_id=args.engine_id)
+            write_results(current_candidates, current_out, scan_start=t0, engine_id=args.engine_id,
+                          trust_store_broken=current_trust_store_broken)
         sys.exit(0)
 
     if hasattr(signal, "SIGTERM"):
@@ -562,9 +601,10 @@ async def main():
 
     keep = alive if only else _pin(alive[:max(args.edge_keep * 4, 400)], alive, pinned)
     print(f"  stage 2  confirming Cloudflare on the {len(keep)} quickest", flush=True)
-    good, mediated, my_ip = await stage_edge(
+    good, mediated, my_ip, trust_store_broken = await stage_edge(
         keep, args.host, args.port, args.path,
         args.http_timeout, min(args.concurrency, 100), sni=args.sni or None)
+    current_trust_store_broken = trust_store_broken
     print(f"    this machine appears to Cloudflare as {my_ip}", flush=True)
     print(f"    {len(good)} direct, {len(mediated)} reached through something else",
           flush=True)
@@ -592,7 +632,8 @@ async def main():
     current_candidates = list(finalists)
 
     # Stage 3 checkpoint: write partial results immediately before stage 4 starts
-    write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id)
+    write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id,
+                  trust_store_broken=trust_store_broken)
 
     if not args.no_speed:
         top = finalists if only else _pin(finalists[:args.final], finalists, pinned)
@@ -623,7 +664,8 @@ async def main():
         print(f"  {i:<4}{r['ip']:<17}{rtt_s}{jit_s}{loss_s}{tls_loss_s}{ratio_s}{max_s}{speed:>11}   "
               f"{r.get('colo', '?')}")
 
-    write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id)
+    write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id,
+                  trust_store_broken=trust_store_broken)
     print(f"\n  full results: {args.out}.json")
     print(f"  loss-free addresses only: {args.out}.txt")
     print(f"  took {time.time() - t0:.0f}s")
