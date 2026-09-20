@@ -101,14 +101,19 @@ def cloudflare_ranges(ranges_file=None):
     return [l.strip() for l in CF_V4_FALLBACK.splitlines() if l.strip()]
 
 
-def candidates(ranges, per_24, seed=None, limit=0, exclude=None):
+EXPLOITATION_FRACTION = 0.70
+EXPLORATION_FRACTION = 0.30
+EXPLOITATION_MIN_YIELD = 0.10      # lowered from 0.50
+EXPLOITATION_MIN_SAMPLES = 3.0
+COLD_START_MIN_PREFIXES = 100
+EXPLORATION_STALE_HOURS = 48
+
+
+def candidates(ranges, per_24, seed=None, limit=0, exclude=None, prefix_stats=None):
     """
     Sample addresses spread across every /24 rather than taken at random.
-
-    Cloudflare assigns whole /24s to a site, so addresses inside one behave
-    alike while neighbouring blocks can route through entirely different
-    cities. Random sampling across the whole space would test one block
-    repeatedly and miss others completely.
+    Biased toward productive prefixes if prefix_stats is provided (70/30 exploitation/exploration).
+    Falls back to uniform sampling on cold start (< COLD_START_MIN_PREFIXES).
     """
     rng = random.Random(seed)
     exclude_set = set(exclude) if exclude else None
@@ -122,11 +127,63 @@ def candidates(ranges, per_24, seed=None, limit=0, exclude=None):
         else:
             subnets.append(net)
 
-    if limit > 0:
-        rng.shuffle(subnets)
+    now = time.time()
+    stats = prefix_stats or {}
+
+    # Check cold start: fewer than COLD_START_MIN_PREFIXES rows -> 100% exploration (uniform random)
+    if len(stats) < COLD_START_MIN_PREFIXES:
+        if limit > 0:
+            rng.shuffle(subnets)
+        ordered_subnets = subnets
+    else:
+        exploit_candidates = []
+        exploit_weights = []
+        explore_candidates = []
+        stale_cutoff = now - (EXPLORATION_STALE_HOURS * 3600.0)
+
+        for sub in subnets:
+            p = str(sub)
+            p_stat = stats.get(p)
+            if not p_stat:
+                explore_candidates.append(sub)
+                continue
+
+            samples = float(p_stat.get("samples", 0.0))
+            successes = float(p_stat.get("successes", 0.0))
+            score_sum = float(p_stat.get("score_sum", 0.0))
+            last_sampled = float(p_stat.get("last_sampled", 0.0))
+            yield_val = (successes / samples) if samples > 0 else 0.0
+
+            if samples >= EXPLOITATION_MIN_SAMPLES and yield_val >= EXPLOITATION_MIN_YIELD:
+                mean_score = (score_sum / successes) if successes > 0 else 0.0
+                weight = yield_val / (mean_score + 1.0)
+                exploit_candidates.append(sub)
+                exploit_weights.append(max(weight, 1e-6))
+            elif samples == 0 or last_sampled < stale_cutoff:
+                explore_candidates.append(sub)
+
+        num_needed = math.ceil(limit / per_24) if (limit > 0 and per_24 > 0) else len(subnets)
+        k_exploit = min(len(exploit_candidates), int(num_needed * EXPLOITATION_FRACTION))
+        k_explore = num_needed - k_exploit
+
+        chosen_subnets = []
+        if k_exploit > 0 and exploit_candidates:
+            keys = [rng.random() ** (1.0 / w) for w in exploit_weights]
+            sorted_indices = sorted(range(len(exploit_candidates)), key=lambda i: keys[i], reverse=True)
+            for idx in sorted_indices[:k_exploit]:
+                chosen_subnets.append(exploit_candidates[idx])
+
+        if k_explore > 0 and explore_candidates:
+            k_exp = min(k_explore, len(explore_candidates))
+            chosen_subnets.extend(rng.sample(explore_candidates, k_exp))
+
+        chosen_set = set(chosen_subnets)
+        remaining = [s for s in subnets if s not in chosen_set]
+        rng.shuffle(remaining)
+        ordered_subnets = chosen_subnets + remaining
 
     out = []
-    for sub in subnets:
+    for sub in ordered_subnets:
         base = int(sub.network_address)
         num_avail = 254 if sub.prefixlen == 24 else max(0, sub.num_addresses - 2)
         if num_avail <= 0:
@@ -536,7 +593,7 @@ _write_lock = False
 
 
 def write_results(rows: list[dict], out_base: str, scan_start: float | None = None, engine_id: int = 0,
-                  trust_store_broken: bool = False):
+                  trust_store_broken: bool = False, prefix_stats: dict | None = None):
     """
     Write ranked candidates to out_base.json and out_base.txt atomically.
     Guarded against signal handler re-entrancy.
@@ -567,6 +624,7 @@ def write_results(rows: list[dict], out_base: str, scan_start: float | None = No
             "engine_id": int(engine_id),
             "trust_store_broken": bool(trust_store_broken),
             "results": valid_rows,
+            "prefix_stats": prefix_stats or {},
         }
 
         tmp_json = f"{out_base}.json.tmp"
@@ -626,18 +684,21 @@ async def main():
                     help="comma-separated addresses to exclude from scanning")
     ap.add_argument("--exclude-file", default="",
                     help="path to local file containing addresses to exclude")
+    ap.add_argument("--prefix-stats-file", default="",
+                    help="path to local JSON file containing prefix statistics")
     args = ap.parse_args()
 
     t0 = time.time()
     current_candidates: list[dict] = []
     current_out: str = args.out
     current_trust_store_broken: bool = False
+    current_prefix_stats: dict[str, dict] = {}
 
     def sigterm_handler(signum, frame):
         if current_candidates:
             print("\n  SIGTERM received; saving partial results...", file=sys.stderr, flush=True)
             write_results(current_candidates, current_out, scan_start=t0, engine_id=args.engine_id,
-                          trust_store_broken=current_trust_store_broken)
+                          trust_store_broken=current_trust_store_broken, prefix_stats=current_prefix_stats)
         sys.exit(0)
 
     if hasattr(signal, "SIGTERM"):
@@ -655,13 +716,22 @@ async def main():
         except Exception as e:
             print(f"  (could not read exclude file {args.exclude_file}: {e})", file=sys.stderr)
 
+    prefix_stats = {}
+    if args.prefix_stats_file:
+        try:
+            with open(args.prefix_stats_file) as f:
+                prefix_stats = json.load(f)
+        except Exception as e:
+            print(f"  (could not read prefix stats file {args.prefix_stats_file}: {e}; falling back to uniform sampling)", file=sys.stderr)
+            prefix_stats = {}
+
     only = [x.strip() for x in args.only.split(",") if x.strip()]
     if only:
         ranges, ips = [], only
         print(f"  measuring a fixed list of {len(ips)} address(es)", flush=True)
     else:
         ranges = cloudflare_ranges(args.ranges_file)
-        ips = candidates(ranges, args.per_24, args.seed, limit=args.limit, exclude=exclude)
+        ips = candidates(ranges, args.per_24, args.seed, limit=args.limit, exclude=exclude, prefix_stats=prefix_stats)
     pinned = {ip.strip() for ip in args.include.split(",") if ip.strip()}
     if pinned:
         ips = list(pinned) + [i for i in ips if i not in pinned]
@@ -669,6 +739,12 @@ async def main():
               flush=True)
     if not only:
         print(f"  ranges: {len(ranges)}   candidates: {len(ips)}", flush=True)
+
+    for ip in ips:
+        p = ip.rsplit(".", 1)[0] + ".0/24"
+        if p not in current_prefix_stats:
+            current_prefix_stats[p] = {"samples": 0.0, "successes": 0.0, "score_sum": 0.0}
+        current_prefix_stats[p]["samples"] += 1.0
 
     print("  stage 1  reachable", flush=True)
     progress_every = max(1, len(ips) // 10)
@@ -703,6 +779,14 @@ async def main():
         print("  none served a Cloudflare response - the TLS path is likely interfered with.")
         return
 
+    for d in good:
+        ip = d.get("ip")
+        if ip:
+            p = ip.rsplit(".", 1)[0] + ".0/24"
+            if p not in current_prefix_stats:
+                current_prefix_stats[p] = {"samples": 0.0, "successes": 0.0, "score_sum": 0.0}
+            current_prefix_stats[p]["successes"] += 1.0
+
     current_candidates = list(good)
 
     finalists = good if only else _pin(good[:args.edge_keep], good, pinned)
@@ -715,9 +799,19 @@ async def main():
     finalists.sort(key=score)
     current_candidates = list(finalists)
 
+    for d in finalists:
+        ip = d.get("ip")
+        if ip:
+            p = ip.rsplit(".", 1)[0] + ".0/24"
+            s_val = score(d)
+            if math.isfinite(s_val):
+                if p not in current_prefix_stats:
+                    current_prefix_stats[p] = {"samples": 0.0, "successes": 0.0, "score_sum": 0.0}
+                current_prefix_stats[p]["score_sum"] += s_val
+
     # Stage 3 checkpoint: write partial results immediately before stage 4 starts
     write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id,
-                  trust_store_broken=trust_store_broken)
+                  trust_store_broken=trust_store_broken, prefix_stats=current_prefix_stats)
 
     if not args.no_speed:
         top = finalists if only else _pin(finalists[:args.final], finalists, pinned)
@@ -753,7 +847,7 @@ async def main():
               f"{r.get('colo', '?')}")
 
     write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id,
-                  trust_store_broken=trust_store_broken)
+                  trust_store_broken=trust_store_broken, prefix_stats=current_prefix_stats)
     print(f"\n  full results: {args.out}.json")
     print(f"  loss-free addresses only: {args.out}.txt")
     print(f"  took {time.time() - t0:.0f}s")

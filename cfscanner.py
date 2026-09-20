@@ -41,6 +41,15 @@ class StaleResultError(RuntimeError):
     pass
 
 
+class ScanOutput(tuple):
+    prefix_stats: dict
+
+    def __new__(cls, data, tail, prefix_stats=None):
+        inst = super().__new__(cls, (data, tail))
+        inst.prefix_stats = prefix_stats or {}
+        return inst
+
+
 import urllib.request
 
 RANGES_CACHE_FILE = os.path.join(os.path.dirname(__file__), ".cf_ranges_cache.txt")
@@ -132,7 +141,8 @@ def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
                      limit=0, only=None, no_speed=False, include=None, engine_id: int = 0,
                      concurrency: int = DEFAULT_CONCURRENCY,
                      ranges_file: str | None = None,
-                     exclude=None, exclude_file: str | None = None) -> list[str]:
+                     exclude=None, exclude_file: str | None = None,
+                     prefix_stats_file: str | None = None) -> list[str]:
     args = ["python3", remote_scanner,
             "--per-24", str(per_24),
             "--rounds", str(rounds),
@@ -150,6 +160,8 @@ def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
         args += ["--ranges-file", ranges_file]
     if exclude_file:
         args += ["--exclude-file", exclude_file]
+    if prefix_stats_file:
+        args += ["--prefix-stats-file", prefix_stats_file]
     if exclude:
         safe_exc = [i for i in exclude if all(ch in "0123456789." for ch in i)]
         if safe_exc:
@@ -171,7 +183,7 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                    final=20, host="speed.cloudflare.com", sni: str | None = None,
                    include=None, limit=0, only=None, no_speed=False, engine_id: int = 1,
                    remote_out: str | None = None, concurrency: int = DEFAULT_CONCURRENCY,
-                   exclude=None):
+                   exclude=None, prefix_stats: dict | None = None):
     """
     SSH to `ssh` (optionally via `jump`), run the scanner, return the ranked
     result list (best first). Each item: ip, rtt, jitter, loss, rtt_max, mbps.
@@ -194,6 +206,29 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
         tmp_exclude_path = f"{remote_exclude_file}.tmp.{os.getpid()}"
     elif safe_exclude:
         exclude_inline = safe_exclude
+
+    remote_stats_file = None
+    tmp_stats_path = None
+    stats_json = None
+    if prefix_stats:
+        stats_to_send = prefix_stats
+        raw_bytes = json.dumps(stats_to_send).encode()
+        if len(raw_bytes) > 500 * 1024:
+            filtered = {}
+            stale_cutoff = time.time() - (48 * 3600.0)
+            for p, s in stats_to_send.items():
+                samples = float(s.get("samples", 0.0))
+                succ = float(s.get("successes", 0.0))
+                last_samp = float(s.get("last_sampled", 0.0))
+                yield_val = (succ / samples) if samples > 0 else 0.0
+                if (samples >= 3.0 and yield_val >= 0.10) or (last_samp >= stale_cutoff):
+                    filtered[p] = s
+            stats_to_send = filtered
+            stats_json = json.dumps(stats_to_send)
+        else:
+            stats_json = raw_bytes.decode()
+        remote_stats_file = f"/root/.cf_prefix_stats_engine_{engine_id}.json"
+        tmp_stats_path = f"{remote_stats_file}.tmp.{os.getpid()}"
 
     # Lock ordering and deadlock prevention:
     # In ScannerEngine.scan_loop, each engine first acquires its per-engine lock (`self.lock`).
@@ -220,19 +255,13 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                 if check_still.stdout and check_still.stdout.strip():
                     await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
 
-            # Delete previous outputs for this engine only (including .tmp siblings)
-            clean_cmd = (f"rm -f {shlex.quote(out_file + '.json')} "
-                         f"{shlex.quote(out_file + '.txt')} "
-                         f"{shlex.quote(out_file + '.json.tmp')} "
-                         f"{shlex.quote(out_file + '.txt.tmp')}")
-            await conn.run(clean_cmd, check=False)
-
-            scan_start_time = int(time.time())
+            scan_start_time = time.time()
+            await conn.run(f"rm -f {shlex.quote(out_file + '.json')} {shlex.quote(out_file + '.txt')}", check=False)
 
             await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
             script = _load_scanner()
             ranges_content = _get_cached_ranges()
-            # Write scanner, cached ranges, and optional exclude file via SFTP to unique temp paths, then atomically rename
+            # Write scanner, cached ranges, and optional exclude / stats files via SFTP to unique temp paths, then atomically rename
             async with conn.start_sftp_client() as sftp:
                 async with sftp.open(tmp_path, "w") as f:
                     await f.write(script)
@@ -241,11 +270,16 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                 if remote_exclude_file and tmp_exclude_path:
                     async with sftp.open(tmp_exclude_path, "w") as f:
                         await f.write("\n".join(safe_exclude) + "\n")
+                if remote_stats_file and tmp_stats_path and stats_json:
+                    async with sftp.open(tmp_stats_path, "w") as f:
+                        await f.write(stats_json + "\n")
 
             rename_cmd = (f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)} && "
                           f"mv {shlex.quote(tmp_ranges_path)} {shlex.quote(remote_ranges_file)}")
             if remote_exclude_file and tmp_exclude_path:
                 rename_cmd += f" && mv {shlex.quote(tmp_exclude_path)} {shlex.quote(remote_exclude_file)}"
+            if remote_stats_file and tmp_stats_path:
+                rename_cmd += f" && mv {shlex.quote(tmp_stats_path)} {shlex.quote(remote_stats_file)}"
             await conn.run(rename_cmd, check=False)
 
             # Raise the fd limit inline: every probe in flight holds one, and the
@@ -254,7 +288,8 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                 remote_script, out_file, per_24=per_24, rounds=rounds, final=final,
                 host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include,
                 engine_id=engine_id, concurrency=concurrency, ranges_file=remote_ranges_file,
-                exclude=exclude_inline, exclude_file=remote_exclude_file
+                exclude=exclude_inline, exclude_file=remote_exclude_file,
+                prefix_stats_file=remote_stats_file
             )
             cmd = ("ulimit -n 65535 2>/dev/null; "
                    f"timeout -k 10 {REMOTE_TIMEOUT} "
@@ -307,7 +342,8 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
             data = [d for d in data
                     if isinstance(d.get("rtt"), (int, float))
                     and math.isfinite(d["rtt"])]
-            return data, tail
+            returned_prefix_stats = payload.get("prefix_stats", {}) if isinstance(payload, dict) else {}
+            return ScanOutput(data, tail, prefix_stats=returned_prefix_stats)
         finally:
             conn.close()
 

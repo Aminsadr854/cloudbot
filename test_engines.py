@@ -1740,6 +1740,71 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("198.18.0.0/24", pruned_stats)
         self.assertNotIn(many_prefixes[1100], pruned_stats)
 
+    def test_d2_prefix_biased_sampling(self):
+        import cf_scan
+        import cfscanner
+        import tempfile
+        import json
+
+        ranges = [f"104.{i}.0.0/16" for i in range(16, 20)]
+
+        # 1. Cold start (< 100 prefixes): behaves identically to uniform random sampler
+        stats_cold = {"104.16.0.0/24": {"samples": 10, "successes": 5, "score_sum": 100.0}}
+        ips_cold = cf_scan.candidates(ranges, per_24=1, seed=42, limit=50, prefix_stats=stats_cold)
+        ips_baseline = cf_scan.candidates(ranges, per_24=1, seed=42, limit=50, prefix_stats=None)
+        self.assertEqual(ips_cold, ips_baseline)
+
+        # 2. Seeded stats: roughly 70% of output comes from high-yield prefixes
+        stats_seeded = {}
+        high_yield_prefixes = set()
+        for i in range(150):
+            p = f"104.16.{i}.0/24"
+            high_yield_prefixes.add(p)
+            stats_seeded[p] = {
+                "samples": 10.0,
+                "successes": 8.0,
+                "score_sum": 200.0,
+                "last_sampled": time.time(),
+                "last_success": time.time(),
+            }
+        for i in range(150, 300):
+            p = f"104.16.{i}.0/24"
+            stats_seeded[p] = {
+                "samples": 10.0,
+                "successes": 0.0,
+                "score_sum": 0.0,
+                "last_sampled": time.time(),
+                "last_success": 0.0,
+            }
+
+        ips = cf_scan.candidates(ranges, per_24=1, seed=123, limit=100, prefix_stats=stats_seeded)
+        self.assertEqual(len(ips), 100)
+        high_yield_hits = sum(1 for ip in ips if ip.rsplit(".", 1)[0] + ".0/24" in high_yield_prefixes)
+        self.assertGreaterEqual(high_yield_hits, 65)
+        self.assertLessEqual(high_yield_hits, 75)
+
+        # 3. Stale prefix loses exploitation eligibility through decay
+        stale_p = "104.17.0.0/24"
+        now = time.time()
+        st = self.st
+        st.record_prefix_stats({stale_p: {"samples": 4, "successes": 3, "score_sum": 90.0}}, now=now - 48 * 3600)
+        decayed = st.get_prefix_stats(now=now)[stale_p]
+        self.assertLess(decayed["samples"], cf_scan.EXPLOITATION_MIN_SAMPLES)
+
+        # 4. Missing / unreadable stats file falls back cleanly
+        with tempfile.TemporaryDirectory() as td:
+            missing_path = os.path.join(td, "nonexistent_stats.json")
+            args = cfscanner._build_scan_args("scan.py", "out", prefix_stats_file=missing_path)
+            self.assertIn("--prefix-stats-file", args)
+            self.assertEqual(args[args.index("--prefix-stats-file") + 1], missing_path)
+
+        # 5. ScanOutput returns prefix_stats and unpacks cleanly as 2-tuple
+        out = cfscanner.ScanOutput(["res1"], "tail_output", prefix_stats={"p": 1})
+        r, t = out
+        self.assertEqual(r, ["res1"])
+        self.assertEqual(t, "tail_output")
+        self.assertEqual(out.prefix_stats, {"p": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

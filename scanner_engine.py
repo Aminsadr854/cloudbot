@@ -7,6 +7,7 @@ Coordinates phone delivery with an isolated 5-minute offset queue.
 """
 import asyncio
 import html
+import ipaddress
 import json
 import logging
 import os
@@ -452,10 +453,30 @@ class ScannerEngine:
         self.set_status("scanning", "اسکن رنج کلادفلر")
         host, sni = self.st.get_engine_targets(self.engine_id)
         blocked = list(self.st.blocked_ips())
-        results, _tail = await cfscanner.run_scan(
+        prefix_stats = self.st.get_prefix_stats()
+        scan_out = await cfscanner.run_scan(
             ssh, self.st.jump(), log_fn, limit=SCAN_SAMPLE,
             final=PHONE_SHORTLIST, no_speed=True, engine_id=self.engine_id,
-            host=host, sni=sni, exclude=blocked)
+            host=host, sni=sni, exclude=blocked, prefix_stats=prefix_stats)
+        results, _tail = scan_out
+        returned_stats = getattr(scan_out, "prefix_stats", None)
+        if returned_stats:
+            self.st.record_prefix_stats(returned_stats)
+
+        try:
+            ranges_content = cfscanner._get_cached_ranges()
+            range_lines = [l.strip() for l in ranges_content.splitlines() if l.strip() and not l.startswith("#")]
+            valid_subnets = []
+            for cidr in range_lines:
+                net = ipaddress.ip_network(cidr)
+                if net.prefixlen <= 24:
+                    valid_subnets.extend(str(s) for s in net.subnets(new_prefix=24))
+                else:
+                    valid_subnets.append(str(net))
+            self.st.prune_prefix_stats(valid_subnets)
+        except Exception as e:
+            log.debug("Prefix stats pruning skipped: %s", e)
+
         self.st.pool_add(results, engine_id=self.engine_id)
         log.info("[ENGINE %d] Candidate IPs: %d", self.engine_id, len(results))
         self.set_status("idle", f"{len(results)} آدرس به استخر اضافه شد")
