@@ -10,6 +10,7 @@ import html
 import json
 import logging
 import os
+import socket
 import ssl
 import time
 from typing import Callable, Optional
@@ -35,6 +36,19 @@ TLS_CTX = ssl.create_default_context()
 TLS_CTX.check_hostname = False
 TLS_CTX.verify_mode = ssl.CERT_NONE
 TLS_CTX.set_alpn_protocols(["http/1.1"])
+
+
+async def _resolve_a(fqdn: str, timeout: float = 5.0) -> list[str]:
+    """Resolve fqdn to A records, off the event loop thread."""
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(fqdn, 443, family=socket.AF_INET,
+                             type=socket.SOCK_STREAM),
+            timeout=timeout)
+        return sorted({i[4][0] for i in infos})
+    except Exception:
+        return []
 
 
 def get_engine_targets(st: Store, engine_id: int) -> tuple[str, str]:
@@ -627,8 +641,20 @@ class ScannerEngine:
                 return
 
             # 3. DOMAIN_POSTCONFIRMED: Post-DNS confirmation with automated rollback
-            await asyncio.sleep(6.0)
+            dns_visible = False
+            resolved = []
+            for attempt in range(5):
+                await asyncio.sleep(5.0)
+                resolved = await _resolve_a(fqdn)
+                if chosen["ip"] in resolved:
+                    dns_visible = True
+                    break
+
             post_ok, post_reason = await _verify(chosen["ip"], host=target_host, sni=target_sni)
+            if not dns_visible and post_ok:
+                log.warning("[ENGINE %d] DNS not yet visible for %s (resolved: %s)",
+                            self.engine_id, fqdn, resolved)
+
             if not post_ok:
                 log.error("[ENGINE %d] DOMAIN_POSTCONFIRMED failed for %s: %s. Initiating automatic rollback!",
                           self.engine_id, chosen["ip"], post_reason)

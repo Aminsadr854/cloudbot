@@ -42,7 +42,14 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
         self.key_path = os.path.join(self.tmp_dir.name, "test.key")
         self.st = Store(db_path=self.db_path, key_path=self.key_path)
 
+        async def fake_resolve_a(fqdn, timeout=5.0):
+            return ["104.16.1.10", "104.17.2.20", "104.18.3.30", "104.17.2.50", "104.26.1.1", "104.26.14.9", "104.26.14.1", "104.26.14.2"]
+
+        self._resolve_patch = patch("scanner_engine._resolve_a", side_effect=fake_resolve_a)
+        self._resolve_patch.start()
+
     def tearDown(self):
+        self._resolve_patch.stop()
         self.tmp_dir.cleanup()
 
     # ----------------------------------------------------------------------
@@ -297,6 +304,7 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
 
         with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
              patch("scanner_engine.verify_domain_ip", AsyncMock(side_effect=verify_side_effects)), \
+             patch("scanner_engine._resolve_a", AsyncMock(return_value=["104.26.1.1"])), \
              patch("asyncio.sleep", AsyncMock()):  # don't wait 6s during unit test
             await eng.phone_recheck_pass(notify_fn=notify_mock)
 
@@ -346,6 +354,7 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
 
         with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
              patch("scanner_engine.verify_domain_ip", AsyncMock(return_value=(True, "Valid WebSocket Backend (HTTP 400)"))), \
+             patch("scanner_engine._resolve_a", AsyncMock(return_value=["104.26.14.9"])), \
              patch("asyncio.sleep", AsyncMock()):
             await eng.phone_recheck_pass(notify_fn=notify_mock)
 

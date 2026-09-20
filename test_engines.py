@@ -46,7 +46,15 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self._open_conn_patch = patch("asyncio.open_connection", side_effect=AssertionError("Real socket opened in unit test!"))
         self._open_conn_patch.start()
 
+        # Mock _resolve_a to return test candidate IPs so tests do not loop and sleep
+        async def fake_resolve_a(fqdn, timeout=5.0):
+            return ["104.16.1.10", "104.17.2.20", "104.18.3.30", "104.17.2.50", "104.26.1.1", "104.26.14.9"]
+
+        self._resolve_patch = patch("scanner_engine._resolve_a", side_effect=fake_resolve_a)
+        self._resolve_patch.start()
+
     async def asyncTearDown(self):
+        self._resolve_patch.stop()
         self._open_conn_patch.stop()
         self.st.close()
         if self.orig_db is not None:
@@ -672,6 +680,41 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(decision["change"])
         self.assertIn("ناموفق", decision["why"])
         self.assertTrue(decision_no_live["change"])
+
+
+    # Test A5: Post-DNS confirmation checks DNS resolution and handles propagation delay
+    async def test_a5_post_dns_confirmation_and_propagation_delay(self):
+        self.st.update_cfscan(1, fqdn="test.domain.com", auto_apply=True, last_best_ip="1.1.1.1")
+        self.st.set_cf_token("fake_token")
+        self.st.set_scan_candidates([{"ip": "104.16.1.10", "rtt": 40}], engine_id=1)
+
+        mock_cf = MagicMock()
+        mock_cf.zone_for = AsyncMock(return_value=["zone1", "domain.com"])
+        mock_cf.find_a_record = AsyncMock(return_value={"id": "rec1", "content": "1.1.1.1"})
+        mock_cf.update_a = AsyncMock(return_value=True)
+
+        # Case 1: DNS not visible initially, but verify_domain_ip passes -> warning logged, NO rollback
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
+             patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.16.1.10", "rtt": 40}, "why": "ok", "voters": 2}), \
+             patch("scanner_engine._resolve_a", new=AsyncMock(return_value=[])), \
+             patch("asyncio.sleep", AsyncMock()), \
+             self.assertLogs("scanner_engine", level="WARNING") as cm:
+            await self.e1.phone_recheck_pass()
+            self.assertTrue(any("DNS not yet visible" in msg for msg in cm.output))
+            # No rollback occurred: update_a called once for the change
+            self.assertEqual(mock_cf.update_a.call_count, 1)
+            self.assertEqual(mock_cf.update_a.call_args[0][2], "104.16.1.10")
+
+        # Case 2: verify_domain_ip fails on post-check -> rollback DOES occur
+        mock_cf.update_a.reset_mock()
+        fail_verifier = AsyncMock(side_effect=[(True, "HTTP 200 OK"), (False, "HTTP 500 Connection Failed")])
+        with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
+             patch("scanner_engine.decide", return_value={"change": True, "entry": {"ip": "104.16.1.10", "rtt": 40}, "why": "ok", "voters": 2}), \
+             patch("asyncio.sleep", AsyncMock()):
+            await self.e1.phone_recheck_pass(verifier=fail_verifier)
+            # Rollback occurred: update_a called twice (update, then restore previous IP 1.1.1.1)
+            self.assertEqual(mock_cf.update_a.call_count, 2)
+            self.assertEqual(mock_cf.update_a.call_args_list[1][0][2], "1.1.1.1")
 
 
 if __name__ == "__main__":
