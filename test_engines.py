@@ -1137,6 +1137,45 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(valid)
             self.assertEqual(reason, "HTTP 200 OK")
 
+    # Test B4: Canonical classify_cf_error and is_valid_response functions
+    def test_b4_canonical_functions(self):
+        import cf_scan
+
+        # Test classify_cf_error across various Cloudflare error conditions
+        self.assertEqual(
+            cf_scan.classify_cf_error("403", "server: cloudflare", "error code: 1034"),
+            (True, "1034")
+        )
+        self.assertEqual(
+            cf_scan.classify_cf_error("500", "server: cloudflare", "errorcode: 1000"),
+            (True, "1000")
+        )
+        self.assertEqual(
+            cf_scan.classify_cf_error("521", "server: cloudflare", "error 521"),
+            (True, "521")
+        )
+        self.assertEqual(
+            cf_scan.classify_cf_error("403", "server: cloudflare\r\ncf-ray: abc", "some error occurred"),
+            (True, "403")
+        )
+        self.assertEqual(
+            cf_scan.classify_cf_error("200", "server: cloudflare\r\ncf-ray: abc", "hello"),
+            (False, None)
+        )
+
+        # Test is_valid_response:
+        # 1. Missing cf-ray -> False
+        self.assertFalse(cf_scan.is_valid_response("200", "server: cloudflare", "ok"))
+        # 2. Cloudflare error -> False
+        self.assertFalse(cf_scan.is_valid_response("520", "cf-ray: abc", "error code: 520"))
+        # 3. Valid 200 with cf-ray -> True
+        self.assertTrue(cf_scan.is_valid_response("200", "cf-ray: abc", "ok"))
+        # 4. Valid 400 with WebSocket -> True
+        self.assertTrue(cf_scan.is_valid_response("400", "cf-ray: abc\r\nsec-websocket-version: 13", "bad request"))
+        # 5. Trace endpoint requires ip and colo or server cloudflare on 200
+        self.assertTrue(cf_scan.is_valid_response("200", "cf-ray: abc", "ip=1.1.1.1\ncolo=FRA\n", is_trace=True))
+        self.assertFalse(cf_scan.is_valid_response("200", "cf-ray: abc", "other body", is_trace=True))
+
 
 if __name__ == "__main__":
     unittest.main()

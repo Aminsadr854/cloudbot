@@ -175,6 +175,53 @@ async def stage_reachable(ips, port, timeout, concurrency, progress_every=20000)
 # --------------------------------------------------------------------------
 # stage 2: is it really a Cloudflare edge that will serve traffic
 # --------------------------------------------------------------------------
+CF_CODES = ["1034", "1000", "1001", "1002", "520", "521", "522", "523", "524", "525", "526"]
+
+
+def classify_cf_error(status: str, headers: str, body: str) -> tuple[bool, str | None]:
+    """
+    Check if the response represents a known Cloudflare edge or origin error.
+    Returns (is_error, error_code_or_name).
+    """
+    body_lower = (body or "").lower()
+    headers_lower = (headers or "").lower()
+    status_str = str(status)
+
+    for code in CF_CODES:
+        if f"error code: {code}" in body_lower or f"errorcode: {code}" in body_lower or f"error {code}" in body_lower:
+            return True, code
+    if status_str == "403" and ("cloudflare" in headers_lower or "cf-ray" in headers_lower) and "error" in body_lower:
+        return True, "403"
+    return False, None
+
+
+def is_valid_response(status: str, headers: str, body: str, is_trace: bool = False) -> bool:
+    """
+    Check if the response is a valid Cloudflare edge response.
+    Requires cf-ray header and absence of Cloudflare edge/origin errors.
+    """
+    headers_lower = (headers or "").lower()
+    if "cf-ray" not in headers_lower:
+        return False
+
+    is_err, _ = classify_cf_error(status, headers, body)
+    if is_err:
+        return False
+
+    status_str = str(status)
+    body_lower = (body or "").lower()
+
+    if is_trace:
+        return ("ip=" in body and "colo=" in body) or ("server: cloudflare" in headers_lower and status_str == "200")
+    if status_str in ("200", "101"):
+        return True
+    if status_str == "400" and ("sec-websocket-version" in headers_lower or "bad request" in body_lower):
+        return True
+    if status_str in ("204", "301", "302", "404"):
+        return True
+    return False
+
+
 async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None, verify=False):
     """One HTTPS request to a named host/SNI, forced to a specific address."""
     start = time.perf_counter()
@@ -216,32 +263,9 @@ async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=Fals
             pass
 
         status = head.split(b" ")[1].decode() if b" " in head else "?"
-        body_lower = body.lower()
-
-        # Reject known Cloudflare edge and origin errors
-        cf_error = False
-        cf_err_code = None
-        cf_codes = ["1034", "1000", "1001", "1002", "520", "521", "522", "523", "524", "525", "526"]
-        for code in cf_codes:
-            if f"error code: {code}" in body_lower or f"errorcode: {code}" in body_lower or f"error {code}" in body_lower:
-                cf_error = True
-                cf_err_code = code
-                break
-        if not cf_error and status == "403" and ("cloudflare" in headers or "cf-ray" in headers) and "error" in body_lower:
-            cf_error = True
-            cf_err_code = "403"
-
         is_trace = "/cdn-cgi/trace" in path
-        valid = False
-        if not cf_error and ("cf-ray" in headers):
-            if is_trace:
-                valid = ("ip=" in body and "colo=" in body) or ("server: cloudflare" in headers and status == "200")
-            elif status in ("200", "101"):
-                valid = True
-            elif status == "400" and ("sec-websocket-version" in headers or "bad request" in body_lower):
-                valid = True
-            elif status in ("204", "301", "302", "404") and not cf_error:
-                valid = True
+        cf_error, cf_err_code = classify_cf_error(status, headers, body)
+        valid = is_valid_response(status, headers, body, is_trace)
 
         return {"tls_ms": tls_ms, "ttfb_ms": ttfb_ms, "status": status,
                 "cloudflare": ("server: cloudflare" in headers or "cf-ray" in headers),

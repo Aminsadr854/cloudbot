@@ -15,6 +15,7 @@ import ssl
 import time
 from typing import Callable, Optional
 
+import cf_scan
 import cfscanner
 from cloudflare import Cloudflare
 from store import Store
@@ -87,25 +88,23 @@ async def verify_domain_ip(ip: str, host: str, sni: str, port: int = 443, timeou
         except Exception:
             pass
 
-        # 1. Reject Cloudflare errors
-        cf_errors = ["1034", "1000", "1001", "1002", "520", "521", "522", "523", "524", "525", "526"]
-        for code in cf_errors:
-            if f"error code: {code}" in body or f"errorcode: {code}" in body or f"error {code}" in body:
-                return False, f"Cloudflare Error {code}"
-
-        if status == "403" and ("cloudflare" in headers or "cf-ray" in headers) and "error" in body:
-            return False, "Cloudflare 403 Edge Restriction"
+        # 1. Reject Cloudflare errors using canonical classifier
+        is_cf_err, cf_code = cf_scan.classify_cf_error(status, headers, body)
+        if is_cf_err:
+            if cf_code == "403":
+                return False, "Cloudflare 403 Edge Restriction"
+            return False, f"Cloudflare Error {cf_code}"
 
         # 2. Require cf-ray header
         if "cf-ray" not in headers:
             return False, "No cf-ray header (not a Cloudflare edge)"
 
-        # 3. Check for valid origin / application responses
-        if status in ("200", "101"):
-            return True, f"HTTP {status} OK"
-        if status == "400" and ("sec-websocket-version" in headers or "bad request" in body):
-            return True, "Valid WebSocket Backend (HTTP 400)"
-        if status in ("204", "301", "302", "404") and not ("error" in body and "cloudflare" in headers):
+        # 3. Check for valid origin / application responses using canonical validator
+        if cf_scan.is_valid_response(status, headers, body, is_trace=False):
+            if status in ("200", "101"):
+                return True, f"HTTP {status} OK"
+            if status == "400":
+                return True, "Valid WebSocket Backend (HTTP 400)"
             return True, f"HTTP {status} from Origin"
 
         return False, f"Unexpected response: HTTP {status}"
