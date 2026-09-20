@@ -38,6 +38,57 @@ class StaleResultError(RuntimeError):
     pass
 
 
+import urllib.request
+
+RANGES_CACHE_FILE = "/tmp/cf_ranges_cache.txt"
+RANGES_CACHE_TTL = 6 * 3600  # at least 6 hours
+CF_RANGES_URL = "https://www.cloudflare.com/ips-v4"
+
+
+def _get_cached_ranges() -> str:
+    """
+    Fetch Cloudflare range list on the bot host, caching it for at least 6 hours.
+    Falls back to CF_V4_FALLBACK if fetch fails and cache is absent.
+    """
+    now = time.time()
+    if os.path.exists(RANGES_CACHE_FILE):
+        try:
+            mtime = os.path.getmtime(RANGES_CACHE_FILE)
+            if now - mtime < RANGES_CACHE_TTL:
+                with open(RANGES_CACHE_FILE) as f:
+                    content = f.read().strip()
+                if content and "/" in content:
+                    return content
+        except Exception:
+            pass
+
+    # Fetch live on bot host
+    try:
+        with urllib.request.urlopen(CF_RANGES_URL, timeout=20) as r:
+            body = r.read().decode().strip()
+        if "/" in body:
+            tmp_cache = f"{RANGES_CACHE_FILE}.tmp.{os.getpid()}"
+            with open(tmp_cache, "w") as f:
+                f.write(body + "\n")
+            os.replace(tmp_cache, RANGES_CACHE_FILE)
+            return body
+    except Exception:
+        pass
+
+    # If live fetch failed but stale cache exists, use it
+    if os.path.exists(RANGES_CACHE_FILE):
+        try:
+            with open(RANGES_CACHE_FILE) as f:
+                content = f.read().strip()
+            if content and "/" in content:
+                return content
+        except Exception:
+            pass
+
+    from cf_scan import CF_V4_FALLBACK
+    return CF_V4_FALLBACK.strip()
+
+
 def _load_scanner() -> str:
     with open(SCANNER_LOCAL) as f:
         return f.read()
@@ -46,7 +97,8 @@ def _load_scanner() -> str:
 def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
                      final=20, host="speed.cloudflare.com", sni: str | None = None,
                      limit=0, only=None, no_speed=False, include=None, engine_id: int = 0,
-                     concurrency: int = DEFAULT_CONCURRENCY) -> list[str]:
+                     concurrency: int = DEFAULT_CONCURRENCY,
+                     ranges_file: str | None = None) -> list[str]:
     args = ["python3", remote_scanner,
             "--per-24", str(per_24),
             "--rounds", str(rounds),
@@ -60,6 +112,8 @@ def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
         args += ["--sni", sni]
     if limit:
         args += ["--limit", str(int(limit))]
+    if ranges_file:
+        args += ["--ranges-file", ranges_file]
     if only:
         safe_only = [i for i in only if all(ch in "0123456789." for ch in i)]
         if safe_only:
@@ -86,6 +140,8 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
     """
     remote_script = f"/root/.cf_scan_engine_{engine_id}.py"
     tmp_path = f"{remote_script}.tmp.{os.getpid()}"
+    remote_ranges_file = f"/root/.cf_ranges_engine_{engine_id}.txt"
+    tmp_ranges_path = f"{remote_ranges_file}.tmp.{os.getpid()}"
     out_file = remote_out or (f"/root/cf_bot_scan_engine_{engine_id}" if engine_id else REMOTE_OUT)
 
     # Lock ordering and deadlock prevention:
@@ -124,18 +180,22 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
 
             await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
             script = _load_scanner()
-            # Write the scanner via SFTP to a unique temp path, then atomically rename into per-engine path
+            ranges_content = _get_cached_ranges()
+            # Write scanner and cached ranges via SFTP to unique temp paths, then atomically rename
             async with conn.start_sftp_client() as sftp:
                 async with sftp.open(tmp_path, "w") as f:
                     await f.write(script)
-            await conn.run(f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)}", check=False)
+                async with sftp.open(tmp_ranges_path, "w") as f:
+                    await f.write(ranges_content + "\n")
+            await conn.run(f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)} && "
+                           f"mv {shlex.quote(tmp_ranges_path)} {shlex.quote(remote_ranges_file)}", check=False)
 
             # Raise the fd limit inline: every probe in flight holds one, and the
             # default 1024 would silently cap concurrency and lose candidates.
             args = _build_scan_args(
                 remote_script, out_file, per_24=per_24, rounds=rounds, final=final,
                 host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include,
-                engine_id=engine_id, concurrency=concurrency
+                engine_id=engine_id, concurrency=concurrency, ranges_file=remote_ranges_file
             )
             cmd = ("ulimit -n 65535 2>/dev/null; "
                    f"timeout -k 10 {REMOTE_TIMEOUT} "

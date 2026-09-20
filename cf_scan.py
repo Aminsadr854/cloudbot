@@ -74,15 +74,30 @@ TLS_CTX_VERIFY.set_alpn_protocols(["http/1.1"])
 # --------------------------------------------------------------------------
 # candidate generation
 # --------------------------------------------------------------------------
-def cloudflare_ranges():
+def cloudflare_ranges(ranges_file=None):
+    if ranges_file:
+        try:
+            with open(ranges_file) as f:
+                lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            if lines and any("/" in l for l in lines):
+                valid = [l for l in lines if "/" in l]
+                print(f"  ranges source: file ({ranges_file})", flush=True)
+                return valid
+            else:
+                print(f"  (ranges file {ranges_file} invalid or empty; trying live fetch)", file=sys.stderr)
+        except Exception as e:
+            print(f"  (could not read ranges file {ranges_file}: {e}; trying live fetch)", file=sys.stderr)
+
     try:
         with urllib.request.urlopen(CF_V4_URL, timeout=20) as r:
             body = r.read().decode()
         if "/" in body:
+            print(f"  ranges source: live fetch ({CF_V4_URL})", flush=True)
             return [l.strip() for l in body.splitlines() if l.strip()]
     except Exception as e:
         print(f"  (could not fetch the live range list: {e}; using the built-in one)",
               file=sys.stderr)
+    print("  ranges source: built-in fallback", flush=True)
     return [l.strip() for l in CF_V4_FALLBACK.splitlines() if l.strip()]
 
 
@@ -601,6 +616,8 @@ async def main():
                     help="comma-separated addresses to measure whatever the "
                          "random sample turned up, and to carry through every "
                          "stage (used for addresses the phones vouched for)")
+    ap.add_argument("--ranges-file", default="",
+                    help="path to local file containing Cloudflare CIDR ranges")
     args = ap.parse_args()
 
     t0 = time.time()
@@ -623,7 +640,7 @@ async def main():
         ranges, ips = [], only
         print(f"  measuring a fixed list of {len(ips)} address(es)", flush=True)
     else:
-        ranges = cloudflare_ranges()
+        ranges = cloudflare_ranges(args.ranges_file)
         ips = candidates(ranges, args.per_24, args.seed, limit=args.limit)
     pinned = {ip.strip() for ip in args.include.split(",") if ip.strip()}
     if pinned:

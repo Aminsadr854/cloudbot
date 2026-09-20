@@ -1520,6 +1520,57 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(res2[0]), 1)
             self.assertEqual(max_active_scans, 1)
 
+    async def test_d1_cloudflare_ranges_caching_and_fallback(self):
+        import cf_scan
+        import cfscanner
+
+        # 1. cf_scan.cloudflare_ranges with valid ranges_file
+        with tempfile.NamedTemporaryFile("w+", delete=False) as f:
+            f.write("# comment\n1.2.3.0/24\n4.5.6.0/24\n")
+            f.flush()
+            temp_path = f.name
+        try:
+            with patch("sys.stdout", new=io.StringIO()) as fake_stdout:
+                ranges = cf_scan.cloudflare_ranges(temp_path)
+                self.assertEqual(ranges, ["1.2.3.0/24", "4.5.6.0/24"])
+                self.assertIn("ranges source: file", fake_stdout.getvalue())
+        finally:
+            os.unlink(temp_path)
+
+        # 2. cf_scan.cloudflare_ranges with missing ranges_file falls back to CF_V4_FALLBACK
+        with patch("urllib.request.urlopen", side_effect=Exception("Network down")), \
+             patch("sys.stdout", new=io.StringIO()) as fake_stdout:
+            ranges = cf_scan.cloudflare_ranges("/nonexistent/file")
+            self.assertIn("ranges source: built-in fallback", fake_stdout.getvalue())
+            self.assertTrue(len(ranges) > 0)
+
+        # 3. cfscanner._get_cached_ranges writes and reads cache
+        with tempfile.TemporaryDirectory() as td:
+            cache_file = os.path.join(td, "cache.txt")
+            with patch("cfscanner.RANGES_CACHE_FILE", cache_file), \
+                 patch("cfscanner.urllib.request.urlopen") as mock_url:
+                mock_resp = MagicMock()
+                mock_resp.read.return_value = b"10.0.0.0/8\n20.0.0.0/8\n"
+                mock_resp.__enter__.return_value = mock_resp
+                mock_resp.__exit__.return_value = None
+                mock_url.return_value = mock_resp
+
+                cached = cfscanner._get_cached_ranges()
+                self.assertIn("10.0.0.0/8", cached)
+                self.assertTrue(os.path.exists(cache_file))
+
+                # Second call reuses cache within TTL without urlopen
+                mock_url.reset_mock()
+                cached2 = cfscanner._get_cached_ranges()
+                self.assertEqual(cached2, cached)
+                mock_url.assert_not_called()
+
+        # 4. _build_scan_args includes --ranges-file
+        args = cfscanner._build_scan_args("scan.py", "out", ranges_file="/root/ranges.txt")
+        self.assertIn("--ranges-file", args)
+        idx = args.index("--ranges-file")
+        self.assertEqual(args[idx + 1], "/root/ranges.txt")
+
 
 if __name__ == "__main__":
     unittest.main()
