@@ -17,6 +17,10 @@ from cryptography.fernet import Fernet
 DB_PATH = os.environ.get("CLOUDBOT_DB", "/opt/cloudbot/data/cloudbot.db")
 KEY_PATH = os.environ.get("CLOUDBOT_KEY", "/opt/cloudbot/data/secret.key")
 
+BLOCK_FAILURES_REQUIRED = 3
+BLOCK_WINDOW_SECONDS = 24 * 3600
+BLOCK_EXPIRY_SECONDS = 72 * 3600
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,6 +46,12 @@ CREATE TABLE IF NOT EXISTS server_secrets (
     PRIMARY KEY (account_id, server_id)
 );
 CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS blocked_ip_failures (
+    ip TEXT NOT NULL,
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_blocked_ip_failures_ip_ts
+    ON blocked_ip_failures (ip, ts);
 """
 
 
@@ -731,24 +741,64 @@ class Store:
     # address in fifty usable at midday and twenty-six in fifty that evening.
     # Remembering a refusal for half a day would rule out most of the space on
     # the strength of one bad hour.
-    def mark_blocked(self, ips, ttl_hours=3):
-        import json, time
-        now = int(time.time())
-        d = self.blocked_ips(raw=True)
-        for ip in ips:
-            d[ip] = now
-        cutoff = now - ttl_hours * 3600
-        d = {ip: ts for ip, ts in d.items() if ts >= cutoff}
-        self.set("blocked_ips", json.dumps(d))
+    def _migrate_blocked_ips_if_needed(self):
+        import json
+        with self.con:
+            row = self.con.execute("SELECT v FROM settings WHERE k = 'blocked_ips'").fetchone()
+            if not row:
+                return
+            self.con.execute("DELETE FROM settings WHERE k = 'blocked_ips'")
+            v = row[0]
+            try:
+                d = json.loads(v) if v else {}
+            except Exception:
+                d = {}
+            if isinstance(d, dict):
+                rows = []
+                for ip, val in d.items():
+                    if isinstance(val, (int, float)):
+                        rows.append((str(ip), float(val)))
+                    elif isinstance(val, list):
+                        for ts in val:
+                            if isinstance(ts, (int, float)):
+                                rows.append((str(ip), float(ts)))
+                if rows:
+                    self.con.executemany("INSERT INTO blocked_ip_failures (ip, ts) VALUES (?, ?)", rows)
 
-    def blocked_ips(self, raw=False, ttl_hours=3):
-        import json, time
-        v = self.get("blocked_ips")
-        d = json.loads(v) if v else {}
-        if raw:
-            return d
-        cutoff = time.time() - ttl_hours * 3600
-        return {ip for ip, ts in d.items() if ts >= cutoff}
+    def mark_blocked(self, ips, now=None):
+        """
+        Record failure timestamps for IPs. One INSERT per ip in a single executemany
+        without read-modify-write. Prunes failures older than BLOCK_EXPIRY_SECONDS.
+        """
+        import time
+        if not ips:
+            return
+        self._migrate_blocked_ips_if_needed()
+        now_ts = float(time.time() if now is None else now)
+        expiry_cutoff = now_ts - BLOCK_EXPIRY_SECONDS
+        rows = [(str(ip), now_ts) for ip in ips]
+        with self.con:
+            self.con.executemany("INSERT INTO blocked_ip_failures (ip, ts) VALUES (?, ?)", rows)
+            self.con.execute("DELETE FROM blocked_ip_failures WHERE ts < ?", (expiry_cutoff,))
+
+    def blocked_ips(self, now=None) -> set[str]:
+        """
+        Return set of blocked IPs: at least BLOCK_FAILURES_REQUIRED failures within
+        BLOCK_WINDOW_SECONDS (24h) and most recent failure within BLOCK_EXPIRY_SECONDS (72h).
+        """
+        import time
+        self._migrate_blocked_ips_if_needed()
+        now_ts = float(time.time() if now is None else now)
+        expiry_cutoff = now_ts - BLOCK_EXPIRY_SECONDS
+        q = """
+        SELECT a.ip
+        FROM blocked_ip_failures a
+        JOIN blocked_ip_failures b ON a.ip = b.ip AND b.ts >= a.ts AND b.ts <= a.ts + ?
+        GROUP BY a.ip, a.ts
+        HAVING COUNT(*) >= ? AND max(b.ts) >= ?
+        """
+        cur = self.con.execute(q, (float(BLOCK_WINDOW_SECONDS), BLOCK_FAILURES_REQUIRED, expiry_cutoff))
+        return {row[0] for row in cur}
 
     def probe_token(self) -> str:
         """Shared secret the phones authenticate with; created on first use."""

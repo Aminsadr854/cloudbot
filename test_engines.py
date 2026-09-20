@@ -1638,6 +1638,45 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             passed_exclude = mock_run.call_args.kwargs.get("exclude")
             self.assertEqual(set(passed_exclude), {"198.51.100.1", "198.51.100.2"})
 
+    def test_d3_blocked_ip_failures_table(self):
+        import time, json
+        from store import Store, BLOCK_WINDOW_SECONDS, BLOCK_EXPIRY_SECONDS
+
+        st = self.st
+        base_t = 100000.0
+
+        # 1. Two overlapping mark_blocked calls (interleave explicitly, no row lost)
+        st.mark_blocked({"10.0.0.1"}, now=base_t)
+        st.mark_blocked({"10.0.0.2"}, now=base_t)
+        rows = st.con.execute("SELECT ip, ts FROM blocked_ip_failures ORDER BY ip").fetchall()
+        ips_in_db = [r[0] for r in rows]
+        self.assertIn("10.0.0.1", ips_in_db)
+        self.assertIn("10.0.0.2", ips_in_db)
+
+        # 2. 2 failures in 24h is not blocked; 3 is
+        st.mark_blocked({"10.0.0.1"}, now=base_t + 3600)
+        self.assertNotIn("10.0.0.1", st.blocked_ips(now=base_t + 3600))
+        st.mark_blocked({"10.0.0.1"}, now=base_t + 7200)
+        self.assertIn("10.0.0.1", st.blocked_ips(now=base_t + 7200))
+
+        # 3. 3 failures, then 73 hours pass -> no longer blocked
+        self.assertNotIn("10.0.0.1", st.blocked_ips(now=base_t + 7200 + 73 * 3600))
+
+        # 4. 3 failures spread over 30 hours (only 2 fall in any 24h window) is not blocked
+        st.mark_blocked({"10.0.0.3"}, now=base_t)
+        st.mark_blocked({"10.0.0.3"}, now=base_t + 15 * 3600)
+        st.mark_blocked({"10.0.0.3"}, now=base_t + 30 * 3600)
+        self.assertNotIn("10.0.0.3", st.blocked_ips(now=base_t + 30 * 3600))
+
+        # 5. Migration from a scalar-format old key produces one failure row per IP and no blocks, old key gone
+        st.set("blocked_ips", json.dumps({"10.0.0.4": base_t, "10.0.0.5": base_t}))
+        blocked = st.blocked_ips(now=base_t)
+        self.assertNotIn("10.0.0.4", blocked)
+        self.assertNotIn("10.0.0.5", blocked)
+        self.assertIsNone(st.get("blocked_ips"))
+        f_rows = st.con.execute("SELECT ip FROM blocked_ip_failures WHERE ip IN ('10.0.0.4', '10.0.0.5')").fetchall()
+        self.assertEqual(len(f_rows), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
