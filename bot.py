@@ -50,8 +50,10 @@ TOKEN = os.environ["CLOUDBOT_TOKEN"]
 OWNER = int(os.environ["CLOUDBOT_OWNER"])
 # Phones are given this address, never the bot host: a handset in Iran
 # dialling a foreign address is the traffic that gets shaped.
+# Control IP probe base URL. In production, this must be supplied via the
+# CLOUDBOT_PROBE (or CLOUDBOT_PROBE_BASE) environment variable.
 PROBE_BASE = os.environ.get("CLOUDBOT_PROBE_BASE",
-                            "https://status.etesalpaya.com")
+                            "https://status.example.com")
 PANEL_URL = os.environ["CLOUDBOT_PANEL_URL"]
 PANEL_USER = os.environ["CLOUDBOT_PANEL_USER"]
 PANEL_PASS = os.environ["CLOUDBOT_PANEL_PASS"]
@@ -958,7 +960,7 @@ async def cf_create_do(cb: CallbackQuery, state: FSMContext):
 async def cf_chg(cb: CallbackQuery, state: FSMContext):
     await state.set_state(CF.change_sub)
     await cb.message.edit_text(
-        "ساب‌دامین کامل را بفرست (مثلاً <code>node1.rjwarehousing.ir</code>):")
+        "ساب‌دامین کامل را بفرست (مثلاً <code>node1.example.com</code>):")
     await cb.answer()
 
 
