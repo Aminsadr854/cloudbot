@@ -86,7 +86,7 @@ def cloudflare_ranges():
     return [l.strip() for l in CF_V4_FALLBACK.splitlines() if l.strip()]
 
 
-def candidates(ranges, per_24, seed=None):
+def candidates(ranges, per_24, seed=None, limit=0):
     """
     Sample addresses spread across every /24 rather than taken at random.
 
@@ -96,16 +96,34 @@ def candidates(ranges, per_24, seed=None):
     repeatedly and miss others completely.
     """
     rng = random.Random(seed)
-    out = []
+    subnets = []
     for cidr in ranges:
         net = ipaddress.ip_network(cidr)
         if net.version != 4:
             continue
-        for sub in net.subnets(new_prefix=24) if net.prefixlen < 24 else [net]:
-            hosts = list(sub.hosts())
-            if not hosts:
-                continue
-            out.extend(str(ip) for ip in rng.sample(hosts, min(per_24, len(hosts))))
+        if net.prefixlen < 24:
+            subnets.extend(net.subnets(new_prefix=24))
+        else:
+            subnets.append(net)
+
+    if limit > 0:
+        rng.shuffle(subnets)
+
+    out = []
+    for sub in subnets:
+        base = int(sub.network_address)
+        num_avail = 254 if sub.prefixlen == 24 else max(0, sub.num_addresses - 2)
+        if num_avail <= 0:
+            continue
+        k = min(per_24, num_avail)
+        offsets = rng.sample(range(1, num_avail + 1), k=k)
+        for offset in offsets:
+            out.append(str(ipaddress.IPv4Address(base + offset)))
+            if limit > 0 and len(out) >= limit:
+                break
+        if limit > 0 and len(out) >= limit:
+            break
+
     rng.shuffle(out)
     return out
 
@@ -575,9 +593,7 @@ async def main():
         print(f"  measuring a fixed list of {len(ips)} address(es)", flush=True)
     else:
         ranges = cloudflare_ranges()
-        ips = candidates(ranges, args.per_24, args.seed)
-        if args.limit:
-            ips = ips[:args.limit]
+        ips = candidates(ranges, args.per_24, args.seed, limit=args.limit)
     pinned = {ip.strip() for ip in args.include.split(",") if ip.strip()}
     if pinned:
         ips = list(pinned) + [i for i in ips if i not in pinned]

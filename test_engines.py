@@ -1361,6 +1361,17 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(p["results"]), 1)
             self.assertEqual(p["results"][0]["ip"], "104.16.1.20")
 
+    def test_c1_candidate_generation(self):
+        import ipaddress
+        import cf_scan
+        ranges = [l.strip() for l in cf_scan.CF_V4_FALLBACK.splitlines() if l.strip()]
+        ips = cf_scan.candidates(ranges, per_24=2, limit=100)
+        self.assertEqual(len(ips), 100)
+        self.assertEqual(len(set(ips)), 100)
+        parsed = [ipaddress.IPv4Address(ip) for ip in ips]
+        prefixes_16 = {f"{ip.exploded.split('.')[0]}.{ip.exploded.split('.')[1]}" for ip in parsed}
+        self.assertGreater(len(prefixes_16), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
