@@ -207,10 +207,12 @@ def score(d: dict) -> float:
 
 
 def _score(d: dict) -> float:
+    # Must agree exactly with cf_scan.score().
     rtt = d.get("rtt")
     if rtt is None or not math.isfinite(rtt):
         return float("inf")
-    jit = d.get("jitter") or 0
-    loss = d.get("loss") or 0
-    mbps = d.get("mbps") or 0
-    return rtt + 2 * jit + 1000 * loss - min(mbps, 100) * 0.5
+    jit = float(d.get("jitter") or 0.0)
+    loss = float(d.get("loss") or 0.0)
+    tls_loss = float(d.get("tls_loss") or 0.0)
+    mbps = float(d.get("mbps") or 0.0)
+    return rtt + 2.0 * jit + 1000.0 * loss + 1200.0 * tls_loss - min(mbps, 100.0) * 0.5

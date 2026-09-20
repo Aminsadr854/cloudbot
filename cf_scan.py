@@ -298,24 +298,43 @@ async def stage_edge(alive, host, port, path, timeout, concurrency, sni=None):
 # --------------------------------------------------------------------------
 # stage 3: does it stay good
 # --------------------------------------------------------------------------
-async def stage_stable(rows, port, timeout, rounds, concurrency):
+async def stage_stable(rows, port, timeout, rounds, concurrency,
+                       host="speed.cloudflare.com", path="/cdn-cgi/trace",
+                       sni=None, http_timeout=6.0):
     sem = asyncio.Semaphore(concurrency)
 
     async def one(row):
         async with sem:
-            samples = []
-            for _ in range(rounds):
-                ms = await tcp_probe(row["ip"], port, timeout)
-                samples.append(ms)
+            tcp_samples = []
+            tls_samples = []
+            for r in range(rounds):
+                if r % 2 == 0:
+                    ms = await tcp_probe(row["ip"], port, timeout)
+                    tcp_samples.append(ms)
+                else:
+                    res = await http_probe(
+                        row["ip"], host, port, path, http_timeout,
+                        read_bytes=0, want_body=False, sni=sni
+                    )
+                    if "error" in res or not res.get("valid") or res.get("cf_error"):
+                        tls_samples.append(None)
+                    else:
+                        tls_samples.append(res.get("ttfb_ms"))
                 await asyncio.sleep(0.12)
-        ok = [s for s in samples if s is not None]
-        row["loss"] = (len(samples) - len(ok)) / len(samples)
-        if ok:
-            row["rtt"] = statistics.median(ok)
+
+        tcp_ok = [s for s in tcp_samples if s is not None]
+        tls_ok = [s for s in tls_samples if s is not None]
+
+        row["loss"] = (len(tcp_samples) - len(tcp_ok)) / len(tcp_samples) if tcp_samples else 0.0
+        row["tls_loss"] = (len(tls_samples) - len(tls_ok)) / len(tls_samples) if tls_samples else 0.0
+
+        all_ok = tcp_ok + tls_ok
+        if all_ok:
+            row["rtt"] = statistics.median(all_ok)
             # Mean absolute deviation rather than stdev: a single stalled probe
             # should register, not be squared into dominating the figure.
-            row["jitter"] = statistics.mean(abs(x - row["rtt"]) for x in ok)
-            row["rtt_max"] = max(ok)
+            row["jitter"] = statistics.mean(abs(x - row["rtt"]) for x in all_ok)
+            row["rtt_max"] = max(all_ok)
         else:
             row["rtt"] = row["jitter"] = row["rtt_max"] = None
         return row
@@ -351,18 +370,18 @@ async def stage_speed(rows, host, port, size_bytes, timeout, concurrency):
 def score(row):
     """
     Lower is better. Loss dominates, jitter counts double against latency.
-
-    A path that drops one probe in twenty is unusable for a tunnel even at
-    30 ms, so loss is weighted far above anything else; ranking on the average
-    alone would put exactly that address at the top.
+    Must agree exactly with cfscanner._score().
     """
     if not row.get("rtt") or not math.isfinite(row["rtt"]):
         return float("inf")
-    cost = row["rtt"] + 2.0 * row["jitter"] + 1000.0 * row["loss"]
+    jitter = float(row.get("jitter") or 0.0)
+    loss = float(row.get("loss") or 0.0)
+    tls_loss = float(row.get("tls_loss") or 0.0)
+    cost = row["rtt"] + 2.0 * jitter + 1000.0 * loss + 1200.0 * tls_loss
     if row.get("mbps"):
         # A fast edge earns a discount, capped so throughput cannot outweigh
         # a path that is unstable.
-        cost -= min(row["mbps"], 100.0) * 0.5
+        cost -= min(float(row["mbps"]), 100.0) * 0.5
     return cost
 
 
@@ -480,7 +499,7 @@ async def main():
         print("  nothing answered - this path may block Cloudflare entirely.")
         return
 
-    current_candidates = [{"ip": r["ip"], "rtt": r["rtt"], "jitter": 0.0, "loss": 0.0} for r in alive]
+    current_candidates = [{"ip": r[0], "rtt": r[1], "jitter": 0.0, "loss": 0.0} for r in alive]
 
     keep = alive if only else _pin(alive[:max(args.edge_keep * 4, 400)], alive, pinned)
     print(f"  stage 2  confirming Cloudflare on the {len(keep)} quickest", flush=True)
@@ -502,8 +521,11 @@ async def main():
 
     finalists = good if only else _pin(good[:args.edge_keep], good, pinned)
     print(f"  stage 3  stability over {args.rounds} probes each", flush=True)
-    finalists = await stage_stable(finalists, args.port, args.connect_timeout,
-                                   args.rounds, min(args.concurrency, 60))
+    finalists = await stage_stable(
+        finalists, args.port, args.connect_timeout,
+        args.rounds, min(args.concurrency, 40),
+        host=args.host, path=args.path, sni=args.sni or None,
+        http_timeout=args.http_timeout)
     finalists.sort(key=score)
     current_candidates = list(finalists)
 

@@ -975,6 +975,71 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
                     jump=None, log=AsyncMock(), engine_id=2
                 )
 
+    # Test B1: Scoring agreement between cf_scan and cfscanner, and tls_loss weighting
+    def test_b1_score_agreement_and_weights(self):
+        import cf_scan
+        rows = [
+            {"rtt": 50.0, "jitter": 2.0, "loss": 0.0, "tls_loss": 0.0, "mbps": 10.0},
+            {"rtt": 45.0, "jitter": 1.5, "loss": 0.02, "tls_loss": 0.01},
+            {"rtt": 40.0, "jitter": 3.0, "loss": 0.05},  # missing tls_loss defaults to 0
+            {"rtt": None, "jitter": 0.0, "loss": 0.0},
+            {"rtt": float("inf"), "jitter": 0.0, "loss": 0.0},
+            {"rtt": 30.0, "jitter": 1.0, "loss": 0.0, "tls_loss": 0.0, "mbps": 250.0},
+        ]
+        for r in rows:
+            self.assertEqual(cf_scan.score(r), cfscanner.score(r))
+
+        # Check penalty: tls_loss (1200.0) is penalized at least as heavily as loss (1000.0)
+        base = {"rtt": 50.0, "jitter": 0.0, "loss": 0.0, "tls_loss": 0.0}
+        with_tcp_loss = {"rtt": 50.0, "jitter": 0.0, "loss": 0.1, "tls_loss": 0.0}
+        with_tls_loss = {"rtt": 50.0, "jitter": 0.0, "loss": 0.0, "tls_loss": 0.1}
+        self.assertEqual(cf_scan.score(with_tcp_loss) - cf_scan.score(base), 100.0)
+        self.assertEqual(cf_scan.score(with_tls_loss) - cf_scan.score(base), 120.0)
+        self.assertGreater(cf_scan.score(with_tls_loss), cf_scan.score(with_tcp_loss))
+
+    # Test B1: stage_stable alternates TCP (even) and TLS (odd) probes and records separate losses
+    async def test_b1_stage_stable_alternates_probes(self):
+        import cf_scan
+
+        tcp_calls = []
+        tls_calls = []
+
+        async def fake_tcp(ip, port, timeout):
+            tcp_calls.append(ip)
+            return 30.0
+
+        async def fake_http(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None):
+            tls_calls.append((ip, host, port, path, sni))
+            if len(tls_calls) == 1:
+                # First TLS probe succeeds
+                return {"valid": True, "cf_error": False, "ttfb_ms": 40.0}
+            else:
+                # Second TLS probe fails (interfered/reset)
+                return {"valid": False, "cf_error": True, "error": "ConnectionResetError"}
+
+        with patch("cf_scan.tcp_probe", side_effect=fake_tcp), \
+             patch("cf_scan.http_probe", side_effect=fake_http), \
+             patch("asyncio.sleep", AsyncMock()):
+            rows = [{"ip": "1.2.3.4"}]
+            results = await cf_scan.stage_stable(
+                rows, port=443, timeout=2.0, rounds=4, concurrency=10,
+                host="example.com", path="/cdn-cgi/trace", sni="sni.example.com", http_timeout=5.0
+            )
+
+        # 4 rounds: rounds 0 & 2 -> TCP (2 calls), rounds 1 & 3 -> TLS (2 calls)
+        self.assertEqual(len(tcp_calls), 2)
+        self.assertEqual(len(tls_calls), 2)
+        self.assertEqual(tls_calls[0], ("1.2.3.4", "example.com", 443, "/cdn-cgi/trace", "sni.example.com"))
+
+        res = results[0]
+        # TCP had 2 attempts and both succeeded -> loss = 0.0
+        self.assertEqual(res["loss"], 0.0)
+        # TLS had 2 attempts, 1 succeeded and 1 failed -> tls_loss = 0.5
+        self.assertEqual(res["tls_loss"], 0.5)
+        # Samples combined: 30.0, 40.0, 30.0 -> median 30.0
+        self.assertEqual(res["rtt"], 30.0)
+        self.assertEqual(res["rtt_max"], 40.0)
+        self.assertIsNotNone(res["jitter"])
 
 
 if __name__ == "__main__":
