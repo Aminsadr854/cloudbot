@@ -21,6 +21,13 @@ import tunnel  # reuse the SSH connector (direct, or via the Iran jump)
 SCANNER_LOCAL = os.path.join(os.path.dirname(__file__), "cf_scan.py")
 REMOTE_OUT = "/root/cf_bot_scan"
 
+REMOTE_TIMEOUT = 900
+LOCAL_TIMEOUT = 960
+
+
+class ScanTimeoutError(TimeoutError):
+    pass
+
 
 def _load_scanner() -> str:
     with open(SCANNER_LOCAL) as f:
@@ -71,6 +78,19 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
     conn = await tunnel.connect(ssh["host"], int(ssh.get("port", 22)),
                                 ssh["user"], ssh["password"], jump=jump)
     try:
+        # Before starting a new scan on an engine, verify no previous cf_scan.py is
+        # still running for that engine. If one is, terminate it before starting.
+        check_cmd = f"pgrep -f {shlex.quote(remote_script)} 2>/dev/null"
+        prev_proc = await conn.run(check_cmd, check=False)
+        if prev_proc.stdout and prev_proc.stdout.strip():
+            if callable(log):
+                await log(f"اسکن قبلی موتور {engine_id} در حال اجراست؛ متوقف می‌شود…")
+            await conn.run(f"pkill -15 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+            await asyncio.sleep(2)
+            check_still = await conn.run(check_cmd, check=False)
+            if check_still.stdout and check_still.stdout.strip():
+                await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+
         await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
         script = _load_scanner()
         # Write the scanner via SFTP to a unique temp path, then atomically rename into per-engine path
@@ -86,16 +106,29 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
             host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include
         )
         cmd = ("ulimit -n 65535 2>/dev/null; "
+               f"timeout -k 10 {REMOTE_TIMEOUT} "
                + shlex.join(args)
                + " 2>&1 | tail -25")
         await log("در حال سنجش روی سرور ایران…" if only
                   else "در حال اسکن رنج کلادفلر از داخل ایران…")
-        r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=600)
+        try:
+            r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=LOCAL_TIMEOUT)
+        except (asyncio.TimeoutError, TimeoutError):
+            try:
+                await conn.run(f"pkill -15 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+                await asyncio.sleep(5)
+                await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+            except Exception:
+                pass
+            raise ScanTimeoutError(f"Scan timed out after {LOCAL_TIMEOUT}s on engine {engine_id}")
+
         tail = (r.stdout or "")[-500:]
 
         res = await conn.run(f"cat {shlex.quote(out_file + '.json')} 2>/dev/null", check=False)
         raw = (res.stdout or "").strip()
         if not raw:
+            if getattr(r, "exit_status", None) == 124:
+                raise ScanTimeoutError(f"Scan timed out after {REMOTE_TIMEOUT}s on engine {engine_id}.\n{tail[-300:]}")
             raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")
         data = json.loads(raw)
         # keep only genuinely usable finalists (finite rtt), best first

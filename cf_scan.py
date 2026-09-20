@@ -34,6 +34,7 @@ import ipaddress
 import json
 import math
 import random
+import signal
 import ssl
 import statistics
 import sys
@@ -364,6 +365,25 @@ def score(row):
     return cost
 
 
+def write_results(rows: list[dict], out_base: str):
+    """
+    Write ranked candidates to out_base.json and out_base.txt.
+    Used by normal finish, stage-3 checkpoint, and SIGTERM handler.
+    """
+    if not rows:
+        return
+    valid_rows = [
+        r for r in rows
+        if isinstance(r, dict) and r.get("ip") and r.get("rtt") is not None and math.isfinite(r["rtt"])
+    ]
+    if not valid_rows:
+        return
+    with open(out_base + ".json", "w") as f:
+        json.dump(valid_rows, f, indent=1, allow_nan=False)
+    with open(out_base + ".txt", "w") as f:
+        f.write("\n".join(r["ip"] for r in valid_rows if r.get("loss") == 0) + "\n")
+
+
 async def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="speed.cloudflare.com",
@@ -395,6 +415,18 @@ async def main():
                          "stage (used for addresses the phones vouched for)")
     args = ap.parse_args()
 
+    current_candidates: list[dict] = []
+    current_out: str = args.out
+
+    def sigterm_handler(signum, frame):
+        if current_candidates:
+            print("\n  SIGTERM received; saving partial results...", file=sys.stderr, flush=True)
+            write_results(current_candidates, current_out)
+        sys.exit(0)
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, sigterm_handler)
+
     t0 = time.time()
     only = [x.strip() for x in args.only.split(",") if x.strip()]
     if only:
@@ -420,6 +452,8 @@ async def main():
         print("  nothing answered - this path may block Cloudflare entirely.")
         return
 
+    current_candidates = [{"ip": r["ip"], "rtt": r["rtt"], "jitter": 0.0, "loss": 0.0} for r in alive]
+
     keep = alive if only else _pin(alive[:max(args.edge_keep * 4, 400)], alive, pinned)
     print(f"  stage 2  confirming Cloudflare on the {len(keep)} quickest", flush=True)
     good, mediated, my_ip = await stage_edge(
@@ -436,11 +470,17 @@ async def main():
         print("  none served a Cloudflare response - the TLS path is likely interfered with.")
         return
 
+    current_candidates = list(good)
+
     finalists = good if only else _pin(good[:args.edge_keep], good, pinned)
     print(f"  stage 3  stability over {args.rounds} probes each", flush=True)
     finalists = await stage_stable(finalists, args.port, args.connect_timeout,
                                    args.rounds, min(args.concurrency, 60))
     finalists.sort(key=score)
+    current_candidates = list(finalists)
+
+    # Stage 3 checkpoint: write partial results immediately before stage 4 starts
+    write_results(finalists, args.out)
 
     if not args.no_speed:
         top = finalists if only else _pin(finalists[:args.final], finalists, pinned)
@@ -452,6 +492,7 @@ async def main():
         done = {r["ip"] for r in top}
         finalists = top + [r for r in finalists if r["ip"] not in done]
         finalists.sort(key=score)
+        current_candidates = list(finalists)
 
     print()
     print(f"  {'#':<4}{'address':<17}{'rtt':>8}{'jitter':>9}{'loss':>7}"
@@ -465,10 +506,7 @@ async def main():
         print(f"  {i:<4}{r['ip']:<17}{rtt_s}{jit_s}{loss_s}{max_s}{speed:>11}   "
               f"{r.get('colo', '?')}")
 
-    with open(args.out + ".json", "w") as f:
-        json.dump(finalists, f, indent=1, allow_nan=False)
-    with open(args.out + ".txt", "w") as f:
-        f.write("\n".join(r["ip"] for r in finalists if r.get("rtt") is not None and r.get("loss") == 0) + "\n")
+    write_results(finalists, args.out)
     print(f"\n  full results: {args.out}.json")
     print(f"  loss-free addresses only: {args.out}.txt")
     print(f"  took {time.time() - t0:.0f}s")

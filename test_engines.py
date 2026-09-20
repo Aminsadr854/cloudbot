@@ -767,7 +767,105 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("نیاز به بررسی دستی دارد", notify_mock.call_args[0][0])
 
 
+    # Test A7: Remote scan timeouts, process cleanup, and write_results helper
+    async def test_a7_timeouts_clean_kill_and_write_results(self):
+        import cf_scan
+        # 1. Module-level constants
+        self.assertEqual(cfscanner.REMOTE_TIMEOUT, 900)
+        self.assertEqual(cfscanner.LOCAL_TIMEOUT, 960)
+
+        # 2. cf_scan.write_results helper
+        with tempfile.TemporaryDirectory() as td:
+            out_base = os.path.join(td, "scan_res")
+            rows = [
+                {"ip": "104.16.1.1", "rtt": 35.0, "loss": 0.0, "jitter": 1.0},
+                {"ip": "104.16.1.2", "rtt": 40.0, "loss": 0.1, "jitter": 2.0},
+                {"ip": "104.16.1.3", "rtt": None, "loss": 1.0},  # invalid, should be excluded
+            ]
+            cf_scan.write_results(rows, out_base)
+            self.assertTrue(os.path.exists(out_base + ".json"))
+            self.assertTrue(os.path.exists(out_base + ".txt"))
+
+            with open(out_base + ".json") as f:
+                saved_json = json.load(f)
+            self.assertEqual(len(saved_json), 2)
+            self.assertEqual(saved_json[0]["ip"], "104.16.1.1")
+            self.assertEqual(saved_json[1]["ip"], "104.16.1.2")
+
+            with open(out_base + ".txt") as f:
+                saved_txt = f.read().splitlines()
+            self.assertEqual(saved_txt, ["104.16.1.1"])
+
+        # 3. cfscanner.run_scan: pre-clean existing process and command timeout wrapper
+        mock_conn = MagicMock()
+        mock_sftp = AsyncMock()
+        mock_file = AsyncMock()
+        mock_sftp.open = MagicMock(return_value=mock_file)
+        mock_file.__aenter__ = AsyncMock(return_value=mock_file)
+        mock_file.__aexit__ = AsyncMock(return_value=None)
+        mock_sftp.__aenter__ = AsyncMock(return_value=mock_sftp)
+        mock_sftp.__aexit__ = AsyncMock(return_value=None)
+        mock_conn.start_sftp_client = MagicMock(return_value=mock_sftp)
+
+        cmd_history = []
+        async def mock_run(cmd, check=False):
+            cmd_history.append(cmd)
+            res = MagicMock()
+            if "pgrep" in cmd:
+                # First check finds process, second check confirms it died
+                res.stdout = "1234\n" if len([c for c in cmd_history if "pgrep" in c]) == 1 else ""
+            elif "cat " in cmd:
+                res.stdout = json.dumps([{"ip": "104.16.1.1", "rtt": 35.0}])
+            else:
+                res.stdout = "scan output..."
+            res.exit_status = 0
+            return res
+
+        mock_conn.run = AsyncMock(side_effect=mock_run)
+
+        with patch("cfscanner.tunnel.connect", AsyncMock(return_value=mock_conn)), \
+             patch("asyncio.sleep", AsyncMock()):
+            data, _ = await cfscanner.run_scan(
+                {"host": "remote.ir", "user": "root", "password": "p"},
+                jump=None, log=AsyncMock(), engine_id=2
+            )
+            self.assertEqual(len(data), 1)
+            # Verify pgrep was called for engine 2 script
+            self.assertTrue(any("pgrep -f /root/.cf_scan_engine_2.py" in c for c in cmd_history))
+            # Verify pkill -15 was called for engine 2 script
+            self.assertTrue(any("pkill -15 -f /root/.cf_scan_engine_2.py" in c for c in cmd_history))
+            # Verify timeout -k 10 900 is in the scan command
+            scan_cmd = next(c for c in cmd_history if "timeout -k 10 900" in c)
+            self.assertIn("timeout -k 10 900", scan_cmd)
+            self.assertIn("/root/.cf_scan_engine_2.py", scan_cmd)
+
+        # 4. cfscanner.run_scan: timeout expiration triggers clean kill and raises ScanTimeoutError
+        async def mock_run_hang(cmd, check=False):
+            if "pgrep" in cmd:
+                res = MagicMock()
+                res.stdout = ""
+                return res
+            if "timeout -k 10" in cmd:
+                raise asyncio.TimeoutError()
+            res = MagicMock()
+            res.stdout = ""
+            return res
+
+        mock_conn.run = AsyncMock(side_effect=mock_run_hang)
+        with patch("cfscanner.tunnel.connect", AsyncMock(return_value=mock_conn)), \
+             patch("asyncio.sleep", AsyncMock()):
+            with self.assertRaises(cfscanner.ScanTimeoutError):
+                await cfscanner.run_scan(
+                    {"host": "remote.ir", "user": "root", "password": "p"},
+                    jump=None, log=AsyncMock(), engine_id=3
+                )
+            calls = [c[0][0] for c in mock_conn.run.call_args_list]
+            self.assertTrue(any("pkill -15 -f /root/.cf_scan_engine_3.py" in c for c in calls))
+            self.assertTrue(any("pkill -9 -f /root/.cf_scan_engine_3.py" in c for c in calls))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 
 
