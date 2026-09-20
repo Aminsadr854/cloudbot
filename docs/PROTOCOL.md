@@ -372,16 +372,104 @@ Submits measurement results from a completed test pass.
     ]
   }
   ```
-- **Response `200 OK`:**
-  ```json
-  {
-    "ok": true,
-    "accepted": 3,
-    "engine_id": 1,
-    "candidate_hash": "a1b2c3d4e5f6",
-    "state": "ACCEPTED"
-  }
-  ```
+- **Response Schemas & Rejection Outcomes:**
+  Never returns `200 OK {"ok": true}` for reports that will be discarded. Every outcome returns a deterministic machine-readable reason string and explicit HTTP status code.
+
+---
+
+### 3.3 Complete Report Outcomes & Rejection Semantics (Wire Contract)
+
+The following table defines the complete, fixed enumeration of outcomes for `POST /probe/v2/report`. The `reason` strings constitute an immutable wire contract.
+
+| HTTP Status | Reason String (`reason`) | Server Evaluation Condition | Prescribed Client Behaviour |
+|---|---|---|---|
+| `200 OK` | `accepted` | All validations passed. Report is complete, cellular, matches current `candidate_hash`, and is incorporated into consensus scoring. | **Log only.** Report successful. Sleep until next poll interval or ping wake-up. |
+| `200 OK` | `already_recorded` | **Idempotent Replay:** An identical report (`device`, `candidate_hash`, and result array) was already received and processed. | **Log only.** Treat as success. Do not retransmit. *(Justification: Mobile cellular links in Iran frequently drop the TCP ACK / HTTP 200 response after the server successfully processes a POST. Treating retransmitted identical payloads as successful idempotency prevents retry storms while ensuring handset state advances cleanly).* |
+| `400 Bad Request` | `invalid_engine` | `engine_id` is missing from the payload, non-integer, or outside valid range `[1, 3]`. | **Stop and alert.** Software/configuration bug in client app. Alert operator; do not retry automatically. |
+| `400 Bad Request` | `invalid_hash` | `candidate_hash` is missing, empty, or not a valid 12-character hex string. | **Discard and re-fetch.** Payload formatting error. Discard local measurements and re-poll `/probe/v2/candidates`. |
+| `401 Unauthorized` | `unauthorized` | Probe authentication token (`X-Probe-Token` or query token) is missing or does not match `st.probe_token()`. | **Stop and alert.** Authentication failure. Halt probing and notify user/admin to verify server URL and token settings. |
+| `409 Conflict` | `stale_shortlist` | The candidate shortlist has expired on the server (`time > cand_ts + SHORTLIST_DELIVERY_TTL` of 3 hours) or the engine has initiated a newer scan pass. | **Discard and re-fetch.** Measurements describe an obsolete shortlist that cannot participate in consensus. Discard local batch immediately and fetch fresh candidates. |
+| `413 Payload Too Large` | `payload_too_large` | Request payload exceeds 64 KB or results array exceeds 60 items. | **Stop and alert.** Client configuration error. Log error and alert developer. |
+| `422 Unprocessable Entity` | `hash_mismatch` | The reported IP address set does not hash-match the expected candidate set (`rep_hash != cand_hash`). Caused by missing addresses, partial scans, or injected IPs. | **Discard and re-fetch.** Partial or mismatched candidate sets cannot be scored. Discard batch, verify client probes the entire list, and re-fetch. |
+| `422 Unprocessable Entity` | `non_cellular` | Handset reported `net` as `wifi`, `ethernet`, or empty string (`net != "cellular"`). | **Discard and wait.** Handset must be on cellular data to measure operator censorship. Discard measurements; wait until handset detects cellular connection before retrying. |
+
+#### Example Rejection Response (`422 Unprocessable Entity`):
+```json
+{
+  "ok": false,
+  "protocol_version": 2,
+  "engine_id": 1,
+  "candidate_hash": "a1b2c3d4e5f6",
+  "reason": "non_cellular",
+  "message": "Probe reports must be measured over cellular data, not wifi"
+}
+```
+
+---
+
+### 3.4 Partial Results & Stalled Handset Detection
+
+1. **Full List Measurement Mandate:**
+   - The handset **MUST probe every single address** in both `controls` and `candidates`.
+   - **Failures must be recorded as failure items, NEVER omitted.** If an address times out, suffers TCP reset, or fails TLS negotiation, the handset must submit an entry with `ok: false` and the appropriate `stage` (`"tcp"`, `"tls"`).
+   - If an ongoing scan pass is interrupted (e.g. cellular signal loss, incoming phone call, app termination), the client **MUST discard the incomplete run**. It must NEVER submit a truncated results array. Submitting a partial array will fail `candidate_set_hash` verification and trigger a `422 hash_mismatch` rejection.
+2. **Detection of Stalled / Starving Handsets:**
+   - In v1, a handset that repeatedly fetched shortlists but failed to report simply vanished from voting without notification.
+   - **v2 Server Tracking:**
+     - The server tracks consecutive incomplete fetches in `delivery_state_engine_{id}["devices"][device]["fetch_count"]`.
+     - If a handset fetches candidate shortlists **3 consecutive times** without submitting a valid completion (`fetch_count >= 3` with status not `COMPLETE`), the server:
+       1. Logs a `WARNING`: `[starved_device] device=%s fetched candidates 3 times without completion on engine %d`.
+       2. In `/probe/v2/ping`, returns a warning flag:
+          ```json
+          {
+            "ok": true,
+            "protocol_version": 2,
+            "warning": "consecutive_incomplete_deliveries",
+            "pending_engines": [...]
+          }
+          ```
+       3. Flags the handset in the Telegram management dashboard (`cb_scan_verified`) with a diagnostic badge:
+          `⚠️ MCI (۳ دور متوالی اندازه‌گیری تکمیل نشد — احتمال بسته‌شدن برنامه توسط مدیریت باتری)`
+
+---
+
+### 3.5 Multi-Engine Concurrency & Timing Feasibility Analysis
+
+#### 3.5.1 Concurrency Rule
+**A handset MUST probe only one engine's candidate list at a time.**
+Parallel probe sweeps across multiple engines on a single cellular interface saturate the local mobile baseband radio queues, triggering artificial bufferbloat, TCP retransmissions, and false-positive packet drops. Handsets must execute engine jobs sequentially:
+`Fetch Engine 1 -> Measure Engine 1 -> Report Engine 1 -> Fetch Engine 2 -> Measure Engine 2 -> Report Engine 2`.
+
+#### 3.5.2 Timing Feasibility Proof
+- **Workload per Engine Pass:**
+  - Candidate targets: ~45 Cloudflare edge IPs + 1 control reference IP = **46 addresses**.
+  - Rounds per address: **4 rounds**.
+  - Total probe transactions per engine: $46 \times 4 = 184\text{ probes}$.
+  - Socket timeout per probe: **4000ms** (4.0s).
+- **Client Execution Profile on Iranian Cellular Data (3G/4G):**
+  - Mobile client connection pool: $C = 6$ concurrent probe workers.
+  - Typical cellular RTT to Iran relay and Cloudflare domestic edge: 60ms–150ms.
+  - Full handshake (TCP SYN + TLS ClientHello + HTTP `/cdn-cgi/trace`): ~300ms–500ms per successful probe.
+- **Duration Scenarios:**
+  1. **Healthy / Low-Interference Window (90% addresses alive):**
+     - Successful probes: $165 \times 0.5\text{s} = 82.5\text{ worker-seconds}$.
+     - Failed probes (timeouts): $19 \times 4.0\text{s} = 76\text{ worker-seconds}$.
+     - Total wall-clock time across 6 workers:
+       $$\frac{82.5 + 76}{6} \approx 26.4\text{ seconds}$$
+  2. **Severe Filtering / Bad Route Window (50% addresses blackholed):**
+     - Blocked addresses wait the full 4.0s socket timeout.
+     - Total wall-clock time across 6 workers:
+       $$\frac{(92 \times 0.5\text{s}) + (92 \times 4.0\text{s})}{6} = \frac{46 + 368}{6} \approx 69\text{ seconds (1.15 minutes)}$$
+  3. **Catastrophic Blackout (100% addresses dropped):**
+     - All 184 probes hit maximum timeout:
+       $$\frac{184 \times 4.0\text{s}}{6} \approx 122.6\text{ seconds (~2.0 minutes)}$$
+- **Alignment with Operational Windows:**
+  - **Inter-Engine Stagger:** Automated background engine passes are scheduled 5 minutes apart (`DELIVERY_OFFSET_SECONDS = 300`). Because an entire engine probe pass completes in 26s–69s, the handset completes Engine 1's work with over 3.5 minutes of idle radio time before Engine 2's shortlist is generated.
+  - **Shortlist Expiry:** The server delivery TTL is `SHORTLIST_DELIVERY_TTL = 3 * 3600` (**3 hours**). Even under the worst-case blackout scenario (2.0 minutes per engine), all three engines measured back-to-back take at most:
+    $$3 \times 2.0\text{m} = 6.0\text{ minutes}$$
+    6 minutes represents only **3.3%** of the 3-hour expiry window.
+- **Conclusion:**
+  Sequential single-engine execution is **thoroughly feasible**, completely avoids baseband contention, and finishes comfortably within both the 5-minute engine delivery stagger and the 3-hour shortlist delivery window.
 
 ---
 

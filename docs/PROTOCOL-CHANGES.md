@@ -85,17 +85,29 @@ Upgrading to Protocol v2 requires server-side changes across four components:
 - **Current Limitation:** In v1, the backend performs heuristic IP set intersection (`rep_ips & cand_ips`) across all engines because the handset body omits `engine_id`. If a candidate IP appears in multiple engines or all reported addresses fail, attribution is ambiguous.
 - **Required Changes:**
   1. Add async handler `report_v2(request)`.
-  2. Enforce presence of `engine_id`, `candidate_hash`, and `shortlist_ts` in the request body. Return `400 Bad Request` if any of the three are missing.
-  3. Retrieve active delivery state from `store.py`:
-     ```python
-     state = st.get_delivery_state(engine_id)
-     ```
-  4. Compare `body["candidate_hash"]` against `state["candidate_set_hash"]`:
-     - **Match:** Ingest report and mark handset `COMPLETE` for that engine.
-     - **Mismatch / Expired:** If the candidate set has rolled over and the report is older than `SHORTLIST_DELIVERY_TTL`, return `409 Conflict` with `{"ok": false, "reason": "stale_shortlist"}` so the handset discards stale state.
-  5. Ingest granular timings:
-     - Parse `tcp_ms`, `tls_ms`, `ttfb_ms` from each result object.
-     - Store these fields alongside existing `ok`, `rtt_ms`, `loss`, and `stage`.
+  2. **Strict Validation Pipeline:**
+     - Validate `X-Probe-Token`: return `401 Unauthorized` with `{"ok": false, "reason": "unauthorized"}` if invalid.
+     - Validate payload size: return `413 Payload Too Large` with `{"ok": false, "reason": "payload_too_large"}` if > 64 KB or > 60 items.
+     - Validate `engine_id`: return `400 Bad Request` with `{"ok": false, "reason": "invalid_engine"}` if missing or not in `[1, 3]`.
+     - Validate `candidate_hash`: return `400 Bad Request` with `{"ok": false, "reason": "invalid_hash"}` if missing or malformed.
+     - Validate network interface: return `422 Unprocessable Entity` with `{"ok": false, "reason": "non_cellular"}` if `net != "cellular"`.
+  3. **Candidate Hash & Shortlist Freshness Check:**
+     - Retrieve active delivery state: `state = st.get_delivery_state(engine_id)`.
+     - If candidate set has expired (`time > cand_ts + SHORTLIST_DELIVERY_TTL`) or engine has advanced to a new shortlist: return `409 Conflict` with `{"ok": false, "reason": "stale_shortlist"}`.
+  4. **Full List & Hash Matching:**
+     - Recompute hash: `rep_hash = st.candidate_set_hash(reported_ips, controls)`.
+     - If `rep_hash != state["candidate_set_hash"]`: return `422 Unprocessable Entity` with `{"ok": false, "reason": "hash_mismatch"}`.
+  5. **Idempotency Guard:**
+     - Check if device report with identical `candidate_hash` was already processed:
+       ```python
+       dev_state = state["devices"].get(device, {})
+       if dev_state.get("status") == "COMPLETE" and dev_state.get("report_candidate_set_hash") == rep_hash:
+           return web.json_response({"ok": true, "reason": "already_recorded", "engine_id": engine_id})
+       ```
+  6. **Successful Acceptance:**
+     - Ingest granular timings (`tcp_ms`, `tls_ms`, `ttfb_ms`).
+     - Mark handset `COMPLETE` for that engine and reset `fetch_count = 0`.
+     - Return `200 OK` with `{"ok": true, "reason": "accepted", "engine_id": engine_id, "candidate_hash": rep_hash}`.
 
 ---
 
@@ -137,6 +149,17 @@ payload = {
     "controls": controls
 }
 ```
+
+---
+
+### 3.3 Starved Handset Detection (`fetch_count`)
+
+In `record_candidate_delivery()`, increment a persistent counter tracking consecutive shortlist deliveries:
+```python
+dev_state["fetch_count"] = dev_state.get("fetch_count", 0) + 1
+```
+When a valid report completes in `record_candidate_report()`, reset `dev_state["fetch_count"] = 0`.
+If `fetch_count >= 3`, surface a warning flag in `/probe/v2/ping` and mark the device on Telegram.
 
 ---
 
