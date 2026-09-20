@@ -26,6 +26,7 @@ read -rp "Panel username: " PANEL_USER
 read -rsp "Panel password: " PANEL_PASS
 echo
 [ -n "$PANEL_PASS" ] || die "panel password is required"
+read -rp "Control probe host URL (e.g. https://probe.example.com): " PROBE_BASE
 
 echo "→ installing system packages"
 export DEBIAN_FRONTEND=noninteractive
@@ -48,6 +49,8 @@ CLOUDBOT_OWNER=$OWNER
 CLOUDBOT_PANEL_URL=$PANEL_URL
 CLOUDBOT_PANEL_USER=$PANEL_USER
 CLOUDBOT_PANEL_PASS=$PANEL_PASS
+# Host whose addresses serve as control addresses in the phone consensus check
+CLOUDBOT_PROBE_BASE=$PROBE_BASE
 CLOUDBOT_DB=$DIR/data/cloudbot.db
 CLOUDBOT_KEY=$DIR/data/secret.key
 ENV
