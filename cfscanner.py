@@ -41,6 +41,20 @@ class StaleResultError(RuntimeError):
     pass
 
 
+def _process_pattern(remote_script: str) -> str:
+    """Return a regex pattern for pgrep/pkill that matches remote_script without matching itself.
+
+    Transforms the first alphabetic character of the basename into a bracketed
+    character class, e.g. '/root/.cf_scan_engine_9.py' -> '/root/.[c]f_scan_engine_9.py'.
+    """
+    dirname, basename = os.path.split(remote_script)
+    for i, ch in enumerate(basename):
+        if ch.isalpha():
+            new_base = basename[:i] + f"[{ch}]" + basename[i + 1:]
+            return os.path.join(dirname, new_base) if dirname else new_base
+    return remote_script
+
+
 class ScanOutput(tuple):
     prefix_stats: dict
 
@@ -192,6 +206,7 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
     `sni` allows probing with the actual domain SNI.
     """
     remote_script = f"/root/.cf_scan_engine_{engine_id}.py"
+    proc_pattern = _process_pattern(remote_script)
     tmp_path = f"{remote_script}.tmp.{os.getpid()}"
     remote_ranges_file = f"/root/.cf_ranges_engine_{engine_id}.txt"
     tmp_ranges_path = f"{remote_ranges_file}.tmp.{os.getpid()}"
@@ -258,16 +273,16 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
         try:
             # Before starting a new scan on an engine, verify no previous cf_scan.py is
             # still running for that engine. If one is, terminate it before starting.
-            check_cmd = f"pgrep -f {shlex.quote(remote_script)} 2>/dev/null"
+            check_cmd = f"pgrep -f {shlex.quote(proc_pattern)} 2>/dev/null"
             prev_proc = await conn.run(check_cmd, check=False)
             if prev_proc.stdout and prev_proc.stdout.strip():
                 if callable(log):
                     await log(f"اسکن قبلی موتور {engine_id} در حال اجراست؛ متوقف می‌شود…")
-                await conn.run(f"pkill -15 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+                await conn.run(f"pkill -15 -f {shlex.quote(proc_pattern)} 2>/dev/null", check=False)
                 await asyncio.sleep(2)
                 check_still = await conn.run(check_cmd, check=False)
                 if check_still.stdout and check_still.stdout.strip():
-                    await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+                    await conn.run(f"pkill -9 -f {shlex.quote(proc_pattern)} 2>/dev/null", check=False)
 
             scan_start_time = time.time()
             await conn.run(f"rm -f {shlex.quote(out_file + '.json')} {shlex.quote(out_file + '.txt')}", check=False)
@@ -315,9 +330,9 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                 r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=LOCAL_TIMEOUT)
             except (asyncio.TimeoutError, TimeoutError):
                 try:
-                    await conn.run(f"pkill -15 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+                    await conn.run(f"pkill -15 -f {shlex.quote(proc_pattern)} 2>/dev/null", check=False)
                     await asyncio.sleep(5)
-                    await conn.run(f"pkill -9 -f {shlex.quote(remote_script)} 2>/dev/null", check=False)
+                    await conn.run(f"pkill -9 -f {shlex.quote(proc_pattern)} 2>/dev/null", check=False)
                 except Exception:
                     pass
                 raise ScanTimeoutError(f"Scan timed out after {LOCAL_TIMEOUT}s on engine {engine_id}")

@@ -6,6 +6,7 @@ import asyncio
 import io
 import json
 import os
+import shlex
 import signal
 import sys
 import tempfile
@@ -833,10 +834,10 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
                 jump=None, log=AsyncMock(), engine_id=2
             )
             self.assertEqual(len(data), 1)
-            # Verify pgrep was called for engine 2 script
-            self.assertTrue(any("pgrep -f /root/.cf_scan_engine_2.py" in c for c in cmd_history))
-            # Verify pkill -15 was called for engine 2 script
-            self.assertTrue(any("pkill -15 -f /root/.cf_scan_engine_2.py" in c for c in cmd_history))
+            # Verify pgrep was called for engine 2 script using bracketed pattern
+            self.assertTrue(any(f"pgrep -f {shlex.quote(cfscanner._process_pattern('/root/.cf_scan_engine_2.py'))}" in c for c in cmd_history))
+            # Verify pkill -15 was called for engine 2 script using bracketed pattern
+            self.assertTrue(any(f"pkill -15 -f {shlex.quote(cfscanner._process_pattern('/root/.cf_scan_engine_2.py'))}" in c for c in cmd_history))
             # Verify timeout -k 10 900 is in the scan command
             scan_cmd = next(c for c in cmd_history if "timeout -k 10 900" in c)
             self.assertIn("timeout -k 10 900", scan_cmd)
@@ -863,8 +864,23 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
                     jump=None, log=AsyncMock(), engine_id=3
                 )
             calls = [c[0][0] for c in mock_conn.run.call_args_list]
-            self.assertTrue(any("pkill -15 -f /root/.cf_scan_engine_3.py" in c for c in calls))
-            self.assertTrue(any("pkill -9 -f /root/.cf_scan_engine_3.py" in c for c in calls))
+            self.assertTrue(any(f"pkill -15 -f {shlex.quote(cfscanner._process_pattern('/root/.cf_scan_engine_3.py'))}" in c for c in calls))
+            self.assertTrue(any(f"pkill -9 -f {shlex.quote(cfscanner._process_pattern('/root/.cf_scan_engine_3.py'))}" in c for c in calls))
+
+    def test_pgrep_process_pattern_prevents_self_match(self):
+        import re
+        script_path = "/root/.cf_scan_engine_1.py"
+        pattern = cfscanner._process_pattern(script_path)
+        # Assert the pattern does not contain the plain script path
+        self.assertNotIn(script_path, pattern)
+        # Assert the pattern is a bracketed character class differing from literal string
+        self.assertEqual(pattern, "/root/.[c]f_scan_engine_1.py")
+        # Assert regex matches the actual script path
+        self.assertTrue(bool(re.search(pattern, script_path)))
+        # Assert regex does NOT match the shell wrapper command line containing pgrep/pkill
+        wrapper_cmd = f"sh -c pgrep -f {shlex.quote(pattern)} 2>/dev/null"
+        self.assertFalse(bool(re.search(pattern, wrapper_cmd)))
+
 
 
     # Test A8: Atomic writes, truncated-file resistance, and stale result rejection
