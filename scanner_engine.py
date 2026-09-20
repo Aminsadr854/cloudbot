@@ -113,14 +113,19 @@ async def verify_domain_ip(ip: str, host: str, sni: str, port: int = 443, timeou
         return False, f"Connection/TLS failed: {type(e).__name__} ({e})"
 
 
-def _control_ips() -> list:
-    """The reference address handed to phones alongside real candidates."""
-    # Control IP probe base URL. In production, this must be supplied via the
-    # CLOUDBOT_PROBE (or CLOUDBOT_PROBE_BASE) environment variable.
-    probe_base = os.environ.get(
+def get_probe_base() -> str:
+    """Resolve the control probe host URL from environment, with legacy fallback."""
+    return os.environ.get(
         "CLOUDBOT_PROBE_BASE",
         os.environ.get("CLOUDBOT_PROBE", "https://status.example.com")
     )
+
+
+def _control_ips() -> list:
+    """The reference address handed to phones alongside real candidates."""
+    # Control IP probe base URL. In production, this must be supplied via the
+    # CLOUDBOT_PROBE_BASE (or legacy CLOUDBOT_PROBE) environment variable.
+    probe_base = get_probe_base()
     host = probe_base.split("//", 1)[-1].split("/")[0].split(":")[0]
     try:
         import socket

@@ -40,7 +40,7 @@ import watchdog
 from cloudflare import CFError, Cloudflare
 from provision import Panel, provision_node
 from store import Store
-from scanner_engine import ScannerEngine, delivery_coordinator
+from scanner_engine import ScannerEngine, delivery_coordinator, get_probe_base
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -51,9 +51,8 @@ OWNER = int(os.environ["CLOUDBOT_OWNER"])
 # Phones are given this address, never the bot host: a handset in Iran
 # dialling a foreign address is the traffic that gets shaped.
 # Control IP probe base URL. In production, this must be supplied via the
-# CLOUDBOT_PROBE (or CLOUDBOT_PROBE_BASE) environment variable.
-PROBE_BASE = os.environ.get("CLOUDBOT_PROBE_BASE",
-                            "https://status.example.com")
+# CLOUDBOT_PROBE_BASE (or legacy CLOUDBOT_PROBE) environment variable.
+PROBE_BASE = get_probe_base()
 PANEL_URL = os.environ["CLOUDBOT_PANEL_URL"]
 PANEL_USER = os.environ["CLOUDBOT_PANEL_USER"]
 PANEL_PASS = os.environ["CLOUDBOT_PANEL_PASS"]
@@ -4097,7 +4096,7 @@ async def main():
         h, p, u, pw = os.environ["CLOUDBOT_JUMP"].split(":", 3)
         st.set_jump(h, int(p), u, pw)
         log.info("iran jump host seeded: %s", h)
-    probe_val = os.environ.get("CLOUDBOT_PROBE_BASE") or os.environ.get("CLOUDBOT_PROBE")
+    probe_val = get_probe_base()
     if not probe_val or "example.com" in probe_val:
         log.warning(
             "Control probe host is unconfigured: CLOUDBOT_PROBE_BASE (or CLOUDBOT_PROBE) is unset, empty, or using placeholder. "

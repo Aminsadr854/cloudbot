@@ -16,6 +16,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.modules.setdefault("asyncssh", MagicMock())
 sys.modules.setdefault("aiohttp", MagicMock())
+sys.modules.setdefault("aiogram", MagicMock())
+sys.modules.setdefault("aiogram.client.default", MagicMock())
+sys.modules.setdefault("aiogram.enums", MagicMock())
+sys.modules.setdefault("aiogram.filters", MagicMock())
+sys.modules.setdefault("aiogram.fsm.context", MagicMock())
+class _DummyStatesGroup:
+    pass
+class _DummyState:
+    pass
+_fsm_state = MagicMock()
+_fsm_state.StatesGroup = _DummyStatesGroup
+_fsm_state.State = _DummyState
+sys.modules.setdefault("aiogram.fsm.state", _fsm_state)
+sys.modules.setdefault("aiogram.fsm.storage.memory", MagicMock())
+sys.modules.setdefault("aiogram.types", MagicMock())
+sys.modules.setdefault("aiogram.utils.keyboard", MagicMock())
 
 import store
 import cfscanner
@@ -556,6 +572,27 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
                 ctrls = scanner_engine._control_ips()
                 mock_dns.assert_called_once_with("legacy.probe.com")
                 self.assertEqual(ctrls, ["5.6.7.8"])
+
+    # Test 11b — Setting only legacy CLOUDBOT_PROBE produces same resolved value in bot.py and scanner_engine.py
+    def test_legacy_probe_unified_resolution(self):
+        env = {
+            "CLOUDBOT_PROBE": "https://legacy.probe.example.com",
+            "CLOUDBOT_TOKEN": "mock:token",
+            "CLOUDBOT_OWNER": "123456",
+            "CLOUDBOT_PANEL_URL": "https://panel.example.com",
+            "CLOUDBOT_PANEL_USER": "admin",
+            "CLOUDBOT_PANEL_PASS": "secret",
+            "CLOUDBOT_DB": self.db_path,
+            "CLOUDBOT_KEY": self.key_path,
+        }
+        with patch.dict(os.environ, env, clear=True):
+            engine_val = scanner_engine.get_probe_base()
+            self.assertEqual(engine_val, "https://legacy.probe.example.com")
+            import bot
+            import importlib
+            importlib.reload(bot)
+            self.assertEqual(bot.PROBE_BASE, "https://legacy.probe.example.com")
+            self.assertEqual(bot.PROBE_BASE, engine_val)
 
     # Test 12 — _report_trusted() rejects Wi-Fi or empty measurements
     def test_regression_12_report_trusted_behavior_unchanged(self):
