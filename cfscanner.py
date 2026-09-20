@@ -18,7 +18,6 @@ import shlex
 import tunnel  # reuse the SSH connector (direct, or via the Iran jump)
 
 SCANNER_LOCAL = os.path.join(os.path.dirname(__file__), "cf_scan.py")
-REMOTE_SCANNER = "/root/cf_scan.py"
 REMOTE_OUT = "/root/cf_bot_scan"
 
 
@@ -65,21 +64,24 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
     `engine_id` isolates output files on the remote server when multiple engines scan.
     `sni` allows probing with the actual domain SNI.
     """
+    remote_script = f"/root/.cf_scan_engine_{engine_id}.py"
+    tmp_path = f"{remote_script}.tmp.{os.getpid()}"
     out_file = remote_out or (f"/root/cf_bot_scan_engine_{engine_id}" if engine_id else REMOTE_OUT)
     conn = await tunnel.connect(ssh["host"], int(ssh.get("port", 22)),
                                 ssh["user"], ssh["password"], jump=jump)
     try:
         await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
         script = _load_scanner()
-        # Write the scanner via SFTP so a 400-line file with quotes survives.
+        # Write the scanner via SFTP to a unique temp path, then atomically rename into per-engine path
         async with conn.start_sftp_client() as sftp:
-            async with sftp.open(REMOTE_SCANNER, "w") as f:
+            async with sftp.open(tmp_path, "w") as f:
                 await f.write(script)
+        await conn.run(f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)}", check=False)
 
         # Raise the fd limit inline: every probe in flight holds one, and the
         # default 1024 would silently cap concurrency and lose candidates.
         args = _build_scan_args(
-            REMOTE_SCANNER, out_file, per_24=per_24, rounds=rounds, final=final,
+            remote_script, out_file, per_24=per_24, rounds=rounds, final=final,
             host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include
         )
         cmd = ("ulimit -n 65535 2>/dev/null; "

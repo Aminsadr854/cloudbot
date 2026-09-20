@@ -619,6 +619,16 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(shlex.quote(out_file), cmd)
 
 
+    # Test A2: Per-engine remote script path isolation and no shared REMOTE_SCANNER
+    def test_a2_per_engine_remote_script_isolation(self):
+        self.assertFalse(hasattr(cfscanner, "REMOTE_SCANNER"), "REMOTE_SCANNER should be removed")
+        scripts = [f"/root/.cf_scan_engine_{eid}.py" for eid in (1, 2, 3)]
+        self.assertEqual(len(set(scripts)), 3)
+        for eid, s in zip((1, 2, 3), scripts):
+            args = cfscanner._build_scan_args(s, f"/root/out_{eid}")
+            self.assertEqual(args[1], s)
+
+
 if __name__ == "__main__":
     unittest.main()
 
