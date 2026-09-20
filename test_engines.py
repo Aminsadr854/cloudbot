@@ -655,6 +655,24 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         loss_free = [r["ip"] for r in finalists if r.get("rtt") is not None and r.get("loss") == 0]
         self.assertEqual(loss_free, ["2.2.2.2"])
 
+    # Test A4: Missing measurement of live_ip keeps current IP without changing
+    def test_a4_missing_live_ip_measurement_keeps_current_ip(self):
+        results = [{"ip": "104.16.1.20", "rtt": 30}]
+        live_ip = "104.16.1.99"
+        measured = {
+            "104.16.1.20": {"rtt": 30, "jitter": 2.0, "loss": 0.0, "valid": True, "cf_error": False}
+        }
+        verdicts = {
+            "dev1": {"104.16.1.20": (True, 30, 1.0)},
+            "dev2": {"104.16.1.20": (True, 32, 1.0)},
+        }
+        with patch("scanner_engine._phone_verdicts", return_value=verdicts):
+            decision = choose(results, live_ip=live_ip, measured=measured, engine_id=1, st=self.st)
+            decision_no_live = choose(results, live_ip=None, measured=measured, engine_id=1, st=self.st)
+        self.assertFalse(decision["change"])
+        self.assertIn("ناموفق", decision["why"])
+        self.assertTrue(decision_no_live["change"])
+
 
 if __name__ == "__main__":
     unittest.main()

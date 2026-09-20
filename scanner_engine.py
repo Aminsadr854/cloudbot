@@ -248,9 +248,15 @@ def choose(results: list, live_ip: Optional[str] = None, measured: Optional[dict
                     [r["ip"] for _rel, r in contenders])
 
     live_m = measured.get(live_ip) if live_ip else None
-    live_score = cfscanner.score(live_m) if live_m else float("inf")
+    if live_ip and live_m is None:
+        return keep("اندازه‌گیری آدرس فعلی ناموفق بود — آدرس فعلی ماند",
+                    len(voters))
     if live_m and (live_m.get("cf_error") or live_m.get("valid") is False):
         live_score = float("inf")
+    elif live_m:
+        live_score = cfscanner.score(live_m)
+    else:
+        live_score = float("inf")   # only when there is no live_ip at all
 
     better = []
     for rel, r in contenders:
