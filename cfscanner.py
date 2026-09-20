@@ -12,12 +12,15 @@ because a steady 90 ms path beats a 40 ms one that stalls.
 """
 import asyncio
 import json
+import logging
 import math
 import os
 import shlex
 import time
 
 import tunnel  # reuse the SSH connector (direct, or via the Iran jump)
+
+logger = logging.getLogger("cfscanner")
 
 SCANNER_LOCAL = os.path.join(os.path.dirname(__file__), "cf_scan.py")
 REMOTE_OUT = "/root/cf_bot_scan"
@@ -40,9 +43,13 @@ class StaleResultError(RuntimeError):
 
 import urllib.request
 
-RANGES_CACHE_FILE = "/tmp/cf_ranges_cache.txt"
+RANGES_CACHE_FILE = os.path.join(os.path.dirname(__file__), ".cf_ranges_cache.txt")
 RANGES_CACHE_TTL = 6 * 3600  # at least 6 hours
 CF_RANGES_URL = "https://www.cloudflare.com/ips-v4"
+
+_in_memory_ranges: str | None = None
+_in_memory_ranges_ts: float = 0.0
+_cache_write_warned: bool = False
 
 
 def _get_cached_ranges() -> str:
@@ -50,7 +57,10 @@ def _get_cached_ranges() -> str:
     Fetch Cloudflare range list on the bot host, caching it for at least 6 hours.
     Falls back to CF_V4_FALLBACK if fetch fails and cache is absent.
     """
+    global _in_memory_ranges, _in_memory_ranges_ts, _cache_write_warned
     now = time.time()
+
+    # 1. If valid disk cache exists, use it
     if os.path.exists(RANGES_CACHE_FILE):
         try:
             mtime = os.path.getmtime(RANGES_CACHE_FILE)
@@ -58,35 +68,55 @@ def _get_cached_ranges() -> str:
                 with open(RANGES_CACHE_FILE) as f:
                     content = f.read().strip()
                 if content and "/" in content:
+                    _in_memory_ranges = content
+                    _in_memory_ranges_ts = mtime
                     return content
         except Exception:
             pass
 
-    # Fetch live on bot host
+    # 2. If valid in-memory cache exists (e.g. unwritable disk directory), use it
+    if _in_memory_ranges and (now - _in_memory_ranges_ts < RANGES_CACHE_TTL):
+        return _in_memory_ranges
+
+    # 3. Fetch live on bot host
     try:
         with urllib.request.urlopen(CF_RANGES_URL, timeout=20) as r:
             body = r.read().decode().strip()
         if "/" in body:
-            tmp_cache = f"{RANGES_CACHE_FILE}.tmp.{os.getpid()}"
-            with open(tmp_cache, "w") as f:
-                f.write(body + "\n")
-            os.replace(tmp_cache, RANGES_CACHE_FILE)
+            _in_memory_ranges = body
+            _in_memory_ranges_ts = now
+            try:
+                tmp_cache = f"{RANGES_CACHE_FILE}.tmp.{os.getpid()}"
+                with open(tmp_cache, "w") as f:
+                    f.write(body + "\n")
+                os.replace(tmp_cache, RANGES_CACHE_FILE)
+            except Exception as e:
+                if not _cache_write_warned:
+                    logger.warning("Could not write Cloudflare ranges cache to %s: %s", RANGES_CACHE_FILE, e)
+                    _cache_write_warned = True
             return body
     except Exception:
         pass
 
-    # If live fetch failed but stale cache exists, use it
+    # 4. If live fetch failed but in-memory cache exists, use it
+    if _in_memory_ranges:
+        return _in_memory_ranges
+
+    # 5. If live fetch failed but stale disk cache exists, use it
     if os.path.exists(RANGES_CACHE_FILE):
         try:
             with open(RANGES_CACHE_FILE) as f:
                 content = f.read().strip()
             if content and "/" in content:
+                _in_memory_ranges = content
+                _in_memory_ranges_ts = os.path.getmtime(RANGES_CACHE_FILE)
                 return content
         except Exception:
             pass
 
     from cf_scan import CF_V4_FALLBACK
     return CF_V4_FALLBACK.strip()
+
 
 
 EXCLUDE_FILE_THRESHOLD = 250  # IPs (~4KB); above this threshold, ship as a file to avoid ARG_MAX

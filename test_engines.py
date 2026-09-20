@@ -1565,7 +1565,37 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(cached2, cached)
                 mock_url.assert_not_called()
 
-        # 4. _build_scan_args includes --ranges-file
+        # 4. unwritable cache directory logs warning once and carries on using in-memory value
+        cfscanner._in_memory_ranges = None
+        cfscanner._in_memory_ranges_ts = 0.0
+        cfscanner._cache_write_warned = False
+        unwritable_cache = "/proc/nonexistent_dir/cache.txt"
+        with patch("cfscanner.RANGES_CACHE_FILE", unwritable_cache), \
+             patch("cfscanner.urllib.request.urlopen") as mock_url, \
+             patch.object(cfscanner.logger, "warning") as mock_warn:
+            mock_resp = MagicMock()
+            mock_resp.read.return_value = b"30.0.0.0/8\n"
+            mock_resp.__enter__.return_value = mock_resp
+            mock_resp.__exit__.return_value = None
+            mock_url.return_value = mock_resp
+
+            res1 = cfscanner._get_cached_ranges()
+            self.assertEqual(res1, "30.0.0.0/8")
+            self.assertEqual(mock_warn.call_count, 1)
+
+            # Second call uses in-memory cache without urlopen and without repeating warning
+            mock_url.reset_mock()
+            mock_warn.reset_mock()
+            res2 = cfscanner._get_cached_ranges()
+            self.assertEqual(res2, "30.0.0.0/8")
+            mock_url.assert_not_called()
+            mock_warn.assert_not_called()
+
+        # 5. cache location is next to the application
+        self.assertEqual(os.path.dirname(cfscanner.RANGES_CACHE_FILE),
+                         os.path.dirname(cfscanner.SCANNER_LOCAL))
+
+        # 6. _build_scan_args includes --ranges-file
         args = cfscanner._build_scan_args("scan.py", "out", ranges_file="/root/ranges.txt")
         self.assertIn("--ranges-file", args)
         idx = args.index("--ranges-file")
