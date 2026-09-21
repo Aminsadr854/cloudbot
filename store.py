@@ -17,6 +17,10 @@ from cryptography.fernet import Fernet
 DB_PATH = os.environ.get("CLOUDBOT_DB", "/opt/cloudbot/data/cloudbot.db")
 KEY_PATH = os.environ.get("CLOUDBOT_KEY", "/opt/cloudbot/data/secret.key")
 
+BLOCK_FAILURES_REQUIRED = 3
+BLOCK_WINDOW_SECONDS = 24 * 3600
+BLOCK_EXPIRY_SECONDS = 72 * 3600
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,6 +46,22 @@ CREATE TABLE IF NOT EXISTS server_secrets (
     PRIMARY KEY (account_id, server_id)
 );
 CREATE TABLE IF NOT EXISTS settings (k TEXT PRIMARY KEY, v TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS blocked_ip_failures (
+    ip TEXT NOT NULL,
+    ts REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_blocked_ip_failures_ip_ts
+    ON blocked_ip_failures (ip, ts);
+CREATE TABLE IF NOT EXISTS cf_prefix_stats (
+    prefix TEXT PRIMARY KEY,
+    samples REAL DEFAULT 0.0,
+    successes REAL DEFAULT 0.0,
+    score_sum REAL DEFAULT 0.0,
+    last_sampled REAL DEFAULT 0.0,
+    last_success REAL DEFAULT 0.0
+);
+CREATE INDEX IF NOT EXISTS idx_prefix_stats_last_sampled
+    ON cf_prefix_stats (last_sampled);
 """
 
 
@@ -731,24 +751,153 @@ class Store:
     # address in fifty usable at midday and twenty-six in fifty that evening.
     # Remembering a refusal for half a day would rule out most of the space on
     # the strength of one bad hour.
-    def mark_blocked(self, ips, ttl_hours=3):
-        import json, time
-        now = int(time.time())
-        d = self.blocked_ips(raw=True)
-        for ip in ips:
-            d[ip] = now
-        cutoff = now - ttl_hours * 3600
-        d = {ip: ts for ip, ts in d.items() if ts >= cutoff}
-        self.set("blocked_ips", json.dumps(d))
+    def _migrate_blocked_ips_if_needed(self):
+        import json
+        with self.con:
+            row = self.con.execute("SELECT v FROM settings WHERE k = 'blocked_ips'").fetchone()
+            if not row:
+                return
+            self.con.execute("DELETE FROM settings WHERE k = 'blocked_ips'")
+            v = row[0]
+            try:
+                d = json.loads(v) if v else {}
+            except Exception:
+                d = {}
+            if isinstance(d, dict):
+                rows = []
+                for ip, val in d.items():
+                    if isinstance(val, (int, float)):
+                        rows.append((str(ip), float(val)))
+                    elif isinstance(val, list):
+                        for ts in val:
+                            if isinstance(ts, (int, float)):
+                                rows.append((str(ip), float(ts)))
+                if rows:
+                    self.con.executemany("INSERT INTO blocked_ip_failures (ip, ts) VALUES (?, ?)", rows)
 
-    def blocked_ips(self, raw=False, ttl_hours=3):
-        import json, time
-        v = self.get("blocked_ips")
-        d = json.loads(v) if v else {}
-        if raw:
-            return d
-        cutoff = time.time() - ttl_hours * 3600
-        return {ip for ip, ts in d.items() if ts >= cutoff}
+    def mark_blocked(self, ips, now=None):
+        """
+        Record failure timestamps for IPs. One INSERT per ip in a single executemany
+        without read-modify-write. Prunes failures older than BLOCK_EXPIRY_SECONDS.
+        """
+        import time
+        if not ips:
+            return
+        self._migrate_blocked_ips_if_needed()
+        now_ts = float(time.time() if now is None else now)
+        expiry_cutoff = now_ts - BLOCK_EXPIRY_SECONDS
+        rows = [(str(ip), now_ts) for ip in ips]
+        with self.con:
+            self.con.executemany("INSERT INTO blocked_ip_failures (ip, ts) VALUES (?, ?)", rows)
+            self.con.execute("DELETE FROM blocked_ip_failures WHERE ts < ?", (expiry_cutoff,))
+
+    def blocked_ips(self, now=None) -> set[str]:
+        """
+        Return set of blocked IPs: at least BLOCK_FAILURES_REQUIRED failures within
+        BLOCK_WINDOW_SECONDS (24h) and most recent failure within BLOCK_EXPIRY_SECONDS (72h).
+        """
+        import time
+        self._migrate_blocked_ips_if_needed()
+        now_ts = float(time.time() if now is None else now)
+        expiry_cutoff = now_ts - BLOCK_EXPIRY_SECONDS
+        q = """
+        SELECT a.ip
+        FROM blocked_ip_failures a
+        JOIN blocked_ip_failures b ON a.ip = b.ip AND b.ts >= a.ts AND b.ts <= a.ts + ?
+        GROUP BY a.ip, a.ts
+        HAVING COUNT(*) >= ? AND max(b.ts) >= ?
+        """
+        cur = self.con.execute(q, (float(BLOCK_WINDOW_SECONDS), BLOCK_FAILURES_REQUIRED, expiry_cutoff))
+        return {row[0] for row in cur}
+
+    def record_prefix_stats(self, stats: dict, now=None):
+        """
+        Record prefix statistics from a scan pass in a single executemany transaction.
+        Accumulates samples, successes, and score_sum.
+        last_success only advances when this batch had successes.
+        """
+        import time
+        if not stats:
+            return
+        now_ts = float(time.time() if now is None else now)
+        rows = []
+        for prefix, s in stats.items():
+            succ = float(s.get("successes", 0.0))
+            rows.append((
+                str(prefix),
+                float(s.get("samples", 0.0)),
+                succ,
+                float(s.get("score_sum", 0.0)),
+                now_ts,
+                now_ts if succ > 0 else 0.0,
+            ))
+        with self.con:
+            self.con.executemany("""
+                INSERT INTO cf_prefix_stats (prefix, samples, successes, score_sum, last_sampled, last_success)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(prefix) DO UPDATE SET
+                    samples = cf_prefix_stats.samples + excluded.samples,
+                    successes = cf_prefix_stats.successes + excluded.successes,
+                    score_sum = cf_prefix_stats.score_sum + excluded.score_sum,
+                    last_sampled = excluded.last_sampled,
+                    last_success = CASE WHEN excluded.last_success > 0 THEN excluded.last_success ELSE cf_prefix_stats.last_success END
+            """, rows)
+
+    def get_prefix_stats(self, now=None) -> dict:
+        """
+        Return prefix stats with 24-hour half-life exponential decay applied.
+        DECAY DIFFERENTLY PER COUNTER:
+          - samples decays by (now - last_sampled): measures freshness of probe volume.
+          - successes and score_sum decay by (now - last_success): a prefix sampled recently
+            with no success since last week must not have week-old successes look fresh.
+        """
+        import time
+        now_ts = float(time.time() if now is None else now)
+        tau = 24.0 * 3600.0
+        out = {}
+        cur = self.con.execute(
+            "SELECT prefix, samples, successes, score_sum, last_sampled, last_success FROM cf_prefix_stats"
+        )
+        for prefix, samples, successes, score_sum, last_sampled, last_success in cur:
+            # samples decays by time since last sampled
+            dt_sampled = max(0.0, now_ts - (last_sampled or now_ts))
+            decay_sampled = 2.0 ** (-dt_sampled / tau)
+            decayed_samples = float(samples or 0.0) * decay_sampled
+
+            # successes and score_sum decay by time since last success
+            if last_success and last_success > 0 and successes and successes > 0:
+                dt_success = max(0.0, now_ts - last_success)
+                decay_success = 2.0 ** (-dt_success / tau)
+                decayed_successes = float(successes) * decay_success
+                decayed_score_sum = float(score_sum or 0.0) * decay_success
+            else:
+                decayed_successes = 0.0
+                decayed_score_sum = 0.0
+
+            out[prefix] = {
+                "samples": decayed_samples,
+                "successes": decayed_successes,
+                "score_sum": decayed_score_sum,
+                "total_samples": float(samples or 0.0),
+                "total_successes": float(successes or 0.0),
+                "last_sampled": last_sampled,
+                "last_success": last_success,
+            }
+        return out
+
+    def prune_prefix_stats(self, current_prefixes):
+        """
+        Purge subnets no longer announced by Cloudflare.
+        Uses a temp table to avoid SQLite variable limits with ~6000 prefixes.
+        """
+        if not current_prefixes:
+            return
+        with self.con:
+            self.con.execute("CREATE TEMP TABLE IF NOT EXISTS _valid_prefixes (prefix TEXT PRIMARY KEY)")
+            self.con.execute("DELETE FROM _valid_prefixes")
+            self.con.executemany("INSERT OR IGNORE INTO _valid_prefixes VALUES (?)", [(str(p),) for p in current_prefixes])
+            self.con.execute("DELETE FROM cf_prefix_stats WHERE prefix NOT IN (SELECT prefix FROM _valid_prefixes)")
+            self.con.execute("DROP TABLE _valid_prefixes")
 
     def probe_token(self) -> str:
         """Shared secret the phones authenticate with; created on first use."""

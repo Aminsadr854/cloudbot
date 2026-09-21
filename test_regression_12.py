@@ -42,7 +42,14 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
         self.key_path = os.path.join(self.tmp_dir.name, "test.key")
         self.st = Store(db_path=self.db_path, key_path=self.key_path)
 
+        async def fake_resolve_a(fqdn, timeout=5.0):
+            return ["104.16.1.10", "104.17.2.20", "104.18.3.30", "104.17.2.50", "104.26.1.1", "104.26.14.9", "104.26.14.1", "104.26.14.2"]
+
+        self._resolve_patch = patch("scanner_engine._resolve_a", side_effect=fake_resolve_a)
+        self._resolve_patch.start()
+
     def tearDown(self):
+        self._resolve_patch.stop()
         self.tmp_dir.cleanup()
 
     # ----------------------------------------------------------------------
@@ -104,6 +111,7 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
         """Backend returning HTTP 400 Bad Request with Sec-WebSocket-Version header is valid."""
         fake_head = (b"HTTP/1.1 400 Bad Request\r\n"
                      b"Server: cloudflare\r\n"
+                     b"CF-RAY: 8e123456789abcde-FRA\r\n"
                      b"Sec-WebSocket-Version: 13\r\n\r\n")
         fake_body = b"Bad Request"
 
@@ -297,6 +305,7 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
 
         with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
              patch("scanner_engine.verify_domain_ip", AsyncMock(side_effect=verify_side_effects)), \
+             patch("scanner_engine._resolve_a", AsyncMock(return_value=["104.26.1.1"])), \
              patch("asyncio.sleep", AsyncMock()):  # don't wait 6s during unit test
             await eng.phone_recheck_pass(notify_fn=notify_mock)
 
@@ -346,6 +355,7 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
 
         with patch("scanner_engine.Cloudflare", return_value=mock_cf), \
              patch("scanner_engine.verify_domain_ip", AsyncMock(return_value=(True, "Valid WebSocket Backend (HTTP 400)"))), \
+             patch("scanner_engine._resolve_a", AsyncMock(return_value=["104.26.14.9"])), \
              patch("asyncio.sleep", AsyncMock()):
             await eng.phone_recheck_pass(notify_fn=notify_mock)
 
@@ -432,27 +442,27 @@ class TestRegression12(unittest.IsolatedAsyncioTestCase):
     # ----------------------------------------------------------------------
     def test_13_target_resolution_and_precedence(self):
         """All 3 engines resolve Host and SNI to stored probe_sni when explicit values are absent."""
-        self.st.set("probe_sni", "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
-        self.st.update_cfscan(1, fqdn="c1c1c1c1c1c1.rjwarehousing.ir")
-        self.st.update_cfscan(2, fqdn="c2c2c2c2c2.rjwarehousing.ir")
-        self.st.update_cfscan(3, fqdn="c3c3c3c3.rjwarehousing.ir")
+        self.st.set("probe_sni", "cdcdcdcdcdcddccccddddnnn.example.com")
+        self.st.update_cfscan(1, fqdn="c1c1c1c1c1c1.example.com")
+        self.st.update_cfscan(2, fqdn="c2c2c2c2c2.example.com")
+        self.st.update_cfscan(3, fqdn="c3c3c3c3.example.com")
 
         h1, s1 = self.st.get_engine_targets(1)
         h2, s2 = self.st.get_engine_targets(2)
         h3, s3 = self.st.get_engine_targets(3)
 
-        self.assertEqual(h1, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
-        self.assertEqual(s1, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
-        self.assertEqual(h2, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
-        self.assertEqual(s2, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
-        self.assertEqual(h3, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
-        self.assertEqual(s3, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+        self.assertEqual(h1, "cdcdcdcdcdcddccccddddnnn.example.com")
+        self.assertEqual(s1, "cdcdcdcdcdcddccccddddnnn.example.com")
+        self.assertEqual(h2, "cdcdcdcdcdcddccccddddnnn.example.com")
+        self.assertEqual(s2, "cdcdcdcdcdcddccccddddnnn.example.com")
+        self.assertEqual(h3, "cdcdcdcdcdcddccccddddnnn.example.com")
+        self.assertEqual(s3, "cdcdcdcdcdcddccccddddnnn.example.com")
 
         # Explicit host override takes priority
-        self.st.update_cfscan(1, host="custom-override.rjwarehousing.ir")
+        self.st.update_cfscan(1, host="custom-override.example.com")
         h1_over, s1_over = self.st.get_engine_targets(1)
-        self.assertEqual(h1_over, "custom-override.rjwarehousing.ir")
-        self.assertEqual(s1_over, "cdcdcdcdcdcddccccddddnnn.rjwarehousing.ir")
+        self.assertEqual(h1_over, "custom-override.example.com")
+        self.assertEqual(s1_over, "cdcdcdcdcdcddccccddddnnn.example.com")
 
     # ----------------------------------------------------------------------
     # Test 14: Contender fallback on domain prevalidation failure

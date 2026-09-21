@@ -32,7 +32,10 @@ import argparse
 import asyncio
 import ipaddress
 import json
+import math
+import os
 import random
+import signal
 import ssl
 import statistics
 import sys
@@ -63,42 +66,146 @@ TLS_CTX.check_hostname = False
 TLS_CTX.verify_mode = ssl.CERT_NONE
 TLS_CTX.set_alpn_protocols(["http/1.1"])
 
+TLS_CTX_VERIFY = ssl.create_default_context()
+TLS_CTX_VERIFY.check_hostname = True
+TLS_CTX_VERIFY.set_alpn_protocols(["http/1.1"])
+
 
 # --------------------------------------------------------------------------
 # candidate generation
 # --------------------------------------------------------------------------
-def cloudflare_ranges():
+def cloudflare_ranges(ranges_file=None):
+    if ranges_file:
+        try:
+            with open(ranges_file) as f:
+                lines = [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+            if lines and any("/" in l for l in lines):
+                valid = [l for l in lines if "/" in l]
+                print(f"  ranges source: file ({ranges_file})", flush=True)
+                return valid
+            else:
+                print(f"  (ranges file {ranges_file} invalid or empty; trying live fetch)", file=sys.stderr)
+        except Exception as e:
+            print(f"  (could not read ranges file {ranges_file}: {e}; trying live fetch)", file=sys.stderr)
+
     try:
         with urllib.request.urlopen(CF_V4_URL, timeout=20) as r:
             body = r.read().decode()
         if "/" in body:
+            print(f"  ranges source: live fetch ({CF_V4_URL})", flush=True)
             return [l.strip() for l in body.splitlines() if l.strip()]
     except Exception as e:
         print(f"  (could not fetch the live range list: {e}; using the built-in one)",
               file=sys.stderr)
+    print("  ranges source: built-in fallback", flush=True)
     return [l.strip() for l in CF_V4_FALLBACK.splitlines() if l.strip()]
 
 
-def candidates(ranges, per_24, seed=None):
+EXPLOITATION_FRACTION = 0.70
+EXPLORATION_FRACTION = 0.30
+EXPLOITATION_MIN_YIELD = 0.10      # lowered from 0.50
+EXPLOITATION_MIN_SAMPLES = 3.0
+COLD_START_MIN_PREFIXES = 100
+EXPLORATION_STALE_HOURS = 48
+
+
+def candidates(ranges, per_24, seed=None, limit=0, exclude=None, prefix_stats=None):
     """
     Sample addresses spread across every /24 rather than taken at random.
-
-    Cloudflare assigns whole /24s to a site, so addresses inside one behave
-    alike while neighbouring blocks can route through entirely different
-    cities. Random sampling across the whole space would test one block
-    repeatedly and miss others completely.
+    Biased toward productive prefixes if prefix_stats is provided (70/30 exploitation/exploration).
+    Falls back to uniform sampling on cold start (< COLD_START_MIN_PREFIXES).
     """
     rng = random.Random(seed)
-    out = []
+    exclude_set = set(exclude) if exclude else None
+    subnets = []
     for cidr in ranges:
         net = ipaddress.ip_network(cidr)
         if net.version != 4:
             continue
-        for sub in net.subnets(new_prefix=24) if net.prefixlen < 24 else [net]:
-            hosts = list(sub.hosts())
-            if not hosts:
+        if net.prefixlen < 24:
+            subnets.extend(net.subnets(new_prefix=24))
+        else:
+            subnets.append(net)
+
+    now = time.time()
+    stats = prefix_stats or {}
+
+    # Check cold start: fewer than COLD_START_MIN_PREFIXES rows -> 100% exploration (uniform random)
+    if len(stats) < COLD_START_MIN_PREFIXES:
+        if limit > 0:
+            rng.shuffle(subnets)
+        ordered_subnets = subnets
+    else:
+        exploit_candidates = []
+        exploit_weights = []
+        explore_candidates = []
+        stale_cutoff = now - (EXPLORATION_STALE_HOURS * 3600.0)
+
+        for sub in subnets:
+            p = str(sub)
+            p_stat = stats.get(p)
+            if not p_stat:
+                explore_candidates.append(sub)
                 continue
-            out.extend(str(ip) for ip in rng.sample(hosts, min(per_24, len(hosts))))
+
+            samples = float(p_stat.get("samples", 0.0))
+            successes = float(p_stat.get("successes", 0.0))
+            score_sum = float(p_stat.get("score_sum", 0.0))
+            last_sampled = float(p_stat.get("last_sampled", 0.0))
+            total_samples = float(p_stat.get("total_samples", samples))
+            total_successes = float(p_stat.get("total_successes", successes))
+            yield_val = (successes / samples) if samples > 0 else 0.0
+
+            if samples >= EXPLOITATION_MIN_SAMPLES and yield_val >= EXPLOITATION_MIN_YIELD:
+                mean_score = (score_sum / successes) if successes > 0 else 0.0
+                weight = yield_val / (mean_score + 1.0)
+                exploit_candidates.append(sub)
+                exploit_weights.append(max(weight, 1e-6))
+            elif total_samples >= EXPLOITATION_MIN_SAMPLES and total_successes == 0:
+                # Proven dead prefix (tested >= 3 times with 0 successes).
+                # Must NOT be re-explored even if stale.
+                pass
+            elif samples == 0 or last_sampled < stale_cutoff:
+                explore_candidates.append(sub)
+
+        num_needed = math.ceil(limit / per_24) if (limit > 0 and per_24 > 0) else len(subnets)
+        k_exploit = min(len(exploit_candidates), int(num_needed * EXPLOITATION_FRACTION))
+        k_explore = num_needed - k_exploit
+
+        chosen_subnets = []
+        if k_exploit > 0 and exploit_candidates:
+            keys = [rng.random() ** (1.0 / w) for w in exploit_weights]
+            sorted_indices = sorted(range(len(exploit_candidates)), key=lambda i: keys[i], reverse=True)
+            for idx in sorted_indices[:k_exploit]:
+                chosen_subnets.append(exploit_candidates[idx])
+
+        if k_explore > 0 and explore_candidates:
+            k_exp = min(k_explore, len(explore_candidates))
+            chosen_subnets.extend(rng.sample(explore_candidates, k_exp))
+
+        chosen_set = set(chosen_subnets)
+        remaining = [s for s in subnets if s not in chosen_set]
+        rng.shuffle(remaining)
+        ordered_subnets = chosen_subnets + remaining
+
+    out = []
+    for sub in ordered_subnets:
+        base = int(sub.network_address)
+        num_avail = 254 if sub.prefixlen == 24 else max(0, sub.num_addresses - 2)
+        if num_avail <= 0:
+            continue
+        k = min(per_24, num_avail)
+        offsets = rng.sample(range(1, num_avail + 1), k=k)
+        for offset in offsets:
+            ip_str = str(ipaddress.IPv4Address(base + offset))
+            if exclude_set and ip_str in exclude_set:
+                continue
+            out.append(ip_str)
+            if limit > 0 and len(out) >= limit:
+                break
+        if limit > 0 and len(out) >= limit:
+            break
+
     rng.shuffle(out)
     return out
 
@@ -145,22 +252,40 @@ def _pin(subset, full, pinned):
                            if _ip_of(e) in pinned and _ip_of(e) not in have]
 
 
-async def stage_reachable(ips, port, timeout, concurrency, progress_every=20000):
-    sem = asyncio.Semaphore(concurrency)
+async def stage_reachable(ips, port, timeout, concurrency, progress_every=None, retries=1):
+    if not ips:
+        return []
+    if progress_every is None:
+        progress_every = max(1, len(ips) // 10)
+    queue = asyncio.Queue()
+    for ip in ips:
+        queue.put_nowait(ip)
+
     alive = []
     done = 0
+    num_workers = min(max(1, concurrency), len(ips))
+    for _ in range(num_workers):
+        queue.put_nowait(None)
 
-    async def one(ip):
+    async def worker():
         nonlocal done
-        async with sem:
+        while True:
+            ip = await queue.get()
+            if ip is None:
+                break
             ms = await tcp_probe(ip, port, timeout)
-        done += 1
-        if done % progress_every == 0:
-            print(f"    {done}/{len(ips)} probed, {len(alive)} answering", flush=True)
-        if ms is not None:
-            alive.append((ip, ms))
+            for _ in range(retries):
+                if ms is not None:
+                    break
+                ms = await tcp_probe(ip, port, timeout)
+            done += 1
+            if progress_every and done % progress_every == 0:
+                print(f"    {done}/{len(ips)} probed, {len(alive)} answering", flush=True)
+            if ms is not None:
+                alive.append((ip, ms))
 
-    await asyncio.gather(*(one(ip) for ip in ips))
+    workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
+    await asyncio.gather(*workers)
     alive.sort(key=lambda x: x[1])
     return alive
 
@@ -168,12 +293,60 @@ async def stage_reachable(ips, port, timeout, concurrency, progress_every=20000)
 # --------------------------------------------------------------------------
 # stage 2: is it really a Cloudflare edge that will serve traffic
 # --------------------------------------------------------------------------
-async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None):
+CF_CODES = ["1034", "1000", "1001", "1002", "520", "521", "522", "523", "524", "525", "526"]
+
+
+def classify_cf_error(status: str, headers: str, body: str) -> tuple[bool, str | None]:
+    """
+    Check if the response represents a known Cloudflare edge or origin error.
+    Returns (is_error, error_code_or_name).
+    """
+    body_lower = (body or "").lower()
+    headers_lower = (headers or "").lower()
+    status_str = str(status)
+
+    for code in CF_CODES:
+        if f"error code: {code}" in body_lower or f"errorcode: {code}" in body_lower or f"error {code}" in body_lower:
+            return True, code
+    if status_str == "403" and ("cloudflare" in headers_lower or "cf-ray" in headers_lower) and "error" in body_lower:
+        return True, "403"
+    return False, None
+
+
+def is_valid_response(status: str, headers: str, body: str, is_trace: bool = False) -> bool:
+    """
+    Check if the response is a valid Cloudflare edge response.
+    Requires cf-ray header and absence of Cloudflare edge/origin errors.
+    """
+    headers_lower = (headers or "").lower()
+    if "cf-ray" not in headers_lower:
+        return False
+
+    is_err, _ = classify_cf_error(status, headers, body)
+    if is_err:
+        return False
+
+    status_str = str(status)
+    body_lower = (body or "").lower()
+
+    if is_trace:
+        return ("ip=" in body and "colo=" in body) or ("server: cloudflare" in headers_lower and status_str == "200")
+    if status_str in ("200", "101"):
+        return True
+    if status_str == "400" and ("sec-websocket-version" in headers_lower or "bad request" in body_lower):
+        return True
+    if status_str in ("204", "301", "302", "404"):
+        return True
+    return False
+
+
+async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=False, sni=None, verify=False):
     """One HTTPS request to a named host/SNI, forced to a specific address."""
     start = time.perf_counter()
     server_name = (sni or host).strip()
+    ctx = TLS_CTX_VERIFY if verify else TLS_CTX
     try:
-        fut = asyncio.open_connection(ip, port, ssl=TLS_CTX, server_hostname=server_name)
+        fut = asyncio.open_connection(ip, port, ssl=ctx, server_hostname=server_name)
         reader, writer = await asyncio.wait_for(fut, timeout=timeout)
         tls_ms = (time.perf_counter() - start) * 1000
 
@@ -208,37 +381,17 @@ async def http_probe(ip, host, port, path, timeout, read_bytes=0, want_body=Fals
             pass
 
         status = head.split(b" ")[1].decode() if b" " in head else "?"
-        body_lower = body.lower()
-
-        # Reject known Cloudflare edge and origin errors
-        cf_error = False
-        cf_err_code = None
-        cf_codes = ["1034", "1000", "1001", "1002", "520", "521", "522", "523", "524", "525", "526"]
-        for code in cf_codes:
-            if f"error code: {code}" in body_lower or f"errorcode: {code}" in body_lower or f"error {code}" in body_lower:
-                cf_error = True
-                cf_err_code = code
-                break
-        if not cf_error and status == "403" and ("cloudflare" in headers or "cf-ray" in headers) and "error" in body_lower:
-            cf_error = True
-            cf_err_code = "403"
-
         is_trace = "/cdn-cgi/trace" in path
-        valid = False
-        if not cf_error:
-            if is_trace:
-                valid = ("ip=" in body and "colo=" in body) or ("server: cloudflare" in headers and status == "200")
-            elif status in ("200", "101"):
-                valid = True
-            elif status == "400" and ("sec-websocket-version" in headers or "bad request" in body_lower):
-                valid = True
-            elif status in ("204", "301", "302", "404") and not cf_error:
-                valid = True
+        cf_error, cf_err_code = classify_cf_error(status, headers, body)
+        valid = is_valid_response(status, headers, body, is_trace)
 
         return {"tls_ms": tls_ms, "ttfb_ms": ttfb_ms, "status": status,
                 "cloudflare": ("server: cloudflare" in headers or "cf-ray" in headers),
                 "valid": valid, "cf_error": cf_error, "cf_err_code": cf_err_code,
+                "cert_ok": True if verify else None,
                 "bytes": got, "dl_ms": dl_ms, "body": body}
+    except ssl.SSLCertVerificationError:
+        return {"error": "CertVerify", "valid": False, "cf_error": False, "cert_ok": False}
     except Exception as e:
         return {"error": type(e).__name__, "valid": False, "cf_error": False}
 
@@ -267,54 +420,130 @@ async def stage_edge(alive, host, port, path, timeout, concurrency, sni=None):
     """
     Keep only addresses that give a direct, unmediated, non-error path to Cloudflare.
     """
-    sem = asyncio.Semaphore(concurrency)
+    if not alive:
+        return [], [], None, False
+
     seen = []
+    cert_failed = []
 
-    async def one(ip, tcp_ms):
-        async with sem:
-            r = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni)
-        if "error" not in r and r.get("valid") and not r.get("cf_error"):
-            seen.append({"ip": ip, "tcp_ms": tcp_ms, **r,
-                         **parse_trace(r.get("body", ""))})
+    queue = asyncio.Queue()
+    for item in alive:
+        queue.put_nowait(item)
 
-    await asyncio.gather(*(one(ip, ms) for ip, ms in alive))
+    num_workers = min(max(1, concurrency), len(alive))
+    for _ in range(num_workers):
+        queue.put_nowait(None)
 
-    reported = [d["ip_trace"] for d in seen if d.get("ip_trace")]
+    async def worker():
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            ip, tcp_ms = item
+            r = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni, verify=True)
+            if r.get("cert_ok") is False:
+                # Probe permissively to see if the address otherwise responds correctly
+                r_fallback = await http_probe(ip, host, port, path, timeout, want_body=True, sni=sni, verify=False)
+                if "error" not in r_fallback and r_fallback.get("valid") and not r_fallback.get("cf_error"):
+                    cert_failed.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": False,
+                                        "reason": "certificate verification failed", **r_fallback,
+                                        **parse_trace(r_fallback.get("body", ""))})
+                else:
+                    cert_failed.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": False,
+                                        "reason": "certificate verification failed", **r})
+            elif "error" not in r and r.get("valid") and not r.get("cf_error"):
+                seen.append({"ip": ip, "tcp_ms": tcp_ms, "cert_ok": True, **r,
+                             **parse_trace(r.get("body", ""))})
+
+    workers = [asyncio.create_task(worker()) for _ in range(num_workers)]
+    await asyncio.gather(*workers)
+
+    # Sanity check: if certificate verification failed for >90% of responsive addresses,
+    # it indicates a local trust store failure (bad CA bundle, clock skew, unusual chain).
+    responsive_cert_failed = [d for d in cert_failed if d.get("valid") and not d.get("cf_error")]
+    total_responsive = len(seen) + len(responsive_cert_failed)
+    trust_store_broken = False
+    if total_responsive > 0 and (len(responsive_cert_failed) / total_responsive) > 0.90:
+        trust_store_broken = True
+        print(
+            "\n  [WARNING] Local trust store failure detected! Over 90% of responsive addresses failed\n"
+            "  certificate verification. Likely causes: outdated CA bundle, incorrect system clock, or\n"
+            "  an unusual domain certificate chain. Falling back to accepting candidates with cert_ok=False.\n",
+            file=sys.stderr, flush=True
+        )
+
+    if trust_store_broken:
+        candidates_to_check = seen + responsive_cert_failed
+        other_cert_failed = [d for d in cert_failed if d not in responsive_cert_failed]
+    else:
+        candidates_to_check = seen
+        other_cert_failed = cert_failed
+
+    reported = [d["ip_trace"] for d in candidates_to_check if d.get("ip_trace")]
     my_ip = max(set(reported), key=reported.count) if reported else None
 
     good, mediated = [], []
-    for d in seen:
+    for d in other_cert_failed:
+        mediated.append(d)
+
+    for d in candidates_to_check:
         if my_ip and d.get("ip_trace") and d["ip_trace"] != my_ip:
+            d["reason"] = f"seen as {d.get('ip_trace')} via {d.get('colo', '?')}/{d.get('loc', '?')}"
             mediated.append(d)
         else:
             good.append(d)
     good.sort(key=lambda d: d["ttfb_ms"])
-    return good, mediated, my_ip
+    return good, mediated, my_ip, trust_store_broken
 
 
 # --------------------------------------------------------------------------
 # stage 3: does it stay good
 # --------------------------------------------------------------------------
-async def stage_stable(rows, port, timeout, rounds, concurrency):
+async def stage_stable(rows, port, timeout, rounds, concurrency,
+                       host="speed.cloudflare.com", path="/cdn-cgi/trace",
+                       sni=None, http_timeout=6.0):
     sem = asyncio.Semaphore(concurrency)
 
     async def one(row):
         async with sem:
-            samples = []
-            for _ in range(rounds):
-                ms = await tcp_probe(row["ip"], port, timeout)
-                samples.append(ms)
+            tcp_samples = []
+            tls_samples = []
+            for r in range(rounds):
+                if r % 2 == 0:
+                    ms = await tcp_probe(row["ip"], port, timeout)
+                    tcp_samples.append(ms)
+                else:
+                    res = await http_probe(
+                        row["ip"], host, port, path, http_timeout,
+                        read_bytes=0, want_body=False, sni=sni
+                    )
+                    if "error" in res or not res.get("valid") or res.get("cf_error"):
+                        tls_samples.append(None)
+                    else:
+                        tls_samples.append(res.get("ttfb_ms"))
                 await asyncio.sleep(0.12)
-        ok = [s for s in samples if s is not None]
-        row["loss"] = (len(samples) - len(ok)) / len(samples)
-        if ok:
-            row["rtt"] = statistics.median(ok)
+
+        tcp_ok = [s for s in tcp_samples if s is not None]
+        tls_ok = [s for s in tls_samples if s is not None]
+
+        row["loss"] = (len(tcp_samples) - len(tcp_ok)) / len(tcp_samples) if tcp_samples else 0.0
+        row["tls_loss"] = (len(tls_samples) - len(tls_ok)) / len(tls_samples) if tls_samples else 0.0
+
+        if tcp_ok:
+            row["rtt"] = statistics.median(tcp_ok)
             # Mean absolute deviation rather than stdev: a single stalled probe
             # should register, not be squared into dominating the figure.
-            row["jitter"] = statistics.mean(abs(x - row["rtt"]) for x in ok)
-            row["rtt_max"] = max(ok)
+            row["jitter"] = statistics.mean(abs(x - row["rtt"]) for x in tcp_ok)
+            row["rtt_max"] = max(tcp_ok)
         else:
-            row["rtt"] = row["jitter"] = row["rtt_max"] = float("inf")
+            row["rtt"] = row["jitter"] = row["rtt_max"] = None
+
+        if tls_ok:
+            row["tls_rtt"] = statistics.median(tls_ok)
+            row["tls_jitter"] = statistics.mean(abs(x - row["tls_rtt"]) for x in tls_ok)
+        else:
+            row["tls_rtt"] = row["tls_jitter"] = None
+
         return row
 
     return await asyncio.gather(*(one(r) for r in rows))
@@ -326,6 +555,8 @@ async def stage_stable(rows, port, timeout, rounds, concurrency):
 async def stage_speed(rows, host, port, size_bytes, timeout, concurrency):
     # Deliberately low concurrency: parallel downloads compete for the same
     # uplink and would measure the server's own limit rather than each edge.
+    # Note: host is hardcoded to "speed.cloudflare.com" because /__down only
+    # exists on Cloudflare's speed test infrastructure.
     sem = asyncio.Semaphore(concurrency)
     path = f"/__down?bytes={size_bytes}"
 
@@ -348,19 +579,75 @@ async def stage_speed(rows, host, port, size_bytes, timeout, concurrency):
 def score(row):
     """
     Lower is better. Loss dominates, jitter counts double against latency.
-
-    A path that drops one probe in twenty is unusable for a tunnel even at
-    30 ms, so loss is weighted far above anything else; ranking on the average
-    alone would put exactly that address at the top.
+    Must agree exactly with cfscanner._score().
     """
-    if row["rtt"] == float("inf"):
+    if not row.get("rtt") or not math.isfinite(row["rtt"]):
         return float("inf")
-    cost = row["rtt"] + 2.0 * row["jitter"] + 1000.0 * row["loss"]
+    jitter = float(row.get("jitter") or 0.0)
+    loss = float(row.get("loss") or 0.0)
+    tls_loss = float(row.get("tls_loss") or 0.0)
+    tls_jitter = float(row.get("tls_jitter") or 0.0)
+    cost = float(row["rtt"]) + 2.0 * jitter + 1000.0 * loss + 1200.0 * tls_loss + 0.5 * tls_jitter
     if row.get("mbps"):
         # A fast edge earns a discount, capped so throughput cannot outweigh
         # a path that is unstable.
-        cost -= min(row["mbps"], 100.0) * 0.5
+        cost -= min(float(row["mbps"]), 100.0) * 0.5
     return cost
+
+
+_write_lock = False
+
+
+def write_results(rows: list[dict], out_base: str, scan_start: float | None = None, engine_id: int = 0,
+                  trust_store_broken: bool = False, prefix_stats: dict | None = None):
+    """
+    Write ranked candidates to out_base.json and out_base.txt atomically.
+    Guarded against signal handler re-entrancy.
+    """
+    global _write_lock
+    if _write_lock:
+        return
+    _write_lock = True
+    try:
+        if not rows:
+            return
+        valid_rows = []
+        for r in rows:
+            if not isinstance(r, dict) or not r.get("ip"):
+                continue
+            rtt = r.get("rtt")
+            if rtt is None and r.get("tcp_ms") is not None:
+                rtt = r["tcp_ms"]
+            if rtt is not None and math.isfinite(rtt):
+                row_copy = dict(r)
+                row_copy.setdefault("rtt", rtt)
+                valid_rows.append(row_copy)
+        if not valid_rows:
+            return
+
+        payload = {
+            "scan_start": int(scan_start) if scan_start is not None else int(time.time()),
+            "engine_id": int(engine_id),
+            "trust_store_broken": bool(trust_store_broken),
+            "results": valid_rows,
+            "prefix_stats": prefix_stats or {},
+        }
+
+        tmp_json = f"{out_base}.json.tmp"
+        with open(tmp_json, "w") as f:
+            json.dump(payload, f, indent=1, allow_nan=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_json, f"{out_base}.json")
+
+        tmp_txt = f"{out_base}.txt.tmp"
+        with open(tmp_txt, "w") as f:
+            f.write("\n".join(r["ip"] for r in valid_rows if r.get("loss") == 0) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_txt, f"{out_base}.txt")
+    finally:
+        _write_lock = False
 
 
 async def main():
@@ -374,15 +661,20 @@ async def main():
     ap.add_argument("--path", default="/cdn-cgi/trace")
     ap.add_argument("--per-24", type=int, default=1, help="addresses sampled per /24")
     ap.add_argument("--limit", type=int, default=0, help="cap candidates (0 = all)")
-    ap.add_argument("--connect-timeout", type=float, default=2.0)
+    ap.add_argument("--connect-timeout", type=float, default=3.0)
+    ap.add_argument("--stage1-retries", type=int, default=1,
+                    help="retries per address if initial reachability probe fails")
     ap.add_argument("--http-timeout", type=float, default=6.0)
     ap.add_argument("--concurrency", type=int, default=400)
     ap.add_argument("--edge-keep", type=int, default=120, help="carried into the stability stage")
     ap.add_argument("--final", type=int, default=20, help="carried into the speed stage")
     ap.add_argument("--rounds", type=int, default=12, help="probes per address for jitter")
     ap.add_argument("--speed-bytes", type=int, default=2_000_000)
+    ap.add_argument("--speed-max", type=int, default=10,
+                    help="maximum candidates to test in the speed stage")
     ap.add_argument("--no-speed", action="store_true", help="skip the download stage")
     ap.add_argument("--out", default="/root/cf_results")
+    ap.add_argument("--engine-id", type=int, default=0, help="scanner engine ID")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--only", default="",
                     help="measure exactly these addresses and sample nothing; "
@@ -392,18 +684,60 @@ async def main():
                     help="comma-separated addresses to measure whatever the "
                          "random sample turned up, and to carry through every "
                          "stage (used for addresses the phones vouched for)")
+    ap.add_argument("--ranges-file", default="",
+                    help="path to local file containing Cloudflare CIDR ranges")
+    ap.add_argument("--exclude", default="",
+                    help="comma-separated addresses to exclude from scanning")
+    ap.add_argument("--exclude-file", default="",
+                    help="path to local file containing addresses to exclude")
+    ap.add_argument("--prefix-stats-file", default="",
+                    help="path to local JSON file containing prefix statistics")
     args = ap.parse_args()
 
     t0 = time.time()
+    current_candidates: list[dict] = []
+    current_out: str = args.out
+    current_trust_store_broken: bool = False
+    current_prefix_stats: dict[str, dict] = {}
+
+    def sigterm_handler(signum, frame):
+        if current_candidates:
+            print("\n  SIGTERM received; saving partial results...", file=sys.stderr, flush=True)
+            write_results(current_candidates, current_out, scan_start=t0, engine_id=args.engine_id,
+                          trust_store_broken=current_trust_store_broken, prefix_stats=current_prefix_stats)
+        sys.exit(0)
+
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, sigterm_handler)
+
+    exclude = {ip.strip() for ip in args.exclude.split(",") if ip.strip()}
+    if args.exclude_file:
+        try:
+            with open(args.exclude_file) as f:
+                for line in f:
+                    for part in line.replace(",", " ").split():
+                        p = part.strip()
+                        if p and not p.startswith("#"):
+                            exclude.add(p)
+        except Exception as e:
+            print(f"  (could not read exclude file {args.exclude_file}: {e})", file=sys.stderr)
+
+    prefix_stats = {}
+    if args.prefix_stats_file:
+        try:
+            with open(args.prefix_stats_file) as f:
+                prefix_stats = json.load(f)
+        except Exception as e:
+            print(f"  (could not read prefix stats file {args.prefix_stats_file}: {e}; falling back to uniform sampling)", file=sys.stderr)
+            prefix_stats = {}
+
     only = [x.strip() for x in args.only.split(",") if x.strip()]
     if only:
         ranges, ips = [], only
         print(f"  measuring a fixed list of {len(ips)} address(es)", flush=True)
     else:
-        ranges = cloudflare_ranges()
-        ips = candidates(ranges, args.per_24, args.seed)
-        if args.limit:
-            ips = ips[:args.limit]
+        ranges = cloudflare_ranges(args.ranges_file)
+        ips = candidates(ranges, args.per_24, args.seed, limit=args.limit, exclude=exclude, prefix_stats=prefix_stats)
     pinned = {ip.strip() for ip in args.include.split(",") if ip.strip()}
     if pinned:
         ips = list(pinned) + [i for i in ips if i not in pinned]
@@ -412,59 +746,114 @@ async def main():
     if not only:
         print(f"  ranges: {len(ranges)}   candidates: {len(ips)}", flush=True)
 
+    for ip in ips:
+        p = ip.rsplit(".", 1)[0] + ".0/24"
+        if p not in current_prefix_stats:
+            current_prefix_stats[p] = {"samples": 0.0, "successes": 0.0, "score_sum": 0.0}
+        current_prefix_stats[p]["samples"] += 1.0
+
     print("  stage 1  reachable", flush=True)
-    alive = await stage_reachable(ips, args.port, args.connect_timeout, args.concurrency)
+    progress_every = max(1, len(ips) // 10)
+    alive = await stage_reachable(
+        ips, args.port, args.connect_timeout, args.concurrency,
+        progress_every=progress_every, retries=args.stage1_retries
+    )
     print(f"    {len(alive)} answered on {args.port}", flush=True)
     if not alive:
         print("  nothing answered - this path may block Cloudflare entirely.")
         return
 
+    current_candidates = [{"ip": r[0], "rtt": r[1], "jitter": 0.0, "loss": 0.0} for r in alive]
+
     keep = alive if only else _pin(alive[:max(args.edge_keep * 4, 400)], alive, pinned)
     print(f"  stage 2  confirming Cloudflare on the {len(keep)} quickest", flush=True)
-    good, mediated, my_ip = await stage_edge(
+    good, mediated, my_ip, trust_store_broken = await stage_edge(
         keep, args.host, args.port, args.path,
         args.http_timeout, min(args.concurrency, 100), sni=args.sni or None)
+    current_trust_store_broken = trust_store_broken
     print(f"    this machine appears to Cloudflare as {my_ip}", flush=True)
     print(f"    {len(good)} direct, {len(mediated)} reached through something else",
           flush=True)
+    cert_fails = sum(1 for d in mediated if d.get("cert_ok") is False)
+    ip_fails = sum(1 for d in mediated if d.get("cert_ok") is not False)
+    print(f"    excluded breakdown: {cert_fails} certificate verification failed, {ip_fails} client IP mismatch", flush=True)
     if mediated:
         for d in mediated[:5]:
-            print(f"      excluded {d['ip']:<16} seen as {d.get('ip_trace')} "
-                  f"via {d.get('colo', '?')}/{d.get('loc', '?')}", flush=True)
+            reason = d.get("reason") or f"seen as {d.get('ip_trace')} via {d.get('colo', '?')}/{d.get('loc', '?')}"
+            print(f"      excluded {d['ip']:<16} {reason}", flush=True)
     if not good:
         print("  none served a Cloudflare response - the TLS path is likely interfered with.")
         return
 
+    for d in good:
+        ip = d.get("ip")
+        if ip:
+            p = ip.rsplit(".", 1)[0] + ".0/24"
+            if p not in current_prefix_stats:
+                current_prefix_stats[p] = {"samples": 0.0, "successes": 0.0, "score_sum": 0.0}
+            current_prefix_stats[p]["successes"] += 1.0
+
+    current_candidates = list(good)
+
     finalists = good if only else _pin(good[:args.edge_keep], good, pinned)
     print(f"  stage 3  stability over {args.rounds} probes each", flush=True)
-    finalists = await stage_stable(finalists, args.port, args.connect_timeout,
-                                   args.rounds, min(args.concurrency, 60))
+    finalists = await stage_stable(
+        finalists, args.port, args.connect_timeout,
+        args.rounds, min(args.concurrency, 40),
+        host=args.host, path=args.path, sni=args.sni or None,
+        http_timeout=args.http_timeout)
     finalists.sort(key=score)
+    current_candidates = list(finalists)
+
+    for d in finalists:
+        ip = d.get("ip")
+        if ip:
+            p = ip.rsplit(".", 1)[0] + ".0/24"
+            s_val = score(d)
+            if math.isfinite(s_val):
+                if p not in current_prefix_stats:
+                    current_prefix_stats[p] = {"samples": 0.0, "successes": 0.0, "score_sum": 0.0}
+                current_prefix_stats[p]["score_sum"] += s_val
+
+    # Stage 3 checkpoint: write partial results immediately before stage 4 starts
+    write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id,
+                  trust_store_broken=trust_store_broken, prefix_stats=current_prefix_stats)
 
     if not args.no_speed:
         top = finalists if only else _pin(finalists[:args.final], finalists, pinned)
+        if args.speed_max > 0:
+            top = top[:args.speed_max]
         mb = args.speed_bytes / 1e6
         print(f"  stage 4  download {mb:.1f} MB from the best {len(top)}"
               f"  (~{mb * len(top):.0f} MB total)", flush=True)
+        # stage_speed deliberately hardcodes "speed.cloudflare.com" because
+        # /__down only exists there on Cloudflare's speed test infrastructure
         top = await stage_speed(top, "speed.cloudflare.com", args.port,
                                 args.speed_bytes, max(args.http_timeout, 25), 3)
         done = {r["ip"] for r in top}
         finalists = top + [r for r in finalists if r["ip"] not in done]
         finalists.sort(key=score)
+        current_candidates = list(finalists)
 
     print()
     print(f"  {'#':<4}{'address':<17}{'rtt':>8}{'jitter':>9}{'loss':>7}"
-          f"{'worst':>9}{'speed':>11}   colo")
+          f"{'tls_loss':>9}{'tls/tcp':>8}{'worst':>9}{'speed':>11}   colo")
     for i, r in enumerate(finalists[:args.final], 1):
         speed = f"{r['mbps']:.1f} Mbps" if r.get("mbps") else "-"
-        print(f"  {i:<4}{r['ip']:<17}{r['rtt']:>7.1f}ms{r['jitter']:>8.1f}ms"
-              f"{r['loss'] * 100:>6.0f}%{r['rtt_max']:>8.1f}ms{speed:>11}   "
+        rtt_s = f"{r['rtt']:>7.1f}ms" if (r.get("rtt") is not None and math.isfinite(r["rtt"])) else f"{'-':>9}"
+        jit_s = f"{r['jitter']:>8.1f}ms" if (r.get("jitter") is not None and math.isfinite(r["jitter"])) else f"{'-':>10}"
+        loss_s = f"{r['loss'] * 100:>6.0f}%" if (r.get("loss") is not None and math.isfinite(r["loss"])) else f"{'-':>7}"
+        tls_loss_s = f"{r['tls_loss'] * 100:>8.0f}%" if (r.get("tls_loss") is not None and math.isfinite(r["tls_loss"])) else f"{'-':>9}"
+        if r.get("tls_rtt") is not None and r.get("rtt") and r["rtt"] > 0 and math.isfinite(r["tls_rtt"]) and math.isfinite(r["rtt"]):
+            ratio_s = f"{r['tls_rtt'] / r['rtt']:>7.2f}x"
+        else:
+            ratio_s = f"{'-':>8}"
+        max_s = f"{r['rtt_max']:>8.1f}ms" if (r.get("rtt_max") is not None and math.isfinite(r["rtt_max"])) else f"{'-':>10}"
+        print(f"  {i:<4}{r['ip']:<17}{rtt_s}{jit_s}{loss_s}{tls_loss_s}{ratio_s}{max_s}{speed:>11}   "
               f"{r.get('colo', '?')}")
 
-    with open(args.out + ".json", "w") as f:
-        json.dump(finalists, f, indent=1)
-    with open(args.out + ".txt", "w") as f:
-        f.write("\n".join(r["ip"] for r in finalists if r["loss"] == 0) + "\n")
+    write_results(finalists, args.out, scan_start=t0, engine_id=args.engine_id,
+                  trust_store_broken=trust_store_broken, prefix_stats=current_prefix_stats)
     print(f"\n  full results: {args.out}.json")
     print(f"  loss-free addresses only: {args.out}.txt")
     print(f"  took {time.time() - t0:.0f}s")

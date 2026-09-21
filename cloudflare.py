@@ -73,3 +73,7 @@ class Cloudflare:
             json={"type": "A", "name": record["name"], "content": ip,
                   "ttl": record.get("ttl", 60),
                   "proxied": record.get("proxied", False)})
+
+    async def delete_record(self, zone_id, record_id):
+        return await self._req("DELETE", f"/zones/{zone_id}/dns_records/{record_id}")
+

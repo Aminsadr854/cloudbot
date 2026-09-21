@@ -7,13 +7,16 @@ Coordinates phone delivery with an isolated 5-minute offset queue.
 """
 import asyncio
 import html
+import ipaddress
 import json
 import logging
 import os
+import socket
 import ssl
 import time
 from typing import Callable, Optional
 
+import cf_scan
 import cfscanner
 from cloudflare import Cloudflare
 from store import Store
@@ -35,6 +38,19 @@ TLS_CTX = ssl.create_default_context()
 TLS_CTX.check_hostname = False
 TLS_CTX.verify_mode = ssl.CERT_NONE
 TLS_CTX.set_alpn_protocols(["http/1.1"])
+
+
+async def _resolve_a(fqdn: str, timeout: float = 5.0) -> list[str]:
+    """Resolve fqdn to A records, off the event loop thread."""
+    loop = asyncio.get_running_loop()
+    try:
+        infos = await asyncio.wait_for(
+            loop.getaddrinfo(fqdn, 443, family=socket.AF_INET,
+                             type=socket.SOCK_STREAM),
+            timeout=timeout)
+        return sorted({i[4][0] for i in infos})
+    except Exception:
+        return []
 
 
 def get_engine_targets(st: Store, engine_id: int) -> tuple[str, str]:
@@ -73,21 +89,23 @@ async def verify_domain_ip(ip: str, host: str, sni: str, port: int = 443, timeou
         except Exception:
             pass
 
-        # 1. Reject Cloudflare errors
-        cf_errors = ["1034", "1000", "1001", "1002", "520", "521", "522", "523", "524", "525", "526"]
-        for code in cf_errors:
-            if f"error code: {code}" in body or f"errorcode: {code}" in body or f"error {code}" in body:
-                return False, f"Cloudflare Error {code}"
+        # 1. Reject Cloudflare errors using canonical classifier
+        is_cf_err, cf_code = cf_scan.classify_cf_error(status, headers, body)
+        if is_cf_err:
+            if cf_code == "403":
+                return False, "Cloudflare 403 Edge Restriction"
+            return False, f"Cloudflare Error {cf_code}"
 
-        if status == "403" and ("cloudflare" in headers or "cf-ray" in headers) and "error" in body:
-            return False, "Cloudflare 403 Edge Restriction"
+        # 2. Require cf-ray header
+        if "cf-ray" not in headers:
+            return False, "No cf-ray header (not a Cloudflare edge)"
 
-        # 2. Check for valid origin / application responses
-        if status in ("200", "101"):
-            return True, f"HTTP {status} OK"
-        if status == "400" and ("sec-websocket-version" in headers or "bad request" in body):
-            return True, "Valid WebSocket Backend (HTTP 400)"
-        if status in ("204", "301", "302", "404") and not ("error" in body and "cloudflare" in headers):
+        # 3. Check for valid origin / application responses using canonical validator
+        if cf_scan.is_valid_response(status, headers, body, is_trace=False):
+            if status in ("200", "101"):
+                return True, f"HTTP {status} OK"
+            if status == "400":
+                return True, "Valid WebSocket Backend (HTTP 400)"
             return True, f"HTTP {status} from Origin"
 
         return False, f"Unexpected response: HTTP {status}"
@@ -95,12 +113,19 @@ async def verify_domain_ip(ip: str, host: str, sni: str, port: int = 443, timeou
         return False, f"Connection/TLS failed: {type(e).__name__} ({e})"
 
 
+def get_probe_base() -> str:
+    """Resolve the control probe host URL from environment, with legacy fallback."""
+    return os.environ.get(
+        "CLOUDBOT_PROBE_BASE",
+        os.environ.get("CLOUDBOT_PROBE", "https://status.example.com")
+    )
+
+
 def _control_ips() -> list:
     """The reference address handed to phones alongside real candidates."""
-    probe_base = os.environ.get(
-        "CLOUDBOT_PROBE_BASE",
-        os.environ.get("CLOUDBOT_PROBE", "https://status.etesalpaya.com")
-    )
+    # Control IP probe base URL. In production, this must be supplied via the
+    # CLOUDBOT_PROBE_BASE (or legacy CLOUDBOT_PROBE) environment variable.
+    probe_base = get_probe_base()
     host = probe_base.split("//", 1)[-1].split("/")[0].split(":")[0]
     try:
         import socket
@@ -248,9 +273,15 @@ def choose(results: list, live_ip: Optional[str] = None, measured: Optional[dict
                     [r["ip"] for _rel, r in contenders])
 
     live_m = measured.get(live_ip) if live_ip else None
-    live_score = cfscanner.score(live_m) if live_m else float("inf")
+    if live_ip and live_m is None:
+        return keep("اندازه‌گیری آدرس فعلی ناموفق بود — آدرس فعلی ماند",
+                    len(voters))
     if live_m and (live_m.get("cf_error") or live_m.get("valid") is False):
         live_score = float("inf")
+    elif live_m:
+        live_score = cfscanner.score(live_m)
+    else:
+        live_score = float("inf")   # only when there is no live_ip at all
 
     better = []
     for rel, r in contenders:
@@ -398,11 +429,13 @@ class ScannerEngine:
     Runs its own schedule, pool, candidate generation, phone delivery, and DNS updates.
     """
     def __init__(self, engine_id: int, store: Optional[Store] = None,
-                 coordinator: Optional[PhoneDeliveryCoordinator] = None):
+                 coordinator: Optional[PhoneDeliveryCoordinator] = None,
+                 verifier: Optional[Callable] = None):
         self.engine_id = engine_id
         self.name = f"ENGINE_{engine_id}"
         self.st = store or Store()
         self.coordinator = coordinator or delivery_coordinator
+        self.verifier = verifier
         self.lock = asyncio.Lock()  # Per-engine scan lock
         self._running = False
 
@@ -426,10 +459,31 @@ class ScannerEngine:
         log.info("[ENGINE %d] Starting scan pass", self.engine_id)
         self.set_status("scanning", "اسکن رنج کلادفلر")
         host, sni = self.st.get_engine_targets(self.engine_id)
-        results, _tail = await cfscanner.run_scan(
+        blocked = list(self.st.blocked_ips())
+        prefix_stats = self.st.get_prefix_stats()
+        scan_out = await cfscanner.run_scan(
             ssh, self.st.jump(), log_fn, limit=SCAN_SAMPLE,
             final=PHONE_SHORTLIST, no_speed=True, engine_id=self.engine_id,
-            host=host, sni=sni)
+            host=host, sni=sni, exclude=blocked, prefix_stats=prefix_stats)
+        results, _tail = scan_out
+        returned_stats = getattr(scan_out, "prefix_stats", None)
+        if returned_stats:
+            self.st.record_prefix_stats(returned_stats)
+
+        try:
+            ranges_content = cfscanner._get_cached_ranges()
+            range_lines = [l.strip() for l in ranges_content.splitlines() if l.strip() and not l.startswith("#")]
+            valid_subnets = []
+            for cidr in range_lines:
+                net = ipaddress.ip_network(cidr)
+                if net.prefixlen <= 24:
+                    valid_subnets.extend(str(s) for s in net.subnets(new_prefix=24))
+                else:
+                    valid_subnets.append(str(net))
+            self.st.prune_prefix_stats(valid_subnets)
+        except Exception as e:
+            log.debug("Prefix stats pruning skipped: %s", e)
+
         self.st.pool_add(results, engine_id=self.engine_id)
         log.info("[ENGINE %d] Candidate IPs: %d", self.engine_id, len(results))
         self.set_status("idle", f"{len(results)} آدرس به استخر اضافه شد")
@@ -520,8 +574,10 @@ class ScannerEngine:
         await log_fn(f"[ENGINE {self.engine_id}] لیست جایگزین #{rounds + 1}: {len(batch)} آدرس تازه")
         return True
 
-    async def phone_recheck_pass(self, notify_fn: Optional[Callable] = None):
+    async def phone_recheck_pass(self, notify_fn: Optional[Callable] = None,
+                                 verifier: Optional[Callable] = None):
         """Evaluate phone reports, choose best IP, and update Cloudflare domain for this engine."""
+        _verify = verifier or self.verifier or verify_domain_ip
         cfg = self.st.cfscan(self.engine_id)
         cand = self.st.scan_candidates(engine_id=self.engine_id)
         if time.time() - (cand.get("ts") or 0) > 12 * 3600:
@@ -563,8 +619,8 @@ class ScannerEngine:
         decision_key = f"scan_last_decision_engine_{self.engine_id}"
         if d["why"] != self.st.get(decision_key):
             self.st.set(decision_key, d["why"])
-            log.info("[ENGINE %d] Decision (live %s, %d phones): %s",
-                     self.engine_id, live_ip, d["voters"], d["why"])
+            log.info("[ENGINE %d] Decision (engine=%d, live %s, %d phones): %s",
+                     self.engine_id, self.engine_id, live_ip, d["voters"], d["why"])
 
         if not d["change"]:
             return
@@ -576,7 +632,7 @@ class ScannerEngine:
 
         for chosen_cand, why_cand in contenders_to_try:
             # 1. DOMAIN_PREVALIDATED: Candidate must prove domain validity BEFORE touching DNS
-            pre_ok, pre_reason = await verify_domain_ip(chosen_cand["ip"], host=target_host, sni=target_sni)
+            pre_ok, pre_reason = await _verify(chosen_cand["ip"], host=target_host, sni=target_sni)
             if not pre_ok:
                 log.warning("[ENGINE %d] DOMAIN_PREVALIDATION failed for candidate %s: %s (trying next contender)",
                             self.engine_id, chosen_cand["ip"], pre_reason)
@@ -597,6 +653,8 @@ class ScannerEngine:
 
         applied = False
         previous_live_ip = live_ip
+        record_created = False
+        created_rec_id = None
 
         if cfg.get("auto_apply") and fqdn and self.st.cf_token() and cf and zone:
             # 2. DNS_UPDATED: Apply to Cloudflare
@@ -604,7 +662,15 @@ class ScannerEngine:
                 if rec:
                     await cf.update_a(zone[0], rec, chosen["ip"])
                 else:
-                    await cf.create_a(zone[0], fqdn, chosen["ip"], proxied=False)
+                    new_rec = await cf.create_a(zone[0], fqdn, chosen["ip"], proxied=False)
+                    record_created = True
+                    if isinstance(new_rec, dict) and "id" in new_rec:
+                        created_rec_id = new_rec["id"]
+                    elif hasattr(new_rec, "get") and new_rec.get("id"):
+                        created_rec_id = new_rec.get("id")
+                    else:
+                        refetch = await cf.find_a_record(zone[0], fqdn)
+                        created_rec_id = refetch.get("id") if refetch else None
                 applied = True
                 log.info("[ENGINE %d] DNS_UPDATED: %s -> %s (previous: %s)",
                          self.engine_id, fqdn, chosen["ip"], previous_live_ip)
@@ -617,13 +683,43 @@ class ScannerEngine:
                 return
 
             # 3. DOMAIN_POSTCONFIRMED: Post-DNS confirmation with automated rollback
-            await asyncio.sleep(6.0)
-            post_ok, post_reason = await verify_domain_ip(chosen["ip"], host=target_host, sni=target_sni)
+            dns_visible = False
+            resolved = []
+            for attempt in range(5):
+                await asyncio.sleep(5.0)
+                resolved = await _resolve_a(fqdn)
+                if chosen["ip"] in resolved:
+                    dns_visible = True
+                    break
+
+            post_ok, post_reason = await _verify(chosen["ip"], host=target_host, sni=target_sni)
+            if not dns_visible and post_ok:
+                log.warning("[ENGINE %d] DNS not yet visible for %s (resolved: %s)",
+                            self.engine_id, fqdn, resolved)
+
             if not post_ok:
                 log.error("[ENGINE %d] DOMAIN_POSTCONFIRMED failed for %s: %s. Initiating automatic rollback!",
                           self.engine_id, chosen["ip"], post_reason)
                 rollback_done = False
-                if previous_live_ip:
+                manual_needed = False
+                rb_mode = None
+
+                if record_created:
+                    rb_mode = "deleted"
+                    try:
+                        cur_rec = await cf.find_a_record(zone[0], fqdn)
+                        if cur_rec and created_rec_id and cur_rec.get("id") == created_rec_id:
+                            await cf.delete_record(zone[0], cur_rec["id"])
+                            rollback_done = True
+                            log.info("[ENGINE %d] Automatic rollback deleted created record %s", self.engine_id, cur_rec["id"])
+                        else:
+                            log.warning("[ENGINE %d] Record ID mismatch during rollback delete for %s: expected %s, found %s",
+                                        self.engine_id, fqdn, created_rec_id, cur_rec.get("id") if cur_rec else None)
+                            manual_needed = True
+                    except Exception as rb_err:
+                        log.error("[ENGINE %d] Automatic rollback delete failed: %s", self.engine_id, rb_err)
+                elif previous_live_ip:
+                    rb_mode = "restored"
                     try:
                         cur_rec = await cf.find_a_record(zone[0], fqdn)
                         if cur_rec:
@@ -632,8 +728,18 @@ class ScannerEngine:
                             log.info("[ENGINE %d] Automatic rollback to %s succeeded", self.engine_id, previous_live_ip)
                     except Exception as rb_err:
                         log.error("[ENGINE %d] Automatic rollback failed: %s", self.engine_id, rb_err)
+
                 if notify_fn:
-                    rb_txt = f"بازگشت خودکار به <code>{previous_live_ip}</code> انجام شد." if rollback_done else "بازگشت خودکار ناموفق بود!"
+                    if manual_needed:
+                        rb_txt = "⚠️ تغییر غیرمنتظره رکورد در کلادفلر — رکورد حذف نشد و نیاز به بررسی دستی دارد."
+                    elif rollback_done:
+                        if rb_mode == "deleted":
+                            rb_txt = "رکورد تازه ایجاد شده به‌دلیل عدم تأیید حذف گردید."
+                        else:
+                            rb_txt = f"بازگشت خودکار به <code>{previous_live_ip}</code> انجام شد."
+                    else:
+                        rb_txt = "بازگشت خودکار ناموفق بود!"
+
                     await notify_fn(
                         f"🚨 <b>[موتور {self.engine_id}] خطا در تست پس از DNS — بازگشت خودکار</b>\n\n"
                         f"دامنه: <code>{fqdn}</code>\n"

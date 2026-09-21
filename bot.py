@@ -40,7 +40,7 @@ import watchdog
 from cloudflare import CFError, Cloudflare
 from provision import Panel, provision_node
 from store import Store
-from scanner_engine import ScannerEngine, delivery_coordinator
+from scanner_engine import ScannerEngine, delivery_coordinator, get_probe_base
 
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -50,13 +50,20 @@ TOKEN = os.environ["CLOUDBOT_TOKEN"]
 OWNER = int(os.environ["CLOUDBOT_OWNER"])
 # Phones are given this address, never the bot host: a handset in Iran
 # dialling a foreign address is the traffic that gets shaped.
-PROBE_BASE = os.environ.get("CLOUDBOT_PROBE_BASE",
-                            "https://status.etesalpaya.com")
+# Control IP probe base URL. In production, this must be supplied via the
+# CLOUDBOT_PROBE_BASE (or legacy CLOUDBOT_PROBE) environment variable.
+PROBE_BASE = get_probe_base()
 PANEL_URL = os.environ["CLOUDBOT_PANEL_URL"]
 PANEL_USER = os.environ["CLOUDBOT_PANEL_USER"]
 PANEL_PASS = os.environ["CLOUDBOT_PANEL_PASS"]
 SNI_CORE_ID = int(os.environ.get("CLOUDBOT_CORE_ID", "6"))
 
+# WARNING / TESTING SAFETY:
+# Importing this module opens the SQLite database and executes schema DDL at
+# module level (st = Store()), reads/creates the encryption key, and constructs
+# clients. Any test that imports or reloads bot.py MUST patch CLOUDBOT_DB and
+# CLOUDBOT_KEY to isolated temporary paths in os.environ before importing,
+# otherwise it will open and mutate the production database /etc/cloudbot/cloudbot.db.
 st = Store()
 engines = {
     1: ScannerEngine(1, st, delivery_coordinator),
@@ -958,7 +965,7 @@ async def cf_create_do(cb: CallbackQuery, state: FSMContext):
 async def cf_chg(cb: CallbackQuery, state: FSMContext):
     await state.set_state(CF.change_sub)
     await cb.message.edit_text(
-        "ساب‌دامین کامل را بفرست (مثلاً <code>node1.rjwarehousing.ir</code>):")
+        "ساب‌دامین کامل را بفرست (مثلاً <code>node1.example.com</code>):")
     await cb.answer()
 
 
@@ -4095,6 +4102,12 @@ async def main():
         h, p, u, pw = os.environ["CLOUDBOT_JUMP"].split(":", 3)
         st.set_jump(h, int(p), u, pw)
         log.info("iran jump host seeded: %s", h)
+    probe_val = get_probe_base()
+    if not probe_val or "example.com" in probe_val:
+        log.warning(
+            "Control probe host is unconfigured: CLOUDBOT_PROBE_BASE (or CLOUDBOT_PROBE) is unset, empty, or using placeholder. "
+            "Phone consensus check cannot work because control addresses will never resolve."
+        )
     log.info("cloudbot up, owner=%s panel=%s core=%s", OWNER, PANEL_URL, SNI_CORE_ID)
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)

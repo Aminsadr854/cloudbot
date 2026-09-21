@@ -1,0 +1,351 @@
+# Pre-change test baseline (regenerated following test rename and domain sanitisation)
+# Known-bad: test_providers.py (13 failures) and test_store.py (1 failure) concern out-of-scope files and are left failing.
+
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-7.4.4, pluggy-1.4.0 -- /usr/bin/python3
+cachedir: .pytest_cache
+rootdir: /root/cloudbot
+plugins: asyncio-0.20.3
+asyncio: mode=Mode.STRICT
+collecting ... collected 87 items
+
+test_engines.py::ThreeEngineScannerTests::test_a1_shell_injection_protection_in_build_scan_args PASSED [  1%]
+test_engines.py::ThreeEngineScannerTests::test_a2_per_engine_remote_script_isolation PASSED [  2%]
+test_engines.py::ThreeEngineScannerTests::test_a3_infinity_and_none_handling PASSED [  3%]
+test_engines.py::ThreeEngineScannerTests::test_a4_missing_live_ip_measurement_keeps_current_ip PASSED [  4%]
+test_engines.py::ThreeEngineScannerTests::test_a5_post_dns_confirmation_and_propagation_delay PASSED [  5%]
+test_engines.py::ThreeEngineScannerTests::test_a6_rollback_by_deleting_freshly_created_record PASSED [  6%]
+test_engines.py::ThreeEngineScannerTests::test_a7_partial_results_coverage PASSED [  8%]
+test_engines.py::ThreeEngineScannerTests::test_a7_timeouts_clean_kill_and_write_results PASSED [  9%]
+test_engines.py::ThreeEngineScannerTests::test_a8_atomic_writes_and_stale_result_rejection PASSED [ 10%]
+test_engines.py::ThreeEngineScannerTests::test_a_independent_startup PASSED [ 11%]
+test_engines.py::ThreeEngineScannerTests::test_b2_interception_detection_and_cert_verify PASSED [ 12%]
+test_engines.py::ThreeEngineScannerTests::test_b3_cf_ray_required PASSED [ 13%]
+test_engines.py::ThreeEngineScannerTests::test_b4_canonical_functions PASSED [ 14%]
+test_engines.py::ThreeEngineScannerTests::test_b5_stage_reachable_retries PASSED [ 16%]
+test_engines.py::ThreeEngineScannerTests::test_b6_score_agreement_and_weights PASSED [ 17%]
+test_engines.py::ThreeEngineScannerTests::test_b6_stage_stable_separate_tcp_tls_metrics PASSED [ 18%]
+test_engines.py::ThreeEngineScannerTests::test_b7_detect_local_trust_store_failure PASSED [ 19%]
+test_engines.py::ThreeEngineScannerTests::test_b_concurrent_parallel_scanning PASSED [ 20%]
+test_engines.py::ThreeEngineScannerTests::test_c1_candidate_generation PASSED [ 21%]
+test_engines.py::ThreeEngineScannerTests::test_c2_bounded_worker_queue PASSED [ 22%]
+test_engines.py::ThreeEngineScannerTests::test_c3_cap_speed_stage_finalists PASSED [ 24%]
+test_engines.py::ThreeEngineScannerTests::test_c4_aggregate_concurrency_and_semaphore PASSED [ 25%]
+test_engines.py::ThreeEngineScannerTests::test_c_independent_result_storage PASSED [ 26%]
+test_engines.py::ThreeEngineScannerTests::test_d1_cloudflare_ranges_caching_and_fallback PASSED [ 27%]
+test_engines.py::ThreeEngineScannerTests::test_d2_dead_prefix_exclusion_from_exploration PASSED [ 28%]
+test_engines.py::ThreeEngineScannerTests::test_d2_prefix_biased_sampling PASSED [ 29%]
+test_engines.py::ThreeEngineScannerTests::test_d2_prefix_stats_table PASSED [ 31%]
+test_engines.py::ThreeEngineScannerTests::test_d2_step1_exclude_handling PASSED [ 32%]
+test_engines.py::ThreeEngineScannerTests::test_d3_blocked_ip_failures_table PASSED [ 33%]
+test_engines.py::ThreeEngineScannerTests::test_d_engine_1_domain_isolation PASSED [ 34%]
+test_engines.py::ThreeEngineScannerTests::test_e_engine_2_domain_isolation PASSED [ 35%]
+test_engines.py::ThreeEngineScannerTests::test_f_engine_3_domain_isolation PASSED [ 36%]
+test_engines.py::ThreeEngineScannerTests::test_g_phone_delivery_5min_offset PASSED [ 37%]
+test_engines.py::ThreeEngineScannerTests::test_h_engine_1_failure_isolation PASSED [ 39%]
+test_engines.py::ThreeEngineScannerTests::test_i_engine_2_failure_isolation PASSED [ 40%]
+test_engines.py::ThreeEngineScannerTests::test_j_cloudflare_update_failure_isolation PASSED [ 41%]
+test_engines.py::ThreeEngineScannerTests::test_k_restart_persistence PASSED [ 42%]
+test_engines.py::ThreeEngineScannerTests::test_l_backward_compatibility_engine_1 PASSED [ 43%]
+test_engines.py::ThreeEngineScannerTests::test_pgrep_process_pattern_prevents_self_match PASSED [ 44%]
+test_engines.py::ThreeEngineScannerTests::test_regression_10_control_ips_precedence_probe_base PASSED [ 45%]
+test_engines.py::ThreeEngineScannerTests::test_regression_11_control_ips_legacy_probe_fallback PASSED [ 47%]
+test_engines.py::ThreeEngineScannerTests::test_regression_12_report_trusted_behavior_unchanged PASSED [ 48%]
+test_engines.py::ThreeEngineScannerTests::test_regression_13_phone_report_trusted_with_control_success PASSED [ 49%]
+test_engines.py::ThreeEngineScannerTests::test_regression_14_phone_report_untrusted_when_control_fails PASSED [ 50%]
+test_engines.py::ThreeEngineScannerTests::test_regression_1_fake_dns_ip_rejected PASSED [ 51%]
+test_engines.py::ThreeEngineScannerTests::test_regression_2_dns_ip_not_in_shortlist PASSED [ 52%]
+test_engines.py::ThreeEngineScannerTests::test_regression_3_valid_existing_ip PASSED [ 54%]
+test_engines.py::ThreeEngineScannerTests::test_regression_4_new_confirmed_candidate PASSED [ 55%]
+test_engines.py::ThreeEngineScannerTests::test_regression_5_preserve_legitimate_best_ip PASSED [ 56%]
+test_engines.py::ThreeEngineScannerTests::test_regression_6_three_engines_isolation PASSED [ 57%]
+test_engines.py::ThreeEngineScannerTests::test_regression_7_telegram_display_placeholder PASSED [ 58%]
+test_engines.py::ThreeEngineScannerTests::test_regression_8_control_ips_never_localhost_by_default PASSED [ 59%]
+test_engines.py::ThreeEngineScannerTests::test_regression_9_control_ips_default_resolves_status_example PASSED [ 60%]
+test_engines.py::ThreeEngineScannerTests::test_verifier_injection_custom_override PASSED [ 62%]
+test_providers.py::ProxyParsingTests::test_bracketed_ipv6_proxy_is_accepted FAILED [ 63%]
+test_providers.py::LocationFormattingTests::test_country_flag_is_added_to_region_choices FAILED [ 64%]
+test_providers.py::LocationFormattingTests::test_country_flag_uses_iso_regional_indicators FAILED [ 65%]
+test_providers.py::LocationFormattingTests::test_location_text_uses_provider_region_fallback FAILED [ 66%]
+test_providers.py::PlanFormattingTests::test_linode_plan_shows_monthly_transfer FAILED [ 67%]
+test_providers.py::ProxyFamilyTests::test_ipv4_replaces_dual_stack_proxy_hostname FAILED [ 68%]
+test_providers.py::ProxyFamilyTests::test_ipv6_replaces_dual_stack_proxy_hostname FAILED [ 70%]
+test_providers.py::ProxyFamilyTests::test_requested_missing_family_has_clear_error FAILED [ 71%]
+test_providers.py::VultrIpTests::test_add_ipv4_requests_reboot FAILED    [ 72%]
+test_providers.py::VultrIpTests::test_create_and_attach_floating_ip FAILED [ 73%]
+test_providers.py::VultrIpTests::test_get_floating_ip_uses_its_id FAILED [ 74%]
+test_providers.py::VultrIpTests::test_lists_only_floating_ips_for_requested_instance FAILED [ 75%]
+test_providers.py::VultrIpTests::test_power_and_delete_use_correct_vultr_endpoints FAILED [ 77%]
+test_regression_12.py::TestRegression12::test_01_error_1034_rejection PASSED [ 78%]
+test_regression_12.py::TestRegression12::test_02_error_1000_rejection PASSED [ 79%]
+test_regression_12.py::TestRegression12::test_03_valid_protocol_websocket_response PASSED [ 80%]
+test_regression_12.py::TestRegression12::test_04_android_engine_isolation PASSED [ 81%]
+test_regression_12.py::TestRegression12::test_05_sni_isolation PASSED    [ 82%]
+test_regression_12.py::TestRegression12::test_06_two_of_two_consensus_enforcement PASSED [ 83%]
+test_regression_12.py::TestRegression12::test_07_dns_api_failure_handling PASSED [ 85%]
+test_regression_12.py::TestRegression12::test_08_post_dns_failure_and_rollback PASSED [ 86%]
+test_regression_12.py::TestRegression12::test_09_successful_deployment_flow PASSED [ 87%]
+test_regression_12.py::TestRegression12::test_10_three_engine_isolation PASSED [ 88%]
+test_regression_12.py::TestRegression12::test_11_fake_ip_protection PASSED [ 89%]
+test_regression_12.py::TestRegression12::test_12_current_live_ip_protection_against_generic_candidates PASSED [ 90%]
+test_regression_12.py::TestRegression12::test_13_target_resolution_and_precedence PASSED [ 91%]
+test_regression_12.py::TestRegression12::test_14_contender_fallback_on_domain_prevalidation_failure PASSED [ 93%]
+test_regression_12.py::TestRegression12::test_15_all_contenders_fail_domain_prevalidation_no_dns_update PASSED [ 94%]
+test_regression_12.py::TestRegression12::test_16_pending_delivery_lifecycle_and_starvation_prevention PASSED [ 95%]
+test_regression_12.py::TestRegression12::test_17_candidate_set_hash_matching_and_stale_rejection PASSED [ 96%]
+test_regression_12.py::TestRegression12::test_18_offline_phone_ttl_protection PASSED [ 97%]
+test_regression_12.py::TestRegression12::test_19_independent_multi_engine_pending_states PASSED [ 98%]
+test_store.py::AccountStoreTests::test_rename_preserves_account_settings FAILED [100%]
+
+=================================== FAILURES ===================================
+___________ ProxyParsingTests.test_bracketed_ipv6_proxy_is_accepted ____________
+
+self = <test_providers.ProxyParsingTests testMethod=test_bracketed_ipv6_proxy_is_accepted>
+
+    def test_bracketed_ipv6_proxy_is_accepted(self):
+        self.assertEqual(
+>           providers.proxy_url("[2001:db8::1]:1080:user:pass"),
+            "http://user:pass@[2001:db8::1]:1080",
+        )
+
+test_providers.py:11: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ 
+
+proxy = '[2001:db8::1]:1080:user:pass'
+
+    def proxy_url(proxy: str | None) -> str | None:
+        """
+        Turn the user's proxy string into a full proxy URL.
+    
+        Accepts, in order of preference:
+          scheme://host:port:user:pass   (scheme = http/https/socks5/socks4)
+          scheme://user:pass@host:port
+          host:port:user:pass            (assumed http - the format the user gives)
+          host:port
+    
+        A bare host:port:user:pass is treated as HTTP because that is what the user
+        was asked for; a SOCKS proxy can be selected by prefixing socks5://.
+        """
+        if not proxy:
+            return None
+        proxy = proxy.strip()
+        scheme = "http"
+        if "://" in proxy:
+            scheme, proxy = proxy.split("://", 1)
+        # already in url auth form?
+        if "@" in proxy:
+            return f"{scheme}://{proxy}"
+        parts = proxy.split(":")
+        if len(parts) == 4:
+            host, port, user, pw = parts
+            return f"{scheme}://{user}:{pw}@{host}:{port}"
+        if len(parts) == 2:
+            host, port = parts
+            return f"{scheme}://{host}:{port}"
+>       raise ValueError("proxy must be host:port or host:port:user:pass "
+                         "(optionally prefixed with socks5://)")
+E       ValueError: proxy must be host:port or host:port:user:pass (optionally prefixed with socks5://)
+
+providers.py:59: ValueError
+_____ LocationFormattingTests.test_country_flag_is_added_to_region_choices _____
+
+self = <test_providers.LocationFormattingTests testMethod=test_country_flag_is_added_to_region_choices>
+
+    async def test_country_flag_is_added_to_region_choices(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={
+            "regions": [{"id": "fra", "city": "Frankfurt", "country": "DE"}]
+        })
+        regions = await p.regions()
+>       self.assertEqual(regions, [("fra", "🇩🇪 Frankfurt DE")])
+E       AssertionError: Lists differ: [('fra', 'Frankfurt DE')] != [('fra', '🇩🇪 Frankfurt DE')]
+E       
+E       First differing element 0:
+E       ('fra', 'Frankfurt DE')
+E       ('fra', '🇩🇪 Frankfurt DE')
+E       
+E       - [('fra', 'Frankfurt DE')]
+E       + [('fra', '🇩🇪 Frankfurt DE')]
+E       ?           +++
+
+test_providers.py:31: AssertionError
+____ LocationFormattingTests.test_country_flag_uses_iso_regional_indicators ____
+
+self = <test_providers.LocationFormattingTests testMethod=test_country_flag_uses_iso_regional_indicators>
+
+    def test_country_flag_uses_iso_regional_indicators(self):
+>       self.assertEqual(providers.country_flag("de"), "🇩🇪")
+E       AttributeError: module 'providers' has no attribute 'country_flag'
+
+test_providers.py:18: AttributeError
+___ LocationFormattingTests.test_location_text_uses_provider_region_fallback ___
+
+self = <test_providers.LocationFormattingTests testMethod=test_location_text_uses_provider_region_fallback>
+
+    def test_location_text_uses_provider_region_fallback(self):
+>       self.assertEqual(providers.location_text("vultr", "fra"), "🇩🇪 fra")
+E       AttributeError: module 'providers' has no attribute 'location_text'
+
+test_providers.py:22: AttributeError
+_________ PlanFormattingTests.test_linode_plan_shows_monthly_transfer __________
+
+self = <test_providers.PlanFormattingTests testMethod=test_linode_plan_shows_monthly_transfer>
+
+    async def test_linode_plan_shows_monthly_transfer(self):
+        p = providers.Provider({"provider": "linode", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"data": [{
+            "id": "g6-standard-1", "label": "Linode 2GB", "transfer": 2000,
+            "price": {"monthly": 12},
+        }]})
+    
+>       self.assertEqual(await p.plans(), [
+            ("g6-standard-1", "Linode 2GB · 📡 2000 GB traffic - $12/mo")
+        ])
+E       AssertionError: Lists differ: [('g6-standard-1', 'Linode 2GB - $12/mo')] != [('g6-standard-1', 'Linode 2GB · 📡 2000 GB traffic - $12/mo')]
+E       
+E       First differing element 0:
+E       ('g6-standard-1', 'Linode 2GB - $12/mo')
+E       ('g6-standard-1', 'Linode 2GB · 📡 2000 GB traffic - $12/mo')
+E       
+E       - [('g6-standard-1', 'Linode 2GB - $12/mo')]
+E       + [('g6-standard-1', 'Linode 2GB · 📡 2000 GB traffic - $12/mo')]
+E       ?                                ++++++++++++++++++++
+
+test_providers.py:42: AssertionError
+________ ProxyFamilyTests.test_ipv4_replaces_dual_stack_proxy_hostname _________
+
+self = <test_providers.ProxyFamilyTests testMethod=test_ipv4_replaces_dual_stack_proxy_hostname>
+
+    async def test_ipv4_replaces_dual_stack_proxy_hostname(self):
+        loop = __import__("asyncio").get_running_loop()
+        rows = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("192.0.2.9", 8080))]
+        with patch.object(loop, "getaddrinfo", new=AsyncMock(return_value=rows)):
+            self.assertEqual(
+>               await providers.proxy_for_family("http://user:pass@proxy.example:8080", "ipv4"),
+                "http://user:pass@192.0.2.9:8080",
+            )
+E           AttributeError: module 'providers' has no attribute 'proxy_for_family'
+
+test_providers.py:53: AttributeError
+________ ProxyFamilyTests.test_ipv6_replaces_dual_stack_proxy_hostname _________
+
+self = <test_providers.ProxyFamilyTests testMethod=test_ipv6_replaces_dual_stack_proxy_hostname>
+
+    async def test_ipv6_replaces_dual_stack_proxy_hostname(self):
+        loop = __import__("asyncio").get_running_loop()
+        rows = [(socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("2001:db8::9", 8080, 0, 0))]
+        with patch.object(loop, "getaddrinfo", new=AsyncMock(return_value=rows)):
+            self.assertEqual(
+>               await providers.proxy_for_family("socks5://proxy.example:8080", "ipv6"),
+                "socks5://[2001:db8::9]:8080",
+            )
+E           AttributeError: module 'providers' has no attribute 'proxy_for_family'
+
+test_providers.py:62: AttributeError
+________ ProxyFamilyTests.test_requested_missing_family_has_clear_error ________
+
+self = <test_providers.ProxyFamilyTests testMethod=test_requested_missing_family_has_clear_error>
+
+    async def test_requested_missing_family_has_clear_error(self):
+        loop = __import__("asyncio").get_running_loop()
+        with patch.object(loop, "getaddrinfo", new=AsyncMock(side_effect=socket.gaierror())):
+            with self.assertRaisesRegex(providers.ProviderError, "no IPV6 address"):
+>               await providers.proxy_for_family("http://proxy.example:8080", "ipv6")
+E               AttributeError: module 'providers' has no attribute 'proxy_for_family'
+
+test_providers.py:70: AttributeError
+__________________ VultrIpTests.test_add_ipv4_requests_reboot __________________
+
+self = <test_providers.VultrIpTests testMethod=test_add_ipv4_requests_reboot>
+
+    async def test_add_ipv4_requests_reboot(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={"ip": "198.51.100.10"})
+>       self.assertEqual(await p.add_vultr_ipv4("instance-1"), {"ip": "198.51.100.10"})
+E       AttributeError: 'Provider' object has no attribute 'add_vultr_ipv4'
+
+test_providers.py:80: AttributeError
+_______________ VultrIpTests.test_create_and_attach_floating_ip ________________
+
+self = <test_providers.VultrIpTests testMethod=test_create_and_attach_floating_ip>
+
+    async def test_create_and_attach_floating_ip(self):
+        p = self._provider()
+        p._req = AsyncMock(side_effect=[
+            {"reserved_ip": {"id": "rip-1", "ip_address": "198.51.100.20"}}, {}
+        ])
+>       got = await p.create_and_attach_vultr_floating_ip("instance-1", "ewr", "cloudbot-test")
+E       AttributeError: 'Provider' object has no attribute 'create_and_attach_vultr_floating_ip'
+
+test_providers.py:88: AttributeError
+________________ VultrIpTests.test_get_floating_ip_uses_its_id _________________
+
+self = <test_providers.VultrIpTests testMethod=test_get_floating_ip_uses_its_id>
+
+    async def test_get_floating_ip_uses_its_id(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={"reserved_ip": {"id": "rip-1", "subnet": "198.51.100.20"}})
+>       self.assertEqual(await p.vultr_floating_ip("rip-1"),
+                         {"id": "rip-1", "subnet": "198.51.100.20"})
+E       AttributeError: 'Provider' object has no attribute 'vultr_floating_ip'
+
+test_providers.py:118: AttributeError
+_______ VultrIpTests.test_lists_only_floating_ips_for_requested_instance _______
+
+self = <test_providers.VultrIpTests testMethod=test_lists_only_floating_ips_for_requested_instance>
+
+    async def test_lists_only_floating_ips_for_requested_instance(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={"reserved_ips": [
+            {"id": "one", "instance_id": "instance-1"},
+            {"id": "two", "instance_id": "instance-2"},
+        ]})
+>       self.assertEqual(await p.vultr_floating_ips("instance-1"),
+                         [{"id": "one", "instance_id": "instance-1"}])
+E       AttributeError: 'Provider' object has no attribute 'vultr_floating_ips'
+
+test_providers.py:103: AttributeError
+________ VultrIpTests.test_power_and_delete_use_correct_vultr_endpoints ________
+
+self = <test_providers.VultrIpTests testMethod=test_power_and_delete_use_correct_vultr_endpoints>
+
+    async def test_power_and_delete_use_correct_vultr_endpoints(self):
+        p = self._provider()
+        p._req = AsyncMock(return_value={})
+>       await p.vultr_power("instance-1", "reboot")
+E       AttributeError: 'Provider' object has no attribute 'vultr_power'
+
+test_providers.py:110: AttributeError
+___________ AccountStoreTests.test_rename_preserves_account_settings ___________
+
+self = <test_store.AccountStoreTests testMethod=test_rename_preserves_account_settings>
+
+    def test_rename_preserves_account_settings(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_db = os.environ.get("CLOUDBOT_DB")
+            old_key = os.environ.get("CLOUDBOT_KEY")
+            os.environ["CLOUDBOT_DB"] = f"{d}/cloudbot.db"
+            os.environ["CLOUDBOT_KEY"] = f"{d}/secret.key"
+            try:
+                import store
+                st = store.Store()
+>               acc_id = st.add_account("old", "linode", "token", "proxy:80:u:p", "ipv4")
+E               TypeError: Store.add_account() takes from 4 to 5 positional arguments but 6 were given
+
+test_store.py:16: TypeError
+=========================== short test summary info ============================
+FAILED test_providers.py::ProxyParsingTests::test_bracketed_ipv6_proxy_is_accepted
+FAILED test_providers.py::LocationFormattingTests::test_country_flag_is_added_to_region_choices
+FAILED test_providers.py::LocationFormattingTests::test_country_flag_uses_iso_regional_indicators
+FAILED test_providers.py::LocationFormattingTests::test_location_text_uses_provider_region_fallback
+FAILED test_providers.py::PlanFormattingTests::test_linode_plan_shows_monthly_transfer
+FAILED test_providers.py::ProxyFamilyTests::test_ipv4_replaces_dual_stack_proxy_hostname
+FAILED test_providers.py::ProxyFamilyTests::test_ipv6_replaces_dual_stack_proxy_hostname
+FAILED test_providers.py::ProxyFamilyTests::test_requested_missing_family_has_clear_error
+FAILED test_providers.py::VultrIpTests::test_add_ipv4_requests_reboot - Attri...
+FAILED test_providers.py::VultrIpTests::test_create_and_attach_floating_ip - ...
+FAILED test_providers.py::VultrIpTests::test_get_floating_ip_uses_its_id - At...
+FAILED test_providers.py::VultrIpTests::test_lists_only_floating_ips_for_requested_instance
+FAILED test_providers.py::VultrIpTests::test_power_and_delete_use_correct_vultr_endpoints
+FAILED test_store.py::AccountStoreTests::test_rename_preserves_account_settings
+======================== 14 failed, 73 passed in 57.94s ========================

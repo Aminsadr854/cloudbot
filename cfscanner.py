@@ -12,13 +12,137 @@ because a steady 90 ms path beats a 40 ms one that stalls.
 """
 import asyncio
 import json
+import logging
+import math
 import os
+import shlex
+import time
 
 import tunnel  # reuse the SSH connector (direct, or via the Iran jump)
 
+logger = logging.getLogger("cfscanner")
+
 SCANNER_LOCAL = os.path.join(os.path.dirname(__file__), "cf_scan.py")
-REMOTE_SCANNER = "/root/cf_scan.py"
 REMOTE_OUT = "/root/cf_bot_scan"
+
+REMOTE_TIMEOUT = 900
+LOCAL_TIMEOUT = 960
+
+DEFAULT_CONCURRENCY = 200
+MAX_CONCURRENT_SCANS = 1
+SCAN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+
+
+class ScanTimeoutError(TimeoutError):
+    pass
+
+
+class StaleResultError(RuntimeError):
+    pass
+
+
+def _process_pattern(remote_script: str) -> str:
+    """Return a regex pattern for pgrep/pkill that matches remote_script without matching itself.
+
+    Transforms the first alphabetic character of the basename into a bracketed
+    character class, e.g. '/root/.cf_scan_engine_9.py' -> '/root/.[c]f_scan_engine_9.py'.
+    """
+    dirname, basename = os.path.split(remote_script)
+    for i, ch in enumerate(basename):
+        if ch.isalpha():
+            new_base = basename[:i] + f"[{ch}]" + basename[i + 1:]
+            return os.path.join(dirname, new_base) if dirname else new_base
+    return remote_script
+
+
+class ScanOutput(tuple):
+    prefix_stats: dict
+
+    def __new__(cls, data, tail, prefix_stats=None):
+        inst = super().__new__(cls, (data, tail))
+        inst.prefix_stats = prefix_stats or {}
+        return inst
+
+
+import urllib.request
+
+RANGES_CACHE_FILE = os.path.join(os.path.dirname(__file__), ".cf_ranges_cache.txt")
+RANGES_CACHE_TTL = 6 * 3600  # at least 6 hours
+CF_RANGES_URL = "https://www.cloudflare.com/ips-v4"
+
+_in_memory_ranges: str | None = None
+_in_memory_ranges_ts: float = 0.0
+_cache_write_warned: bool = False
+
+
+def _get_cached_ranges() -> str:
+    """
+    Fetch Cloudflare range list on the bot host, caching it for at least 6 hours.
+    Falls back to CF_V4_FALLBACK if fetch fails and cache is absent.
+    """
+    global _in_memory_ranges, _in_memory_ranges_ts, _cache_write_warned
+    now = time.time()
+
+    # 1. If valid disk cache exists, use it
+    if os.path.exists(RANGES_CACHE_FILE):
+        try:
+            mtime = os.path.getmtime(RANGES_CACHE_FILE)
+            if now - mtime < RANGES_CACHE_TTL:
+                with open(RANGES_CACHE_FILE) as f:
+                    content = f.read().strip()
+                if content and "/" in content:
+                    _in_memory_ranges = content
+                    _in_memory_ranges_ts = mtime
+                    return content
+        except Exception:
+            pass
+
+    # 2. If valid in-memory cache exists (e.g. unwritable disk directory), use it
+    if _in_memory_ranges and (now - _in_memory_ranges_ts < RANGES_CACHE_TTL):
+        return _in_memory_ranges
+
+    # 3. Fetch live on bot host
+    try:
+        with urllib.request.urlopen(CF_RANGES_URL, timeout=20) as r:
+            body = r.read().decode().strip()
+        if "/" in body:
+            _in_memory_ranges = body
+            _in_memory_ranges_ts = now
+            try:
+                tmp_cache = f"{RANGES_CACHE_FILE}.tmp.{os.getpid()}"
+                with open(tmp_cache, "w") as f:
+                    f.write(body + "\n")
+                os.replace(tmp_cache, RANGES_CACHE_FILE)
+            except Exception as e:
+                if not _cache_write_warned:
+                    logger.warning("Could not write Cloudflare ranges cache to %s: %s", RANGES_CACHE_FILE, e)
+                    _cache_write_warned = True
+            return body
+    except Exception:
+        pass
+
+    # 4. If live fetch failed but in-memory cache exists, use it
+    if _in_memory_ranges:
+        return _in_memory_ranges
+
+    # 5. If live fetch failed but stale disk cache exists, use it
+    if os.path.exists(RANGES_CACHE_FILE):
+        try:
+            with open(RANGES_CACHE_FILE) as f:
+                content = f.read().strip()
+            if content and "/" in content:
+                _in_memory_ranges = content
+                _in_memory_ranges_ts = os.path.getmtime(RANGES_CACHE_FILE)
+                return content
+        except Exception:
+            pass
+
+    from cf_scan import CF_V4_FALLBACK
+    return CF_V4_FALLBACK.strip()
+
+
+
+EXCLUDE_FILE_THRESHOLD = 250  # IPs (~4KB); above this threshold, ship as a file to avoid ARG_MAX
 
 
 def _load_scanner() -> str:
@@ -26,10 +150,54 @@ def _load_scanner() -> str:
         return f.read()
 
 
+def _build_scan_args(remote_scanner: str, out_file: str, *, per_24=2, rounds=14,
+                     final=20, host="speed.cloudflare.com", sni: str | None = None,
+                     limit=0, only=None, no_speed=False, include=None, engine_id: int = 0,
+                     concurrency: int = DEFAULT_CONCURRENCY,
+                     ranges_file: str | None = None,
+                     exclude=None, exclude_file: str | None = None,
+                     prefix_stats_file: str | None = None) -> list[str]:
+    args = ["python3", remote_scanner,
+            "--per-24", str(per_24),
+            "--rounds", str(rounds),
+            "--final", str(final),
+            "--host", host,
+            "--concurrency", str(concurrency),
+            "--out", out_file]
+    if engine_id:
+        args += ["--engine-id", str(engine_id)]
+    if sni:
+        args += ["--sni", sni]
+    if limit:
+        args += ["--limit", str(int(limit))]
+    if ranges_file:
+        args += ["--ranges-file", ranges_file]
+    if exclude_file:
+        args += ["--exclude-file", exclude_file]
+    if prefix_stats_file:
+        args += ["--prefix-stats-file", prefix_stats_file]
+    if exclude:
+        safe_exc = [i for i in exclude if all(ch in "0123456789." for ch in i)]
+        if safe_exc:
+            args += ["--exclude", ",".join(safe_exc)]
+    if only:
+        safe_only = [i for i in only if all(ch in "0123456789." for ch in i)]
+        if safe_only:
+            args += ["--only", ",".join(safe_only)]
+    if no_speed:
+        args.append("--no-speed")
+    if include:
+        safe_inc = [i for i in include if all(ch in "0123456789." for ch in i)]
+        if safe_inc:
+            args += ["--include", ",".join(safe_inc)]
+    return args
+
+
 async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
                    final=20, host="speed.cloudflare.com", sni: str | None = None,
                    include=None, limit=0, only=None, no_speed=False, engine_id: int = 1,
-                   remote_out: str | None = None):
+                   remote_out: str | None = None, concurrency: int = DEFAULT_CONCURRENCY,
+                   exclude=None, prefix_stats: dict | None = None):
     """
     SSH to `ssh` (optionally via `jump`), run the scanner, return the ranked
     result list (best first). Each item: ip, rtt, jitter, loss, rtt_max, mbps.
@@ -37,61 +205,176 @@ async def run_scan(ssh: dict, jump: dict | None, log, *, per_24=2, rounds=14,
     `engine_id` isolates output files on the remote server when multiple engines scan.
     `sni` allows probing with the actual domain SNI.
     """
+    remote_script = f"/root/.cf_scan_engine_{engine_id}.py"
+    proc_pattern = _process_pattern(remote_script)
+    tmp_path = f"{remote_script}.tmp.{os.getpid()}"
+    remote_ranges_file = f"/root/.cf_ranges_engine_{engine_id}.txt"
+    tmp_ranges_path = f"{remote_ranges_file}.tmp.{os.getpid()}"
     out_file = remote_out or (f"/root/cf_bot_scan_engine_{engine_id}" if engine_id else REMOTE_OUT)
-    conn = await tunnel.connect(ssh["host"], int(ssh.get("port", 22)),
-                                ssh["user"], ssh["password"], jump=jump)
-    try:
-        await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
-        script = _load_scanner()
-        # Write the scanner via SFTP so a 400-line file with quotes survives.
-        async with conn.start_sftp_client() as sftp:
-            async with sftp.open(REMOTE_SCANNER, "w") as f:
-                await f.write(script)
 
-        # Raise the fd limit inline: every probe in flight holds one, and the
-        # default 1024 would silently cap concurrency and lose candidates.
-        cmd = (
-            f"ulimit -n 65535 2>/dev/null; "
-            f"python3 {REMOTE_SCANNER} --per-24 {per_24} --rounds {rounds} "
-            f"--final {final} --host {host} "
-            + (f"--sni {sni} " if sni else "")
-            + f"--concurrency 500 "
-            # A fixed sample size rather than the whole announced space: the
-            # addresses are shuffled across every /24 first, so a thousand of
-            # them is a fair picture of the whole and finishes in a minute.
-            + (f"--limit {int(limit)} " if limit else "")
-            # `only` measures a fixed list and samples nothing; `no_speed`
-            # drops the download stage, which is the whole bandwidth cost of a
-            # scan and is not worth paying on every pass of a continuous one.
-            + (("--only " + ",".join(
-                i for i in only if all(ch in "0123456789." for ch in i)) + " ")
-               if only else "")
-            + ("--no-speed " if no_speed else "") +
-            f"--out {out_file} 2>&1 | tail -25"
-        )
-        if include:
-            # Addresses the phones vouched for. They are re-measured here every
-            # round so the relay always has fresh numbers for them, otherwise a
-            # phone-verified address could never be the one deployed.
-            safe = ",".join(i for i in include
-                            if all(ch in "0123456789." for ch in i))
-            if safe:
-                cmd = cmd.replace("--out ", f"--include {safe} --out ")
-        await log("در حال سنجش روی سرور ایران…" if only
-                  else "در حال اسکن رنج کلادفلر از داخل ایران…")
-        r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=600)
-        tail = (r.stdout or "")[-500:]
+    safe_exclude = [i for i in (exclude or []) if all(ch in "0123456789." for ch in i)]
+    remote_exclude_file = None
+    tmp_exclude_path = None
+    exclude_inline = None
+    if len(safe_exclude) > EXCLUDE_FILE_THRESHOLD:
+        remote_exclude_file = f"/root/.cf_exclude_engine_{engine_id}.txt"
+        tmp_exclude_path = f"{remote_exclude_file}.tmp.{os.getpid()}"
+    elif safe_exclude:
+        exclude_inline = safe_exclude
 
-        res = await conn.run(f"cat {out_file}.json 2>/dev/null", check=False)
-        raw = (res.stdout or "").strip()
-        if not raw:
-            raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")
-        data = json.loads(raw)
-        # keep only genuinely usable finalists (finite rtt), best first
-        data = [d for d in data if isinstance(d.get("rtt"), (int, float))]
-        return data, tail
-    finally:
-        conn.close()
+    remote_stats_file = None
+    tmp_stats_path = None
+    stats_json = None
+    if prefix_stats:
+        stats_to_send = prefix_stats
+        raw_bytes = json.dumps(stats_to_send).encode()
+        if len(raw_bytes) > 500 * 1024:
+            filtered = {}
+            stale_cutoff = time.time() - (48 * 3600.0)
+            for p, s in stats_to_send.items():
+                samples = float(s.get("samples", 0.0))
+                succ = float(s.get("successes", 0.0))
+                last_samp = float(s.get("last_sampled", 0.0))
+                total_samp = float(s.get("total_samples", samples))
+                total_succ = float(s.get("total_successes", succ))
+                yield_val = (succ / samples) if samples > 0 else 0.0
+
+                is_exploit = (samples >= 3.0 and yield_val >= 0.10)
+                is_recent = (last_samp >= stale_cutoff)
+                is_proven_dead = (total_samp >= 3.0 and total_succ == 0)
+
+                if is_exploit or is_recent:
+                    filtered[p] = s
+                elif is_proven_dead:
+                    # Compact record: prefix and two numbers
+                    filtered[p] = {
+                        "samples": samples,
+                        "total_samples": total_samp,
+                        "successes": 0.0,
+                    }
+            stats_to_send = filtered
+            stats_json = json.dumps(stats_to_send)
+        else:
+            stats_json = raw_bytes.decode()
+        remote_stats_file = f"/root/.cf_prefix_stats_engine_{engine_id}.json"
+        tmp_stats_path = f"{remote_stats_file}.tmp.{os.getpid()}"
+
+    # Lock ordering and deadlock prevention:
+    # In ScannerEngine.scan_loop, each engine first acquires its per-engine lock (`self.lock`).
+    # Then it calls run_scan(), which acquires the global SCAN_SEMAPHORE across all engines.
+    # Because lock acquisition order is strictly:
+    #   Level 1: Per-engine lock (ScannerEngine.lock)
+    #   Level 2: Global scan semaphore (SCAN_SEMAPHORE)
+    # and SCAN_SEMAPHORE is never held while waiting to acquire self.lock,
+    # circular wait cannot occur and deadlock is impossible.
+    async with SCAN_SEMAPHORE:
+        conn = await tunnel.connect(ssh["host"], int(ssh.get("port", 22)),
+                                    ssh["user"], ssh["password"], jump=jump)
+        try:
+            # Before starting a new scan on an engine, verify no previous cf_scan.py is
+            # still running for that engine. If one is, terminate it before starting.
+            check_cmd = f"pgrep -f {shlex.quote(proc_pattern)} 2>/dev/null"
+            prev_proc = await conn.run(check_cmd, check=False)
+            if prev_proc.stdout and prev_proc.stdout.strip():
+                if callable(log):
+                    await log(f"اسکن قبلی موتور {engine_id} در حال اجراست؛ متوقف می‌شود…")
+                await conn.run(f"pkill -15 -f {shlex.quote(proc_pattern)} 2>/dev/null", check=False)
+                await asyncio.sleep(2)
+                check_still = await conn.run(check_cmd, check=False)
+                if check_still.stdout and check_still.stdout.strip():
+                    await conn.run(f"pkill -9 -f {shlex.quote(proc_pattern)} 2>/dev/null", check=False)
+
+            scan_start_time = time.time()
+            await conn.run(f"rm -f {shlex.quote(out_file + '.json')} {shlex.quote(out_file + '.txt')}", check=False)
+
+            await log("در حال آماده‌سازی اسکنر روی سرور ایران…")
+            script = _load_scanner()
+            ranges_content = _get_cached_ranges()
+            # Write scanner, cached ranges, and optional exclude / stats files via SFTP to unique temp paths, then atomically rename
+            async with conn.start_sftp_client() as sftp:
+                async with sftp.open(tmp_path, "w") as f:
+                    await f.write(script)
+                async with sftp.open(tmp_ranges_path, "w") as f:
+                    await f.write(ranges_content + "\n")
+                if remote_exclude_file and tmp_exclude_path:
+                    async with sftp.open(tmp_exclude_path, "w") as f:
+                        await f.write("\n".join(safe_exclude) + "\n")
+                if remote_stats_file and tmp_stats_path and stats_json:
+                    async with sftp.open(tmp_stats_path, "w") as f:
+                        await f.write(stats_json + "\n")
+
+            rename_cmd = (f"mv {shlex.quote(tmp_path)} {shlex.quote(remote_script)} && "
+                          f"mv {shlex.quote(tmp_ranges_path)} {shlex.quote(remote_ranges_file)}")
+            if remote_exclude_file and tmp_exclude_path:
+                rename_cmd += f" && mv {shlex.quote(tmp_exclude_path)} {shlex.quote(remote_exclude_file)}"
+            if remote_stats_file and tmp_stats_path:
+                rename_cmd += f" && mv {shlex.quote(tmp_stats_path)} {shlex.quote(remote_stats_file)}"
+            await conn.run(rename_cmd, check=False)
+
+            # Raise the fd limit inline: every probe in flight holds one, and the
+            # default 1024 would silently cap concurrency and lose candidates.
+            args = _build_scan_args(
+                remote_script, out_file, per_24=per_24, rounds=rounds, final=final,
+                host=host, sni=sni, limit=limit, only=only, no_speed=no_speed, include=include,
+                engine_id=engine_id, concurrency=concurrency, ranges_file=remote_ranges_file,
+                exclude=exclude_inline, exclude_file=remote_exclude_file,
+                prefix_stats_file=remote_stats_file
+            )
+            cmd = ("ulimit -n 65535 2>/dev/null; "
+                   f"timeout -k 10 {REMOTE_TIMEOUT} "
+                   + shlex.join(args)
+                   + " 2>&1 | tail -25")
+            await log("در حال سنجش روی سرور ایران…" if only
+                      else "در حال اسکن رنج کلادفلر از داخل ایران…")
+            try:
+                r = await asyncio.wait_for(conn.run(cmd, check=False), timeout=LOCAL_TIMEOUT)
+            except (asyncio.TimeoutError, TimeoutError):
+                try:
+                    await conn.run(f"pkill -15 -f {shlex.quote(proc_pattern)} 2>/dev/null", check=False)
+                    await asyncio.sleep(5)
+                    await conn.run(f"pkill -9 -f {shlex.quote(proc_pattern)} 2>/dev/null", check=False)
+                except Exception:
+                    pass
+                raise ScanTimeoutError(f"Scan timed out after {LOCAL_TIMEOUT}s on engine {engine_id}")
+
+            tail = (r.stdout or "")[-500:]
+
+            res = await conn.run(f"cat {shlex.quote(out_file + '.json')} 2>/dev/null", check=False)
+            raw = (res.stdout or "").strip()
+            if not raw:
+                if getattr(r, "exit_status", None) == 124:
+                    raise ScanTimeoutError(f"Scan timed out after {REMOTE_TIMEOUT}s on engine {engine_id}.\n{tail[-300:]}")
+                raise RuntimeError(f"scanner produced no results.\n{tail[-300:]}")
+
+            payload = json.loads(raw)
+            if isinstance(payload, dict):
+                file_start = payload.get("scan_start")
+                file_engine = payload.get("engine_id")
+                if file_start is not None and file_start < (scan_start_time - 5):
+                    raise StaleResultError(
+                        f"Stale scan results for engine {engine_id}: result timestamp {file_start} "
+                        f"is older than scan start {scan_start_time}"
+                    )
+                if file_engine is not None and file_engine != engine_id and file_engine != 0:
+                    raise StaleResultError(
+                        f"Engine ID mismatch in scan results: expected {engine_id}, got {file_engine}"
+                    )
+                if payload.get("trust_store_broken"):
+                    await log("هشدار: اعتبارسنجی گواهی SSL در سرور اسکنر با خطا مواجه شد (احتمال مشکل CA bundle یا ساعت سرور)")
+                data = payload.get("results", [])
+            elif isinstance(payload, list):
+                data = payload
+            else:
+                raise RuntimeError(f"Unexpected scan result format: {type(payload)}")
+
+            # keep only genuinely usable finalists (finite rtt), best first
+            data = [d for d in data
+                    if isinstance(d.get("rtt"), (int, float))
+                    and math.isfinite(d["rtt"])]
+            returned_prefix_stats = payload.get("prefix_stats", {}) if isinstance(payload, dict) else {}
+            return ScanOutput(data, tail, prefix_stats=returned_prefix_stats)
+        finally:
+            conn.close()
 
 
 def is_better(candidate: dict, current_ip: str | None, current: dict | None,
@@ -125,8 +408,16 @@ def score(d: dict) -> float:
 
 
 def _score(d: dict) -> float:
-    rtt = d.get("rtt") or 999
-    jit = d.get("jitter") or 0
-    loss = d.get("loss") or 0
-    mbps = d.get("mbps") or 0
-    return rtt + 2 * jit + 1000 * loss - min(mbps, 100) * 0.5
+    # Must agree exactly with cf_scan.score().
+    rtt = d.get("rtt")
+    if rtt is None or not math.isfinite(rtt):
+        return float("inf")
+    jit = float(d.get("jitter") or 0.0)
+    loss = float(d.get("loss") or 0.0)
+    tls_loss = float(d.get("tls_loss") or 0.0)
+    tls_jitter = float(d.get("tls_jitter") or 0.0)
+    mbps = float(d.get("mbps") or 0.0)
+    cost = float(rtt) + 2.0 * jit + 1000.0 * loss + 1200.0 * tls_loss + 0.5 * tls_jitter
+    if d.get("mbps"):
+        cost -= min(float(d["mbps"]), 100.0) * 0.5
+    return cost

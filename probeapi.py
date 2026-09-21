@@ -47,6 +47,8 @@ async def candidates(request):
     engine_id = int(eng_param) if eng_param and eng_param.isdigit() else None
     if engine_id is None:
         engine_id = st.active_probe_engine(device=dev or None, operator=op or None)
+        log.warning("[candidates] inferred engine_id=%d for device=%s (unspecified by client)",
+                    engine_id, dev or "unknown")
 
     if dev:
         st.record_candidate_delivery(engine_id, dev, op)
@@ -123,13 +125,23 @@ async def report(request):
 
     if engine_id is None:
         rep_ips = {str(r.get("ip") or "") for r in clean if r.get("ip")}
+        matching_eids = []
         for eid in (1, 2, 3):
             cand_ips = set(st.scan_candidates(engine_id=eid).get("ips") or [])
             if rep_ips & cand_ips:
-                engine_id = eid
-                break
-    if engine_id is None:
-        engine_id = st.active_probe_engine(device=device or None, operator=operator or None)
+                matching_eids.append(eid)
+        if len(matching_eids) > 1:
+            engine_id = matching_eids[0]
+            log.error("[report] AMBIGUOUS ATTRIBUTION for device=%s: reported addresses intersect MULTIPLE engines %s, defaulting to engine_id=%d",
+                      device or "unknown", matching_eids, engine_id)
+        elif len(matching_eids) == 1:
+            engine_id = matching_eids[0]
+            log.warning("[report] inferred engine_id=%d for device=%s via candidate IP intersection (unspecified by client)",
+                        engine_id, device or "unknown")
+        else:
+            engine_id = st.active_probe_engine(device=device or None, operator=operator or None)
+            log.warning("[report] inferred engine_id=%d for device=%s via active_probe_engine fallback (no IP match, unspecified by client)",
+                        engine_id, device or "unknown")
 
     st.save_device_report(device, operator, clean, net, app, engine_id=engine_id)
     st.touch_device(device, operator, net, app)
@@ -165,6 +177,8 @@ async def ping(request):
     engine_id = int(eng_param) if eng_param and eng_param.isdigit() else None
     if engine_id is None:
         engine_id = st.active_probe_engine(device=dev or None, operator=op or None)
+        log.warning("[ping] inferred engine_id=%d for device=%s (unspecified by client)",
+                    engine_id, dev or "unknown")
 
     cand = st.scan_candidates(engine_id=engine_id)
     current = set(cand.get("ips") or [])
