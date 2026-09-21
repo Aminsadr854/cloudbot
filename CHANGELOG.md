@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.1.1] - 2026-09-21
+
+### Changed
+- The control probe host configuration is now resolved in a single shared helper, continuing to accept the legacy environment variable name for backward compatibility.
+- Added a startup warning when the control probe host is unset or left as a placeholder.
+- Server-side engine attribution for phone reports that omit engine_id is now explicitly logged, and ambiguous attribution across multiple engines is logged as an error.
+- Scan decision log lines now include their engine ID alongside voter counts and decision reasons.
+
+### Added
+- Comprehensive phone probe protocol documentation (v1 and v2 specifications) and protocol gap analysis.
+- Reviewer guide covering architectural correctness, confidence bounds, and verification methodology.
+
+### Upgrading
+Stop the service and back up the database before the first start of this version:
+- The store migrates blocked-address data into a new table and adds another prefix statistics table.
+- Set `CLOUDBOT_PROBE_BASE` in your environment file if not already defined.
+
 ## [3.1.0] - 2026-09-21
 
 ### Security
