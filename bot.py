@@ -53,9 +53,9 @@ OWNER = int(os.environ["CLOUDBOT_OWNER"])
 # Control IP probe base URL. In production, this must be supplied via the
 # CLOUDBOT_PROBE_BASE (or legacy CLOUDBOT_PROBE) environment variable.
 PROBE_BASE = get_probe_base()
-PANEL_URL = os.environ["CLOUDBOT_PANEL_URL"]
-PANEL_USER = os.environ["CLOUDBOT_PANEL_USER"]
-PANEL_PASS = os.environ["CLOUDBOT_PANEL_PASS"]
+PANEL_URL = os.environ.get("CLOUDBOT_PANEL_URL", "")
+PANEL_USER = os.environ.get("CLOUDBOT_PANEL_USER", "")
+PANEL_PASS = os.environ.get("CLOUDBOT_PANEL_PASS", "")
 SNI_CORE_ID = int(os.environ.get("CLOUDBOT_CORE_ID", "6"))
 
 # WARNING / TESTING SAFETY:
