@@ -75,6 +75,7 @@ bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 PROVIDER_LABEL = {"linode": "🟢 Linode", "vultr": "🔵 Vultr", "hetzner": "🔴 Hetzner"}
+PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
 
 
 def _own_addresses() -> set[str]:
@@ -150,10 +151,50 @@ def kb_account(acc):
     b = InlineKeyboardBuilder()
     b.button(text="📋 سرورها", callback_data=f"srvs:{acc['id']}")
     b.button(text="➕ ساخت سرور", callback_data=f"new:{acc['id']}")
-    b.button(text="🌐 پروکسی", callback_data=f"prx:{acc['id']}")
+    b.button(text="⚙️ تنظیمات", callback_data=f"accset:{acc['id']}")
     b.button(text="🔑 حذف اکانت", callback_data=f"delacc:{acc['id']}")
     b.button(text="🔙 اکانت‌ها", callback_data="accounts")
     b.adjust(2, 2, 1)
+    return b.as_markup()
+
+
+def proxy_summary(proxy):
+    """Show a proxy endpoint without exposing its authentication details."""
+    if not proxy:
+        return "بدون پروکسی"
+    value = proxy.split("://", 1)[-1]
+    if "@" in value:
+        value = value.rsplit("@", 1)[1]
+    if value.startswith("["):
+        end = value.find("]")
+        if end < 0:
+            return "پروکسی تنظیم شده"
+        port = value[end + 2:].split(":", 1)[0] if value[end + 1:end + 2] == ":" else ""
+        return f"{value[:end + 1]}:{port}" if port else value[:end + 1]
+    bits = value.split(":", 2)
+    return ":".join(bits[:2]) if len(bits) >= 2 else "پروکسی تنظیم شده"
+
+
+def account_settings_text(acc):
+    family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
+    return (
+        "⚙️ <b>تنظیمات اکانت</b>\n\n"
+        f"🏷 نام: <b>{html.escape(acc['label'])}</b>\n"
+        f"☁️ ارائه‌دهنده: {PROVIDER_LABEL.get(acc['provider'], acc['provider'])}\n"
+        f"🌐 پروکسی: <code>{html.escape(proxy_summary(acc['proxy']))}</code>\n"
+        f"🔌 مسیر اتصال پراکسی: <b>{family}</b>\n"
+        "🔐 توکن API: <i>ذخیره‌شده و رمزنگاری‌شده</i>"
+    )
+
+
+def kb_account_settings(acc):
+    b = InlineKeyboardBuilder()
+    b.button(text="✏️ تغییر نام", callback_data=f"accname:{acc['id']}")
+    b.button(text="🌐 تغییر پراکسی", callback_data=f"prx:{acc['id']}")
+    if acc["proxy"]:
+        b.button(text="🗑 حذف پراکسی", callback_data=f"accprxclear:{acc['id']}")
+    b.button(text="🔙 بازگشت", callback_data=f"acc:{acc['id']}")
+    b.adjust(1)
     return b.as_markup()
 
 
@@ -183,17 +224,81 @@ async def cb_accounts(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+def format_account_details(info: dict | None, provider: str) -> str:
+    if not info:
+        return ""
+    lines = []
+    ident = []
+    if info.get("name"):
+        ident.append(html.escape(str(info["name"])))
+    if info.get("email"):
+        ident.append(f"<code>{html.escape(str(info['email']))}</code>")
+    if ident:
+        lines.append(f"👤 <b>مشخصات:</b> {' · '.join(ident)}")
+
+    if provider == "vultr":
+        credit = info.get("credit", 0.0)
+        owed = info.get("owed", 0.0)
+        pending = info.get("pending_charges", 0.0)
+        net = info.get("net", 0.0)
+        if credit > 0:
+            lines.append(f"💳 <b>اعتبار:</b> ${credit:,.2f}")
+        elif owed > 0:
+            lines.append(f"⚠️ <b>بدهی:</b> ${owed:,.2f}")
+        else:
+            lines.append("💳 <b>اعتبار:</b> $0.00")
+        if pending > 0:
+            lines.append(f"⏳ <b>هزینه جاری:</b> ${pending:,.2f}")
+        if credit > 0 or pending > 0:
+            sign = "" if net >= 0 else "-"
+            lines.append(f"💰 <b>مانده خالص:</b> {sign}${abs(net):,.2f}")
+        if info.get("last_payment_amount") is not None and info.get("last_payment_date"):
+            lines.append(f"🧾 <b>آخرین پرداخت:</b> ${info['last_payment_amount']:,.2f} ({info['last_payment_date']})")
+
+    elif provider == "linode":
+        credit = info.get("credit", 0.0)
+        pending = info.get("pending_charges", 0.0)
+        if credit > 0:
+            lines.append(f"🎁 <b>اعتبار هدیه / پروموشن:</b> ${credit:,.2f}")
+        if pending > 0:
+            lines.append(f"⏳ <b>کارکرد جاری (تخمینی):</b> ${pending:,.2f}")
+        if credit > 0 and pending > 0:
+            net = credit - pending
+            lines.append(f"💰 <b>مانده تخمینی:</b> ${net:,.2f}")
+
+    return ("\n\n" + "\n".join(lines)) if lines else ""
+
+
 @dp.callback_query(F.data.startswith("acc:"))
 async def cb_account(cb: CallbackQuery):
     acc = st.account(int(cb.data.split(":")[1]))
     if not acc:
         await cb.answer("یافت نشد", show_alert=True)
         return
-    prx = acc["proxy"].split(":")[0] + ":…" if acc["proxy"] else "بدون پروکسی"
+    prx = proxy_summary(acc["proxy"])
+    family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
+    details_str = ""
+    try:
+        info = await providers.Provider(acc).account_info()
+        details_str = format_account_details(info, acc["provider"])
+    except Exception as e:
+        log.warning("failed to fetch account_info for acc %s: %s", acc.get("id"), e)
     await cb.message.edit_text(
         f"{PROVIDER_LABEL.get(acc['provider'])} <b>{html.escape(acc['label'])}</b>\n"
-        f"🌐 پروکسی: <code>{html.escape(prx)}</code>",
+        f"🌐 پروکسی: <code>{html.escape(prx)}</code> · {family}"
+        f"{details_str}",
         reply_markup=kb_account(acc))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("accset:"))
+async def cb_account_settings(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    acc = st.account(int(cb.data.split(":", 1)[1]))
+    if not acc:
+        await cb.answer("یافت نشد", show_alert=True)
+        return
+    await cb.message.edit_text(account_settings_text(acc), reply_markup=kb_account_settings(acc))
     await cb.answer()
 
 
@@ -205,6 +310,16 @@ class Add(StatesGroup):
     label = State()
     token = State()
     proxy = State()
+    proxy_family = State()
+
+
+def kb_proxy_family(prefix: str):
+    b = InlineKeyboardBuilder()
+    b.button(text="پیش‌فرض", callback_data=f"{prefix}:default")
+    b.button(text="IPv4", callback_data=f"{prefix}:ipv4")
+    b.button(text="IPv6", callback_data=f"{prefix}:ipv6")
+    b.adjust(3)
+    return b.as_markup()
 
 
 @dp.callback_query(F.data == "add_acc")
@@ -250,9 +365,10 @@ async def add_token(msg: Message, state: FSMContext):
         "یا اگر لازم نیست، دکمهٔ زیر را بزن.", reply_markup=b.as_markup())
 
 
-async def _finish_add(data, proxy, answer):
+async def _finish_add(data, proxy, proxy_family, answer):
     try:
-        acc = {"provider": data["provider"], "token": data["token"], "proxy": proxy}
+        acc = {"provider": data["provider"], "token": data["token"], "proxy": proxy,
+               "proxy_family": proxy_family}
         who = await providers.Provider(acc).whoami()
     except Exception as e:
         log.exception("add-account validation failed (provider=%s proxy=%s)",
@@ -261,7 +377,7 @@ async def _finish_add(data, proxy, answer):
                      "اگر پروکسی از نوع SOCKS است، جلوش <code>socks5://</code> بگذار. "
                      "وگرنه توکن را بررسی کن.")
         return
-    st.add_account(data["label"], data["provider"], data["token"], proxy)
+    st.add_account(data["label"], data["provider"], data["token"], proxy, proxy_family)
     await answer(f"✅ اکانت <b>{html.escape(data['label'])}</b> اضافه شد.\n"
                  f"شناسایی شد: <code>{html.escape(str(who))}</code>")
 
@@ -274,11 +390,20 @@ async def add_proxy(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("❌ قالب پروکسی نادرست است. host:port:username:password")
         return
+    await state.update_data(proxy=proxy)
+    await state.set_state(Add.proxy_family)
+    await msg.answer("اتصال به پراکسی با کدام IP برقرار شود؟", reply_markup=kb_proxy_family("addfam"))
+
+
+@dp.callback_query(Add.proxy_family, F.data.startswith("addfam:"))
+async def add_proxy_family(cb: CallbackQuery, state: FSMContext):
+    family = cb.data.split(":", 1)[1]
     data = await state.get_data()
     await state.clear()
-    note = await msg.answer("در حال تست اتصال…")
-    await _finish_add(data, proxy, note.edit_text)
-    await msg.answer("منو:", reply_markup=kb_main())
+    await cb.message.edit_text("در حال تست اتصال…")
+    await _finish_add(data, data["proxy"], family, cb.message.edit_text)
+    await cb.message.answer("منو:", reply_markup=kb_main())
+    await cb.answer()
 
 
 @dp.callback_query(Add.proxy, F.data == "noproxy")
@@ -286,7 +411,7 @@ async def add_noproxy(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
     await cb.message.edit_text("در حال تست اتصال…")
-    await _finish_add(data, None, cb.message.edit_text)
+    await _finish_add(data, None, "default", cb.message.edit_text)
     await cb.message.answer("منو:", reply_markup=kb_main())
     await cb.answer()
 
@@ -294,8 +419,43 @@ async def add_noproxy(cb: CallbackQuery, state: FSMContext):
 # --------------------------------------------------------------------------
 # proxy change
 # --------------------------------------------------------------------------
+class AccountSettings(StatesGroup):
+    name = State()
+
+
+@dp.callback_query(F.data.startswith("accname:"))
+async def account_name_start(cb: CallbackQuery, state: FSMContext):
+    acc_id = int(cb.data.split(":", 1)[1])
+    acc = st.account(acc_id)
+    if not acc:
+        await cb.answer("یافت نشد", show_alert=True)
+        return
+    await state.set_state(AccountSettings.name)
+    await state.update_data(acc_id=acc_id)
+    b = InlineKeyboardBuilder()
+    b.button(text="🔙 انصراف", callback_data=f"accset:{acc_id}")
+    await cb.message.edit_text(
+        f"نام جدید اکانت را بفرست.\n\nنام فعلی: <b>{html.escape(acc['label'])}</b>",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.message(AccountSettings.name)
+async def account_name_set(msg: Message, state: FSMContext):
+    label = (msg.text or "").strip()
+    if not label or len(label) > 80:
+        await msg.answer("نام باید بین ۱ تا ۸۰ کاراکتر باشد.")
+        return
+    data = await state.get_data()
+    await state.clear()
+    st.set_account_label(data["acc_id"], label)
+    acc = st.account(data["acc_id"])
+    await msg.answer("✅ نام اکانت به‌روز شد.", reply_markup=kb_account_settings(acc))
+
+
 class Proxy(StatesGroup):
     value = State()
+    family = State()
 
 
 @dp.callback_query(F.data.startswith("prx:"))
@@ -321,19 +481,50 @@ async def prx_set(msg: Message, state: FSMContext):
     except ValueError:
         await msg.answer("❌ قالب نادرست. host:port:username:password")
         return
+    await state.update_data(proxy=proxy)
+    await state.set_state(Proxy.family)
+    await msg.answer("اتصال به پراکسی با کدام IP برقرار شود؟", reply_markup=kb_proxy_family("prxfam"))
+
+
+@dp.callback_query(Proxy.family, F.data.startswith("prxfam:"))
+async def prx_family(cb: CallbackQuery, state: FSMContext):
+    family = cb.data.split(":", 1)[1]
     data = await state.get_data()
+    account = st.account(data["acc_id"])
+    await cb.message.edit_text("در حال تست اتصال…")
+    try:
+        await providers.Provider({**account, "proxy": data["proxy"], "proxy_family": family}).whoami()
+    except Exception as e:
+        await cb.message.edit_text(
+            f"❌ اتصال ناموفق بود:\n<code>{html.escape(str(e)[:350])}</code>\n\n"
+            "یک خانوادهٔ IP دیگر انتخاب کن یا با /start دوباره تلاش کن.",
+            reply_markup=kb_proxy_family("prxfam"))
+        await cb.answer()
+        return
     await state.clear()
-    st.set_proxy(data["acc_id"], proxy)
-    await msg.answer("✅ پروکسی به‌روز شد.", reply_markup=kb_account(st.account(data["acc_id"])))
+    st.set_proxy(data["acc_id"], data["proxy"], family)
+    await cb.message.edit_text("✅ پروکسی به‌روز شد.", reply_markup=kb_account(st.account(data["acc_id"])))
+    await cb.answer()
 
 
 @dp.callback_query(Proxy.value, F.data == "prx_clear")
 async def prx_clear(cb: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     await state.clear()
-    st.set_proxy(data["acc_id"], None)
+    st.set_proxy(data["acc_id"], None, "default")
     await cb.message.edit_text("✅ پروکسی حذف شد.",
                                reply_markup=kb_account(st.account(data["acc_id"])))
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("accprxclear:"))
+async def account_proxy_clear(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    acc_id = int(cb.data.split(":", 1)[1])
+    st.set_proxy(acc_id, None, "default")
+    acc = st.account(acc_id)
+    await cb.message.edit_text("✅ پروکسی حذف شد.\n\n" + account_settings_text(acc),
+                               reply_markup=kb_account_settings(acc))
     await cb.answer()
 
 
@@ -376,7 +567,8 @@ async def cb_servers(cb: CallbackQuery):
         return
     b = InlineKeyboardBuilder()
     for s in servers:
-        b.button(text=f"{s['label']} · {s['ip']} · {s['status']}",
+        where = providers.location_text(acc["provider"], s.get("region"), s.get("country"))
+        b.button(text=f"{s['label']} · {where} · {s['ip']} · {s['status']}",
                  callback_data=f"srv:{acc_id}:{s['id']}")
     b.button(text="🔙 بازگشت", callback_data=f"acc:{acc_id}")
     b.adjust(1)
@@ -390,7 +582,9 @@ async def cb_server(cb: CallbackQuery):
     _, acc_id, srv_id = cb.data.split(":")
     acc = st.account(int(acc_id))
     try:
-        s = await providers.Provider(acc).server(srv_id)
+        prov = providers.Provider(acc)
+        s = await prov.server(srv_id)
+        floating_ips = await prov.vultr_floating_ips(srv_id) if acc["provider"] == "vultr" else []
     except Exception as e:
         await cb.answer(str(e)[:180], show_alert=True)
         return
@@ -409,6 +603,12 @@ async def cb_server(cb: CallbackQuery):
         b.button(text="🔑 ثبت رمز این سرور", callback_data=f"srvpw:{acc_id}:{srv_id}")
     if acc.get("provider") == "hetzner":
         b.button(text="🔄 ریست رمز روت", callback_data=f"srvrst:{acc_id}:{srv_id}")
+    if acc["provider"] == "vultr":
+        b.button(text="🌐 مدیریت IPها", callback_data=f"ipman:{acc_id}:{srv_id}")
+        b.button(text="🔄 ریبوت", callback_data=f"power:reboot:{acc_id}:{srv_id}")
+        power_label = "⏹ خاموش کردن" if s.get("status") == "active" else "▶️ روشن کردن"
+        power_action = "halt" if s.get("status") == "active" else "start"
+        b.button(text=power_label, callback_data=f"power:{power_action}:{acc_id}:{srv_id}")
     b.button(text="🗑 حذف سرور", callback_data=f"delsrv:{acc_id}:{srv_id}")
     b.button(text="🔙 سرورها", callback_data=f"srvs:{acc_id}")
     b.adjust(1)
@@ -417,12 +617,22 @@ async def cb_server(cb: CallbackQuery):
              f"🔑 رمز: <code>{html.escape(pw)}</code>" if pw else
              "🔑 رمز: <i>ذخیره نشده — این سرور را ربات نساخته، یا رمزش عوض شده</i>")
 
+    float_lines = ""
+    if acc["provider"] == "vultr":
+        if floating_ips:
+            shown = [f"• <code>{html.escape(_floating_ip_value(ip))}</code>"
+                     f" — {html.escape(str(ip.get('label') or 'بدون نام'))}"
+                     for ip in floating_ips]
+            float_lines = "\n📌 <b>Floating IPها:</b>\n" + "\n".join(shown)
+        else:
+            float_lines = "\n📌 <b>Floating IPها:</b> ندارد"
+
     await cb.message.edit_text(
         f"🖥 <b>{html.escape(str(s['label']))}</b>\n"
-        f"🌍 منطقه: <code>{s.get('region')}</code>\n"
+        f"🌍 منطقه: <b>{html.escape(providers.location_text(acc['provider'], s.get('region'), s.get('country')))}</b>\n"
         f"🔢 پلن: <code>{s.get('plan')}</code>\n"
         f"📡 آی‌پی: <code>{ip}</code>\n"
-        f"وضعیت: <b>{s.get('status')}</b>\n\n"
+        f"وضعیت: <b>{s.get('status')}</b>{float_lines}\n\n"
         f"{creds}", reply_markup=b.as_markup())
     await cb.answer()
 
@@ -562,6 +772,230 @@ async def cb_server_resetpw_ok(cb: CallbackQuery):
     await cb.answer()
 
 
+def _vultr_ip_value(result):
+    """Read the allocated address from either documented Vultr response shape."""
+    data = result.get("ipv4", result)
+    return data.get("ip") or data.get("ip_address") or "در حال تخصیص"
+
+
+async def _vultr_action_context(acc_id, srv_id):
+    acc = st.account(int(acc_id))
+    if not acc or acc["provider"] != "vultr":
+        raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
+    server = await providers.Provider(acc).server(srv_id)
+    return acc, server
+
+
+def _floating_ip_value(ip):
+    # Vultr calls the address `subnet` for Reserved IP records, while other
+    # endpoints use `ip` or `ip_address`.
+    return str(ip.get("ip_address") or ip.get("ip") or ip.get("subnet") or "—")
+
+
+@dp.callback_query(F.data.startswith("ipman:"))
+async def vultr_ip_manager(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    try:
+        acc, server = await _vultr_action_context(acc_id, srv_id)
+        floating_ips = await providers.Provider(acc).vultr_floating_ips(srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="➕ IPv4 عمومی جدید", callback_data=f"v4add:{acc_id}:{srv_id}")
+    b.button(text="➕ Floating IP جدید", callback_data=f"float:{acc_id}:{srv_id}")
+    for ip in floating_ips:
+        # Both Vultr IDs are UUIDs; only send the Reserved-IP ID so the
+        # callback stays below Telegram's 64-byte callback-data limit.
+        b.button(text=f"🗑 حذف {_floating_ip_value(ip)}", callback_data=f"floatdel:{acc_id}:{ip['id']}")
+    b.button(text="🔄 تازه‌سازی", callback_data=f"ipman:{acc_id}:{srv_id}")
+    b.button(text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    if floating_ips:
+        listed = "\n".join(
+            f"• <code>{html.escape(_floating_ip_value(ip))}</code> — "
+            f"{html.escape(str(ip.get('label') or 'بدون نام'))}" for ip in floating_ips)
+    else:
+        listed = "ندارد"
+    await cb.message.edit_text(
+        "🌐 <b>مدیریت IPها</b>\n\n"
+        f"📡 IP اصلی: <code>{html.escape(str(server.get('ip')))}</code>\n\n"
+        f"📌 <b>Floating IPهای متصل ({len(floating_ips)}):</b>\n{listed}\n\n"
+        "برای ساخت Floating IP جدید، Vultr سقف حساب/منطقه را بررسی می‌کند.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+POWER_TEXT = {
+    "start": ("روشن کردن", "سرور شروع به روشن شدن می‌کند."),
+    "halt": ("خاموش کردن", "سرور خاموش می‌شود و اتصال‌های فعال قطع خواهند شد."),
+    "reboot": ("ریبوت", "سرور ریبوت می‌شود و اتصال‌های فعال قطع خواهند شد."),
+}
+
+
+@dp.callback_query(F.data.startswith("power:"))
+async def vultr_power_prompt(cb: CallbackQuery):
+    _, action, acc_id, srv_id = cb.data.split(":")
+    if action not in POWER_TEXT:
+        await cb.answer("عملیات نامعتبر", show_alert=True)
+        return
+    try:
+        _, server = await _vultr_action_context(acc_id, srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    label, warning = POWER_TEXT[action]
+    b = InlineKeyboardBuilder()
+    b.button(text=f"⚠️ بله، {label}", callback_data=f"powerok:{action}:{acc_id}:{srv_id}")
+    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    await cb.message.edit_text(
+        f"⚠️ <b>{label} سرور</b>\n\n{html.escape(str(server['label']))}\n\n{warning}",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("powerok:"))
+async def vultr_power_execute(cb: CallbackQuery):
+    _, action, acc_id, srv_id = cb.data.split(":")
+    if action not in POWER_TEXT:
+        await cb.answer("عملیات نامعتبر", show_alert=True)
+        return
+    label, _ = POWER_TEXT[action]
+    await cb.message.edit_text(f"⏳ در حال {label}…")
+    try:
+        acc, _ = await _vultr_action_context(acc_id, srv_id)
+        await providers.Provider(acc).vultr_power(srv_id, action)
+    except Exception as e:
+        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        f"✅ دستور {label} ارسال شد.", reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("floatdel:"))
+async def vultr_delete_floating_prompt(cb: CallbackQuery):
+    _, acc_id, reserved_id = cb.data.split(":")
+    try:
+        acc = st.account(int(acc_id))
+        if not acc or acc["provider"] != "vultr":
+            raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
+        floating = await providers.Provider(acc).vultr_floating_ip(reserved_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ بله، برای همیشه حذف کن", callback_data=f"floatdelok:{acc_id}:{reserved_id}")
+    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{floating.get('instance_id')}")
+    b.adjust(1)
+    await cb.message.edit_text(
+        "⚠️ <b>حذف Floating IP</b>\n\n"
+        f"<code>{html.escape(_floating_ip_value(floating))}</code> از Vultr حذف می‌شود؛ این عمل قابل بازگشت نیست.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("floatdelok:"))
+async def vultr_delete_floating(cb: CallbackQuery):
+    _, acc_id, reserved_id = cb.data.split(":")
+    await cb.message.edit_text("⏳ در حال حذف Floating IP…")
+    try:
+        acc = st.account(int(acc_id))
+        if not acc or acc["provider"] != "vultr":
+            raise providers.ProviderError("این عملیات فقط برای سرورهای Vultr است")
+        await providers.Provider(acc).delete_vultr_floating_ip(reserved_id)
+    except Exception as e:
+        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        "✅ Floating IP حذف شد.", reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 سرورها", callback_data=f"srvs:{acc_id}").as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("v4add:"))
+async def vultr_add_ipv4_prompt(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    try:
+        _, server = await _vultr_action_context(acc_id, srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ بله، IPv4 جدید اضافه کن", callback_data=f"v4add_ok:{acc_id}:{srv_id}")
+    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    await cb.message.edit_text(
+        "⚠️ <b>افزودن IPv4 جدید</b>\n\n"
+        f"برای <b>{html.escape(str(server['label']))}</b> یک IPv4 عمومی دیگر می‌سازد و سرور را ریبوت می‌کند.\n"
+        "آی‌پی اصلی Vultr جایگزین نمی‌شود؛ آی‌پی جدید به سرور اضافه خواهد شد.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("v4add_ok:"))
+async def vultr_add_ipv4(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    await cb.message.edit_text("⏳ در حال ساخت IPv4 و ریبوت سرور…")
+    try:
+        acc, _ = await _vultr_action_context(acc_id, srv_id)
+        result = await providers.Provider(acc).add_vultr_ipv4(srv_id)
+    except Exception as e:
+        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        f"✅ IPv4 جدید درخواست شد: <code>{html.escape(str(_vultr_ip_value(result)))}</code>\n\n"
+        "Vultr سرور را ریبوت می‌کند؛ چند دقیقه بعد از فهرست سرورها وضعیت را بررسی کن.",
+        reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("float:"))
+async def vultr_floating_ip_prompt(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    try:
+        _, server = await _vultr_action_context(acc_id, srv_id)
+    except Exception as e:
+        await cb.answer(str(e)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ بله، Floating IP بساز", callback_data=f"float_ok:{acc_id}:{srv_id}")
+    b.button(text="🔙 انصراف", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    await cb.message.edit_text(
+        "⚠️ <b>افزودن Floating IP</b>\n\n"
+        f"یک Reserved IPv4 جدید در منطقهٔ <b>{html.escape(providers.location_text(acc['provider'], server.get('region'), server.get('country')))}</b> می‌سازد و به این سرور وصل می‌کند.\n"
+        "این IP جداگانه قابل جابه‌جایی بین سرورهای همان منطقه است و ممکن است هزینهٔ Vultr داشته باشد.",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("float_ok:"))
+async def vultr_floating_ip(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    await cb.message.edit_text("⏳ در حال ساخت و اتصال Floating IP…")
+    try:
+        acc, server = await _vultr_action_context(acc_id, srv_id)
+        reserved = await providers.Provider(acc).create_and_attach_vultr_floating_ip(
+            srv_id, server["region"], f"cloudbot-{server['label'] or srv_id[:8]}")
+    except Exception as e:
+        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>")
+        await cb.answer()
+        return
+    await cb.message.edit_text(
+        f"✅ Floating IP ساخته و متصل شد: <code>{html.escape(str(_vultr_ip_value(reserved)))}</code>\n"
+        f"شناسه: <code>{html.escape(str(reserved.get('id', '—')))}</code>",
+        reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}").as_markup())
+    await cb.answer()
+
+
 @dp.callback_query(F.data.startswith("delsrv:"))
 async def del_srv(cb: CallbackQuery):
     _, acc_id, srv_id = cb.data.split(":")
@@ -670,7 +1104,10 @@ async def pick_region(cb: CallbackQuery, state: FSMContext):
     region = cb.data.split(":", 1)[1]
     data = await state.get_data()
     acc = st.account(data["acc_id"])
-    await state.update_data(region=region)
+    region_label = next((item[1] for item in data.get("regions", [])
+                         if item[0] == region),
+                        providers.location_text(acc["provider"], region))
+    await state.update_data(region=region, region_label=region_label)
     await cb.message.edit_text("در حال گرفتن پلن‌ها…")
     try:
         plans = await providers.Provider(acc).plans(region)
@@ -679,8 +1116,10 @@ async def pick_region(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         return
     await state.update_data(plans=plans)
-    await cb.message.edit_text(f"🌍 {region}\n🔢 پلن را انتخاب کن:",
-                               reply_markup=_paged_kb(plans, "plan", f"acc:{data['acc_id']}"))
+    await cb.message.edit_text(
+        f"🌍 {html.escape(region_label)}\n"
+        "🔢 پلن را انتخاب کن:",
+        reply_markup=_paged_kb(plans, "plan", f"acc:{data['acc_id']}"))
     await cb.answer()
 
 
@@ -748,6 +1187,8 @@ async def do_create(msg: Message, state: FSMContext):
     # hand it back through the API a second time.
     st.set_server_pass(acc["id"], srv["id"], srv["root_password"])
     ip = srv.get("ip") or "(در حال تخصیص — چند لحظه بعد در لیست سرورها می‌آید)"
+    region_label = data.get("region_label") or providers.location_text(
+        acc["provider"], srv.get("region"), srv.get("country"))
     b = InlineKeyboardBuilder()
     if srv.get("ip"):
         b.button(text="🔌 نود کردن در پنل", callback_data=f"node:{acc['id']}:{srv['id']}")
@@ -757,7 +1198,7 @@ async def do_create(msg: Message, state: FSMContext):
         f"✅ <b>سرور ساخته شد</b>\n\n"
         f"🏷 نام: <code>{html.escape(str(srv['label']))}</code>\n"
         f"📡 آی‌پی: <code>{ip}</code>\n"
-        f"🌍 منطقه: <code>{srv.get('region')}</code>\n"
+        f"🌍 منطقه: <b>{html.escape(region_label)}</b>\n"
         f"🔢 پلن: <code>{srv.get('plan')}</code>\n"
         f"👤 یوزر: <code>root</code>\n"
         f"🔑 رمز: <code>{html.escape(srv['root_password'])}</code>\n\n"
@@ -2914,7 +3355,7 @@ async def _replace_target(t, log_fn):
         if not sib:
             raise RuntimeError(
                 f"اکانت «{acc['label']}» بن شده و هیچ اکانت دیگری برای "
-                f"{old.get('region')} باقی نمانده")
+                f"{providers.location_text(acc['provider'], old.get('region'), old.get('country'))} باقی نمانده")
         target_acc = sib
         await log_fn(f"اکانت جایگزین (کم‌بارترین اکانت همان دیتاسنتر): "
                      f"«{html.escape(sib['label'])}»")
@@ -2951,7 +3392,7 @@ async def _replace_target(t, log_fn):
         await replacer.scrap(st, target_acc, cand, log_fn)
     if srv is None:
         raise RuntimeError(f"بعد از {IP_HUNT_ATTEMPTS} تلاش، آی‌پی تمیزی در "
-                           f"{old.get('region')} پیدا نشد")
+                           f"{providers.location_text(acc['provider'], old.get('region'), old.get('country'))} پیدا نشد")
 
     await log_fn("نصب و نود کردن سرور نو…")
     server_ca, api_key = await provision_node(srv["ip"], srv["root_password"], log_fn)
@@ -3006,7 +3447,9 @@ async def _replace_target(t, log_fn):
     return {"fqdn": fqdn, "old_ip": old_ip, "old_label": old.get("label"),
             "old_account": acc["label"], "new_ip": srv["ip"],
             "new_label": srv.get("label"), "new_account": target_acc["label"],
-            "region": old.get("region"), "plan": old.get("plan"),
+            "provider": acc["provider"], "region": old.get("region"),
+            "country": old.get("country"),
+            "plan": old.get("plan"),
             "healthy": healthy, "verdict": verdict, "ban_note": ban_note}
 
 
@@ -3199,7 +3642,7 @@ async def _do_watch(*, alert: bool):
                     f"({html.escape(str(info['new_label']))}) — "
                     f"اکانت «{html.escape(info['new_account'])}»"
                     f"{'' if info['healthy'] else ' <i>(حذف شد)</i>'}\n"
-                    f"📍 {info['region']} · {info['plan']}\n\n"
+                    f"📍 {providers.location_text(info['provider'], info['region'], info.get('country'))} · {info['plan']}\n\n"
                     f"باقی‌ماندهٔ جایگزینی امروز برای این کانفیگ: "
                     f"{_replace_budget(t['id'])}")
             if info.get("ban_note"):

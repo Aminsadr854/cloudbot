@@ -28,6 +28,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     provider  TEXT NOT NULL,          -- 'linode' | 'vultr'
     token     BLOB NOT NULL,          -- encrypted API token
     proxy     BLOB,                   -- encrypted host:port:user:pass, or NULL
+    proxy_family TEXT NOT NULL DEFAULT 'default', -- default | ipv4 | ipv6
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tunnels (
@@ -84,6 +85,13 @@ class Store:
         self.con = sqlite3.connect(self.db_path, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
         self.con.executescript(SCHEMA)
+        # Existing installations predate the per-proxy IP-family preference.
+        # SQLite's CREATE TABLE IF NOT EXISTS does not add columns, so migrate
+        # them in place without touching their encrypted credentials.
+        columns = {r["name"] for r in self.con.execute("PRAGMA table_info(accounts)")}
+        if "proxy_family" not in columns:
+            self.con.execute("ALTER TABLE accounts ADD COLUMN proxy_family TEXT NOT NULL DEFAULT 'default'")
+            self.con.commit()
         self.f = _fernet(self.key_path)
 
     def close(self):
@@ -93,12 +101,12 @@ class Store:
             pass
 
     # ---- accounts ------------------------------------------------------
-    def add_account(self, label, provider, token, proxy=None):
+    def add_account(self, label, provider, token, proxy=None, proxy_family="default"):
         self.con.execute(
-            "INSERT INTO accounts (label, provider, token, proxy, created_at)"
-            " VALUES (?,?,?,?,?)",
+            "INSERT INTO accounts (label, provider, token, proxy, proxy_family, created_at)"
+            " VALUES (?,?,?,?,?,?)",
             (label, provider, self.f.encrypt(token.encode()),
-             self.f.encrypt(proxy.encode()) if proxy else None, int(time.time())))
+             self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, int(time.time())))
         self.con.commit()
         return self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -107,11 +115,16 @@ class Store:
         self.con.commit()
         return n
 
-    def set_proxy(self, acc_id, proxy):
-        """Set, change, or clear (proxy=None) an account's proxy."""
+    def set_account_label(self, acc_id, label):
+        """Rename an account without rewriting its encrypted credentials."""
+        self.con.execute("UPDATE accounts SET label = ? WHERE id = ?", (label, acc_id))
+        self.con.commit()
+
+    def set_proxy(self, acc_id, proxy, proxy_family="default"):
+        """Set, change, or clear (proxy=None) an account's proxy preference."""
         self.con.execute(
-            "UPDATE accounts SET proxy = ? WHERE id = ?",
-            (self.f.encrypt(proxy.encode()) if proxy else None, acc_id))
+            "UPDATE accounts SET proxy = ?, proxy_family = ? WHERE id = ?",
+            (self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, acc_id))
         self.con.commit()
 
     def _row(self, r):
@@ -119,6 +132,7 @@ class Store:
             "id": r["id"], "label": r["label"], "provider": r["provider"],
             "token": self.f.decrypt(r["token"]).decode(),
             "proxy": self.f.decrypt(r["proxy"]).decode() if r["proxy"] else None,
+            "proxy_family": r["proxy_family"] if "proxy_family" in r.keys() else "default",
             "created_at": r["created_at"],
         }
 

@@ -190,7 +190,8 @@ async def build_replacement(st, acc, old_server, log):
     prov = providers.Provider(acc)
     image = await pick_image(acc)
     label = new_label(old_server.get("label"), old_server.get("ip"))
-    await log(f"ساخت سرور نو روی «{acc['label']}» — {old_server.get('region')} / "
+    await log(f"ساخت سرور نو روی «{acc['label']}» — "
+              f"{providers.location_text(acc['provider'], old_server.get('region'), old_server.get('country'))} / "
               f"{old_server.get('plan')}")
     import secrets
     import string

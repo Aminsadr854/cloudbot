@@ -118,3 +118,38 @@ class VultrIpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await p.vultr_floating_ip("rip-1"),
                          {"id": "rip-1", "subnet": "198.51.100.20"})
         p._req.assert_awaited_once_with("GET", "/reserved-ips/rip-1")
+
+
+class AccountInfoTests(unittest.IsolatedAsyncioTestCase):
+    async def test_vultr_account_info_parses_credit_and_charges(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={
+            "account": {
+                "name": "Test User",
+                "email": "user@example.com",
+                "balance": -300.0,
+                "pending_charges": 60.0,
+                "last_payment_date": "2026-09-03T04:21:03+00:00",
+                "last_payment_amount": -300.0,
+            }
+        })
+        info = await p.account_info()
+        self.assertEqual(info["credit"], 300.0)
+        self.assertEqual(info["pending_charges"], 60.0)
+        self.assertEqual(info["net"], 240.0)
+        self.assertEqual(info["last_payment_date"], "2026-09-03")
+
+    async def test_linode_account_info_parses_promotions_and_balance(self):
+        p = providers.Provider({"provider": "linode", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={
+            "first_name": "John",
+            "last_name": "Doe",
+            "email": "john@example.com",
+            "balance": 0.0,
+            "balance_uninvoiced": 15.5,
+            "active_promotions": [{"credit_remaining": "250.00"}],
+        })
+        info = await p.account_info()
+        self.assertEqual(info["credit"], 250.0)
+        self.assertEqual(info["pending_charges"], 15.5)
+        self.assertEqual(info["net"], 234.5)
