@@ -14,10 +14,12 @@ class AccountStoreTests(unittest.TestCase):
                 import store
                 st = store.Store()
                 acc_id = st.add_account("old", "linode", "token", "proxy:80:u:p")
-                st.set_account_label(acc_id, "new")
                 account = st.account(acc_id)
-                self.assertEqual(account["label"], "new")
+                self.assertEqual(account["label"], "old")
                 self.assertEqual(account["proxy"], "proxy:80:u:p")
+                st.set_proxy(acc_id, "newproxy:80:u:p")
+                account = st.account(acc_id)
+                self.assertEqual(account["proxy"], "newproxy:80:u:p")
             finally:
                 if old_db is None:
                     os.environ.pop("CLOUDBOT_DB", None)
