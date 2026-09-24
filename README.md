@@ -14,6 +14,9 @@ proxy (`host:port:user:pass`, HTTP or SOCKS). List, create and delete servers.
 API tokens and proxies are encrypted at rest with a key in its own root-only
 file, so the database on its own is inert.
 
+The server-creation wizard accepts up to 10 names, one per line, and creates
+them sequentially with a separate password for each.
+
 **Panel nodes.** Provision a new server and attach it to a Pasarguard/Marzban
 panel in one step: firewall down, node installed, certificate and API key read
 back, node registered. Duplicate names are cleaned up rather than stacked.

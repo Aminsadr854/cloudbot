@@ -29,6 +29,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     token     BLOB NOT NULL,          -- encrypted API token
     proxy     BLOB,                   -- encrypted host:port:user:pass, or NULL
     proxy_family TEXT NOT NULL DEFAULT 'default', -- default | ipv4 | ipv6
+    auto_backup  TEXT NOT NULL DEFAULT 'disabled', -- disabled | enabled
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tunnels (
@@ -92,6 +93,9 @@ class Store:
         if "proxy_family" not in columns:
             self.con.execute("ALTER TABLE accounts ADD COLUMN proxy_family TEXT NOT NULL DEFAULT 'default'")
             self.con.commit()
+        if "auto_backup" not in columns:
+            self.con.execute("ALTER TABLE accounts ADD COLUMN auto_backup TEXT NOT NULL DEFAULT 'disabled'")
+            self.con.commit()
         self.f = _fernet(self.key_path)
 
     def close(self):
@@ -101,12 +105,12 @@ class Store:
             pass
 
     # ---- accounts ------------------------------------------------------
-    def add_account(self, label, provider, token, proxy=None, proxy_family="default"):
+    def add_account(self, label, provider, token, proxy=None, proxy_family="default", auto_backup="disabled"):
         self.con.execute(
-            "INSERT INTO accounts (label, provider, token, proxy, proxy_family, created_at)"
-            " VALUES (?,?,?,?,?,?)",
+            "INSERT INTO accounts (label, provider, token, proxy, proxy_family, auto_backup, created_at)"
+            " VALUES (?,?,?,?,?,?,?)",
             (label, provider, self.f.encrypt(token.encode()),
-             self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, int(time.time())))
+             self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, auto_backup, int(time.time())))
         self.con.commit()
         return self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
 
@@ -127,12 +131,18 @@ class Store:
             (self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, acc_id))
         self.con.commit()
 
+    def set_auto_backup(self, acc_id, auto_backup="disabled"):
+        """Enable or disable auto-backups on newly created servers for this account."""
+        self.con.execute("UPDATE accounts SET auto_backup = ? WHERE id = ?", (auto_backup, acc_id))
+        self.con.commit()
+
     def _row(self, r):
         return {
             "id": r["id"], "label": r["label"], "provider": r["provider"],
             "token": self.f.decrypt(r["token"]).decode(),
             "proxy": self.f.decrypt(r["proxy"]).decode() if r["proxy"] else None,
             "proxy_family": r["proxy_family"] if "proxy_family" in r.keys() else "default",
+            "auto_backup": r["auto_backup"] if "auto_backup" in r.keys() else "disabled",
             "created_at": r["created_at"],
         }
 

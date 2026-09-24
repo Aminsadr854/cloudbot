@@ -32,3 +32,36 @@ class AccountStoreTests(unittest.TestCase):
                     os.environ.pop("CLOUDBOT_KEY", None)
                 else:
                     os.environ["CLOUDBOT_KEY"] = old_key
+
+    def test_auto_backup_setting_and_migration(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_db = os.environ.get("CLOUDBOT_DB")
+            old_key = os.environ.get("CLOUDBOT_KEY")
+            os.environ["CLOUDBOT_DB"] = f"{d}/cloudbot.db"
+            os.environ["CLOUDBOT_KEY"] = f"{d}/secret.key"
+            try:
+                import store
+                st = store.Store()
+                # Default is disabled
+                acc_id = st.add_account("vultr-test", "vultr", "token")
+                account = st.account(acc_id)
+                self.assertEqual(account.get("auto_backup"), "disabled")
+
+                # Toggle to enabled
+                st.set_auto_backup(acc_id, "enabled")
+                account = st.account(acc_id)
+                self.assertEqual(account.get("auto_backup"), "enabled")
+
+                # Toggle back to disabled
+                st.set_auto_backup(acc_id, "disabled")
+                account = st.account(acc_id)
+                self.assertEqual(account.get("auto_backup"), "disabled")
+            finally:
+                if old_db is None:
+                    os.environ.pop("CLOUDBOT_DB", None)
+                else:
+                    os.environ["CLOUDBOT_DB"] = old_db
+                if old_key is None:
+                    os.environ.pop("CLOUDBOT_KEY", None)
+                else:
+                    os.environ["CLOUDBOT_KEY"] = old_key

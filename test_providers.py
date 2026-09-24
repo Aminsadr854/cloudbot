@@ -14,6 +14,12 @@ class ProxyParsingTests(unittest.TestCase):
 
 
 class LocationFormattingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        providers.clear_cache()
+
+    def tearDown(self):
+        providers.clear_cache()
+
     def test_country_flag_uses_iso_regional_indicators(self):
         self.assertEqual(providers.country_flag("de"), "🇩🇪")
         self.assertEqual(providers.country_flag("United States"), "🇺🇸")
@@ -32,6 +38,12 @@ class LocationFormattingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PlanFormattingTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        providers.clear_cache()
+
+    def tearDown(self):
+        providers.clear_cache()
+
     async def test_linode_plan_shows_monthly_transfer(self):
         p = providers.Provider({"provider": "linode", "token": "test", "proxy": None})
         p._req = AsyncMock(return_value={"data": [{
@@ -42,6 +54,126 @@ class PlanFormattingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await p.plans(), [
             ("g6-standard-1", "Linode 2GB · 📡 2000 GB traffic - $12/mo")
         ])
+
+
+class CacheTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        providers.clear_cache()
+
+    def tearDown(self):
+        providers.clear_cache()
+
+    async def test_regions_are_cached_across_calls(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={
+            "regions": [{"id": "ams", "city": "Amsterdam", "country": "NL"}]
+        })
+        first = await p.regions()
+        second = await p.regions()
+        self.assertEqual(first, second)
+        self.assertEqual(p._req.await_count, 1)
+
+    async def test_regions_force_refresh_bypasses_cache(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={
+            "regions": [{"id": "ams", "city": "Amsterdam", "country": "NL"}]
+        })
+        await p.regions()
+        await p.regions(force=True)
+        self.assertEqual(p._req.await_count, 2)
+
+    async def test_plans_are_cached_per_region(self):
+        p = providers.Provider({"provider": "linode", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"data": [{
+            "id": "g6-standard-1", "label": "Linode 2GB", "transfer": 2000,
+            "price": {"monthly": 12},
+        }]})
+        first = await p.plans("us-east")
+        second = await p.plans("us-east")
+        self.assertEqual(first, second)
+        self.assertEqual(p._req.await_count, 1)
+
+        p._req.return_value = {"data": [{
+            "id": "g6-standard-2", "label": "Linode 4GB", "transfer": 4000,
+            "price": {"monthly": 24},
+        }]}
+        third = await p.plans("eu-central")
+        self.assertEqual(p._req.await_count, 2)
+        self.assertNotEqual(first, third)
+
+    async def test_clear_cache_by_provider_or_all(self):
+        p_vultr = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p_vultr._req = AsyncMock(return_value={"regions": [{"id": "ams", "city": "Amsterdam", "country": "NL"}]})
+        p_linode = providers.Provider({"provider": "linode", "token": "test", "proxy": None})
+        p_linode._req = AsyncMock(return_value={"data": [{"id": "us-east", "label": "Newark, NJ", "country": "US"}]})
+
+        await p_vultr.regions()
+        await p_linode.regions()
+        self.assertIsNotNone(providers.get_cached_regions("vultr"))
+        self.assertIsNotNone(providers.get_cached_regions("linode"))
+
+        # Clear only vultr
+        providers.clear_cache("vultr")
+        self.assertIsNone(providers.get_cached_regions("vultr"))
+        self.assertIsNotNone(providers.get_cached_regions("linode"))
+
+        # Clear all
+        providers.clear_cache()
+        self.assertIsNone(providers.get_cached_regions("linode"))
+
+
+class VultrBackupsAndAvailabilityTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        providers.clear_cache()
+
+    def tearDown(self):
+        providers.clear_cache()
+
+    async def test_vultr_plans_filtered_by_region(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        async def mock_req(method, path, **kwargs):
+            if path == "/regions/ams/availability":
+                return {"available_plans": ["vc2-1c-1gb"]}
+            if path.startswith("/plans"):
+                return {"plans": [
+                    {"id": "vc2-1c-1gb", "vcpu_count": 1, "ram": 1024, "disk": 25, "monthly_cost": 5, "locations": ["ams", "ewr"]},
+                    {"id": "vc2-1c-0.5gb-v6", "vcpu_count": 1, "ram": 512, "disk": 10, "monthly_cost": 2.5, "locations": ["ewr", "atl"]},
+                ]}
+            return {}
+        p._req = AsyncMock(side_effect=mock_req)
+        plans = await p.plans("ams")
+        # Should only contain vc2-1c-1gb, vc2-1c-0.5gb-v6 must be excluded
+        self.assertEqual(len(plans), 1)
+        self.assertEqual(plans[0][0], "vc2-1c-1gb")
+
+    async def test_vultr_create_server_disables_backup_by_default(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"instance": {
+            "id": "inst-1", "label": "srv1", "main_ip": "1.2.3.4",
+            "region": "ams", "plan": "vc2-1c-1gb", "default_password": "pass"
+        }})
+        await p.create_server("srv1", "ams", "vc2-1c-1gb", "1743", "rootpw")
+        call_args = p._req.call_args
+        self.assertEqual(call_args[0][0], "POST")
+        self.assertEqual(call_args[0][1], "/instances")
+        body = call_args[1]["json"]
+        self.assertEqual(body["backups"], "disabled")
+
+    async def test_vultr_create_server_enables_backup_when_specified(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"instance": {
+            "id": "inst-1", "label": "srv1", "main_ip": "1.2.3.4",
+            "region": "ams", "plan": "vc2-1c-1gb", "default_password": "pass"
+        }})
+        await p.create_server("srv1", "ams", "vc2-1c-1gb", "1743", "rootpw", auto_backup="enabled")
+        body = p._req.call_args[1]["json"]
+        self.assertEqual(body["backups"], "enabled")
+
+    async def test_set_vultr_backups(self):
+        p = providers.Provider({"provider": "vultr", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"instance": {"id": "inst-1"}})
+        await p.set_vultr_backups("inst-1", "disabled")
+        p._req.assert_called_once_with("PATCH", "/instances/inst-1", json={"backups": "disabled"})
 
 
 class ProxyFamilyTests(unittest.IsolatedAsyncioTestCase):

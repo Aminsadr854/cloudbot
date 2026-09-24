@@ -13,6 +13,7 @@ import html
 import json
 import logging
 import os
+import re
 import secrets
 import string
 
@@ -177,12 +178,15 @@ def proxy_summary(proxy):
 
 def account_settings_text(acc):
     family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
+    backup_status = "فعال ✅" if acc.get("auto_backup") == "enabled" else "غیرفعال ❌ (بدون ۲۰٪ هزینه اضافی)"
+    extra_vultr = f"\n💾 بکاپ خودکار سرورهای جدید: <b>{backup_status}</b>" if acc.get("provider") == "vultr" else ""
     return (
         "⚙️ <b>تنظیمات اکانت</b>\n\n"
         f"🏷 نام: <b>{html.escape(acc['label'])}</b>\n"
         f"☁️ ارائه‌دهنده: {PROVIDER_LABEL.get(acc['provider'], acc['provider'])}\n"
         f"🌐 پروکسی: <code>{html.escape(proxy_summary(acc['proxy']))}</code>\n"
-        f"🔌 مسیر اتصال پراکسی: <b>{family}</b>\n"
+        f"🔌 مسیر اتصال پراکسی: <b>{family}</b>"
+        f"{extra_vultr}\n"
         "🔐 توکن API: <i>ذخیره‌شده و رمزنگاری‌شده</i>"
     )
 
@@ -193,6 +197,10 @@ def kb_account_settings(acc):
     b.button(text="🌐 تغییر پراکسی", callback_data=f"prx:{acc['id']}")
     if acc["proxy"]:
         b.button(text="🗑 حذف پراکسی", callback_data=f"accprxclear:{acc['id']}")
+    if acc.get("provider") == "vultr":
+        is_en = acc.get("auto_backup") == "enabled"
+        btn_text = "💾 بکاپ خودکار: فعال ✅ (تغییر به غیرفعال)" if is_en else "💾 بکاپ خودکار: غیرفعال ❌ (تغییر به فعال)"
+        b.button(text=btn_text, callback_data=f"accbackup:{acc['id']}")
     b.button(text="🔙 بازگشت", callback_data=f"acc:{acc['id']}")
     b.adjust(1)
     return b.as_markup()
@@ -528,6 +536,22 @@ async def account_proxy_clear(cb: CallbackQuery, state: FSMContext):
     await cb.answer()
 
 
+@dp.callback_query(F.data.startswith("accbackup:"))
+async def account_toggle_backup(cb: CallbackQuery):
+    acc_id = int(cb.data.split(":", 1)[1])
+    acc = st.account(acc_id)
+    if not acc:
+        await cb.answer("یافت نشد", show_alert=True)
+        return
+    curr = acc.get("auto_backup", "disabled")
+    new_val = "enabled" if curr == "disabled" else "disabled"
+    st.set_auto_backup(acc_id, new_val)
+    acc = st.account(acc_id)
+    msg_text = "بکاپ خودکار سرورهای جدید فعال شد." if new_val == "enabled" else "بکاپ خودکار سرورهای جدید غیرفعال شد."
+    await cb.answer(msg_text)
+    await cb.message.edit_text(account_settings_text(acc), reply_markup=kb_account_settings(acc))
+
+
 # --------------------------------------------------------------------------
 # delete account
 # --------------------------------------------------------------------------
@@ -609,6 +633,8 @@ async def cb_server(cb: CallbackQuery):
         power_label = "⏹ خاموش کردن" if s.get("status") == "active" else "▶️ روشن کردن"
         power_action = "halt" if s.get("status") == "active" else "start"
         b.button(text=power_label, callback_data=f"power:{power_action}:{acc_id}:{srv_id}")
+        if "auto_backups" in s.get("features", []):
+            b.button(text="💾 غیرفعال‌سازی بکاپ خودکار", callback_data=f"disbackup:{acc_id}:{srv_id}")
     b.button(text="🗑 حذف سرور", callback_data=f"delsrv:{acc_id}:{srv_id}")
     b.button(text="🔙 سرورها", callback_data=f"srvs:{acc_id}")
     b.adjust(1)
@@ -618,6 +644,7 @@ async def cb_server(cb: CallbackQuery):
              "🔑 رمز: <i>ذخیره نشده — این سرور را ربات نساخته، یا رمزش عوض شده</i>")
 
     float_lines = ""
+    vultr_extra = ""
     if acc["provider"] == "vultr":
         if floating_ips:
             shown = [f"• <code>{html.escape(_floating_ip_value(ip))}</code>"
@@ -626,15 +653,30 @@ async def cb_server(cb: CallbackQuery):
             float_lines = "\n📌 <b>Floating IPها:</b>\n" + "\n".join(shown)
         else:
             float_lines = "\n📌 <b>Floating IPها:</b> ندارد"
+        has_backup = "auto_backups" in s.get("features", [])
+        vultr_extra = f"\n💾 بکاپ خودکار: <b>{'فعال ✅' if has_backup else 'غیرفعال ❌'}</b>"
 
     await cb.message.edit_text(
         f"🖥 <b>{html.escape(str(s['label']))}</b>\n"
         f"🌍 منطقه: <b>{html.escape(providers.location_text(acc['provider'], s.get('region'), s.get('country')))}</b>\n"
         f"🔢 پلن: <code>{s.get('plan')}</code>\n"
         f"📡 آی‌پی: <code>{ip}</code>\n"
-        f"وضعیت: <b>{s.get('status')}</b>{float_lines}\n\n"
+        f"وضعیت: <b>{s.get('status')}</b>{float_lines}{vultr_extra}\n\n"
         f"{creds}", reply_markup=b.as_markup())
     await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("disbackup:"))
+async def cb_disable_backup(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":")
+    acc = st.account(int(acc_id))
+    try:
+        await providers.Provider(acc).set_vultr_backups(srv_id, "disabled")
+        await cb.answer("✅ بکاپ خودکار برای این سرور غیرفعال شد.", show_alert=True)
+    except Exception as e:
+        await cb.answer(f"❌ خطا: {str(e)[:150]}", show_alert=True)
+        return
+    await cb_server(cb)
 
 
 @dp.callback_query(F.data.startswith("srvssh:"))
@@ -1049,8 +1091,26 @@ async def del_srv_ok(cb: CallbackQuery):
 
 
 # --------------------------------------------------------------------------
-# create server (region -> plan -> image -> label)
+# create server (region -> plan -> image -> one name per line)
 # --------------------------------------------------------------------------
+MAX_BATCH_SERVER_NAMES = 10
+
+
+def parse_server_names(text):
+    names = [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if not names:
+        return None, "Send at least one server name, one per line."
+    if len(names) > MAX_BATCH_SERVER_NAMES:
+        return None, f"Send at most {MAX_BATCH_SERVER_NAMES} server names at a time."
+    invalid = [name for name in names
+               if len(name) > 64 or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name)]
+    if invalid:
+        return None, "Names must start with a letter or number and contain only letters, numbers, _ or - (up to 64 characters)."
+    if len(set(names)) != len(names):
+        return None, "Each server name must be unique."
+    return names, None
+
+
 class Create(StatesGroup):
     label = State()
 
@@ -1076,7 +1136,8 @@ def _paged_kb(items, cb_prefix, back_cb, page=0, per=8):
 async def new_start(cb: CallbackQuery, state: FSMContext):
     acc_id = int(cb.data.split(":")[1])
     acc = st.account(acc_id)
-    await cb.message.edit_text("در حال گرفتن مناطق…")
+    if not providers.get_cached_regions(acc["provider"], acc.get("id")):
+        await cb.message.edit_text("در حال گرفتن مناطق…")
     try:
         regions = await providers.Provider(acc).regions()
     except Exception as e:
@@ -1107,8 +1168,13 @@ async def pick_region(cb: CallbackQuery, state: FSMContext):
     region_label = next((item[1] for item in data.get("regions", [])
                          if item[0] == region),
                         providers.location_text(acc["provider"], region))
+    if acc["provider"] == "linode" and "Linodes unavailable" in region_label:
+        await cb.answer("Linode creation is unavailable in this region for this account.",
+                        show_alert=True)
+        return
     await state.update_data(region=region, region_label=region_label)
-    await cb.message.edit_text("در حال گرفتن پلن‌ها…")
+    if not providers.get_cached_plans(acc["provider"], region):
+        await cb.message.edit_text("در حال گرفتن پلن‌ها…")
     try:
         plans = await providers.Provider(acc).plans(region)
     except Exception as e:
@@ -1163,46 +1229,109 @@ async def image_page(cb: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("image:"))
 async def pick_image(cb: CallbackQuery, state: FSMContext):
     image = cb.data.split(":", 1)[1]
-    await state.update_data(image=image)
+    data = await state.get_data()
+    acc = st.account(data["acc_id"])
+    auto_backup = acc.get("auto_backup", "disabled")
+    await state.update_data(image=image, auto_backup=auto_backup)
     await state.set_state(Create.label)
-    await cb.message.edit_text("یک <b>نام</b> برای سرور بفرست (فقط حروف/عدد/خط تیره):")
+
+    b = InlineKeyboardBuilder()
+    extra = ""
+    if acc.get("provider") == "vultr":
+        bk_text = "💾 بکاپ: فعال ✅ (تغییر به غیرفعال)" if auto_backup == "enabled" else "💾 بکاپ: غیرفعال ❌ (تغییر به فعال)"
+        b.button(text=bk_text, callback_data="create_toggle_backup")
+        status_txt = "فعال ✅" if auto_backup == "enabled" else "غیرفعال ❌ (بدون ۲۰٪ هزینه اضافی)"
+        extra = f"\n\n💾 وضعیت بکاپ خودکار: <b>{status_txt}</b>"
+    b.button(text="🔙 انصراف", callback_data=f"acc:{acc['id']}")
+    b.adjust(1)
+
+    await cb.message.edit_text(
+        f"نام سرور را بفرست؛ برای ساخت چند سرور، هر نام را در یک خط بنویس (حداکثر {MAX_BATCH_SERVER_NAMES} نام، فقط حروف/عدد/_/-):{extra}",
+        reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(Create.label, F.data == "create_toggle_backup")
+async def cb_create_toggle_backup(cb: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    acc = st.account(data["acc_id"])
+    curr = data.get("auto_backup", acc.get("auto_backup", "disabled"))
+    new_val = "enabled" if curr == "disabled" else "disabled"
+    await state.update_data(auto_backup=new_val)
+
+    b = InlineKeyboardBuilder()
+    bk_text = "💾 بکاپ: فعال ✅ (تغییر به غیرفعال)" if new_val == "enabled" else "💾 بکاپ: غیرفعال ❌ (تغییر به فعال)"
+    b.button(text=bk_text, callback_data="create_toggle_backup")
+    b.button(text="🔙 انصراف", callback_data=f"acc:{acc['id']}")
+    b.adjust(1)
+
+    status_txt = "فعال ✅" if new_val == "enabled" else "غیرفعال ❌ (بدون ۲۰٪ هزینه اضافی)"
+    await cb.message.edit_text(
+        f"نام سرور را بفرست؛ برای ساخت چند سرور، هر نام را در یک خط بنویس (حداکثر {MAX_BATCH_SERVER_NAMES} نام، فقط حروف/عدد/_/-):\n\n💾 وضعیت بکاپ خودکار: <b>{status_txt}</b>",
+        reply_markup=b.as_markup()
+    )
     await cb.answer()
 
 
 @dp.message(Create.label)
 async def do_create(msg: Message, state: FSMContext):
-    label = "".join(c for c in msg.text.strip() if c.isalnum() or c in "-_") or "server"
+    labels, error = parse_server_names(msg.text)
+    if error:
+        await msg.answer(f"❌ {html.escape(error)}")
+        return
+
     data = await state.get_data()
     await state.clear()
     acc = st.account(data["acc_id"])
-    root_pw = gen_password()
-    note = await msg.answer("⏳ در حال ساخت سرور…")
-    try:
-        srv = await providers.Provider(acc).create_server(
-            label, data["region"], data["plan"], data["image"], root_pw)
-    except Exception as e:
-        await note.edit_text(f"❌ ساخت ناموفق: <code>{html.escape(str(e)[:250])}</code>")
-        return
-    # Keep the root password so "node it" can SSH in later - Linode will not
-    # hand it back through the API a second time.
-    st.set_server_pass(acc["id"], srv["id"], srv["root_password"])
-    ip = srv.get("ip") or "(در حال تخصیص — چند لحظه بعد در لیست سرورها می‌آید)"
-    region_label = data.get("region_label") or providers.location_text(
-        acc["provider"], srv.get("region"), srv.get("country"))
+    auto_backup = data.get("auto_backup", acc.get("auto_backup", "disabled"))
+    prov = providers.Provider(acc)
+    note = await msg.answer(f"⏳ در حال ساخت {len(labels)} سرور…")
+    results = []
+    created_servers = []
+
+    for index, label in enumerate(labels, start=1):
+        await note.edit_text(f"⏳ در حال ساخت سرورها… {index}/{len(labels)} · <code>{html.escape(label)}</code>")
+        root_pw = gen_password()
+        try:
+            srv = await prov.create_server(
+                label, data["region"], data["plan"], data["image"], root_pw,
+                auto_backup=auto_backup)
+        except Exception as e:
+            detail = str(e)[:220]
+            results.append(f"❌ <code>{html.escape(label)}</code>: {html.escape(detail)}")
+            if "resource creation in this region is currently restricted" in detail.lower():
+                for skipped in labels[index:]:
+                    results.append(f"⏭ <code>{html.escape(skipped)}</code>: به‌دلیل محدودیت Linode در این منطقه ساخته نشد.")
+                break
+            continue
+
+        # Linode and Hetzner passwords are returned only at creation; Vultr
+        # generates its own password. Preserve each provider's actual value.
+        server_password = srv.get("root_password") or root_pw
+        srv["root_password"] = server_password
+        st.set_server_pass(acc["id"], srv["id"], server_password)
+        created_servers.append(srv)
+        ip = srv.get("ip") or "(در حال تخصیص؛ کمی بعد فهرست سرورها را ببین)"
+        details = (f"✅ <code>{html.escape(str(srv['label']))}</code> · "
+                   f"آی‌پی <code>{html.escape(str(ip))}</code> · "
+                   f"رمز <code>{html.escape(server_password)}</code>")
+        if acc["provider"] == "vultr":
+            backup_status = "enabled" if auto_backup == "enabled" else "disabled"
+            details += f" · بکاپ {('فعال' if backup_status == 'enabled' else 'غیرفعال')}"
+        results.append(details)
+
     b = InlineKeyboardBuilder()
-    if srv.get("ip"):
-        b.button(text="🔌 نود کردن در پنل", callback_data=f"node:{acc['id']}:{srv['id']}")
+    for srv in created_servers:
+        if srv.get("ip"):
+            b.button(text=f"🔌 نود کردن {str(srv.get('label') or srv['id'])[:35]}",
+                     callback_data=f"node:{acc['id']}:{srv['id']}")
     b.button(text="🔙 سرورها", callback_data=f"srvs:{acc['id']}")
     b.adjust(1)
     await note.edit_text(
-        f"✅ <b>سرور ساخته شد</b>\n\n"
-        f"🏷 نام: <code>{html.escape(str(srv['label']))}</code>\n"
-        f"📡 آی‌پی: <code>{ip}</code>\n"
-        f"🌍 منطقه: <b>{html.escape(region_label)}</b>\n"
-        f"🔢 پلن: <code>{srv.get('plan')}</code>\n"
-        f"👤 یوزر: <code>root</code>\n"
-        f"🔑 رمز: <code>{html.escape(srv['root_password'])}</code>\n\n"
-        f"<i>رمز را جای امنی ذخیره کن.</i>", reply_markup=b.as_markup())
+        f"نتیجهٔ ساخت سرورها در {html.escape(str(data.get('region_label') or data['region']))} "
+        f"(پلن <code>{html.escape(str(data['plan']))}</code>):\n\n" + "\n".join(results) +
+        "\n\n<i>رمز هر سرور را جای امنی ذخیره کن.</i>",
+        reply_markup=b.as_markup())
 
 
 # --------------------------------------------------------------------------

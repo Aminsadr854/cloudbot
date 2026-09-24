@@ -15,6 +15,7 @@ import asyncio
 import ipaddress
 import logging
 import socket
+import time
 
 import aiohttp
 from yarl import URL
@@ -118,6 +119,48 @@ def location_text(provider, region, country=None):
     return f"{flag} {value}" if flag else value
 
 
+# -- in-memory cache for regions and plans ----------------------------------
+CACHE_TTL_REGIONS = 3600  # 1 hour
+CACHE_TTL_PLANS = 3600    # 1 hour
+
+_CACHE: dict[tuple, tuple[float, any]] = {}
+
+
+def clear_cache(provider: str | None = None):
+    """Clear in-memory cache, optionally filtered by provider."""
+    global _CACHE
+    if provider is None:
+        _CACHE.clear()
+    else:
+        _CACHE = {k: v for k, v in _CACHE.items() if k[0] != provider}
+
+
+def _get_cached(key: tuple) -> any:
+    now = time.time()
+    if key in _CACHE:
+        expire_at, data = _CACHE[key]
+        if now < expire_at:
+            return data
+        del _CACHE[key]
+    return None
+
+
+def _set_cached(key: tuple, data: any, ttl: int = 3600):
+    _CACHE[key] = (time.time() + ttl, data)
+
+
+def get_cached_regions(provider: str, account_id=None) -> list | None:
+    """Return cached region choices for a provider if available."""
+    if provider == "linode":
+        return _get_cached((provider, "regions", str(account_id or "")))
+    return _get_cached((provider, "regions"))
+
+
+def get_cached_plans(provider: str, region: str | None = None) -> list | None:
+    """Return cached plan choices for a provider and region if available."""
+    return _get_cached((provider, "plans", str(region or "")))
+
+
 def proxy_url(proxy: str | None) -> str | None:
     """
     Turn the user's proxy string into a full proxy URL.
@@ -204,10 +247,13 @@ class ProviderError(Exception):
 
 class Provider:
     def __init__(self, account: dict):
+        self.account = account
+        self.acc = account
         self.provider = account["provider"]
         self.token = account["token"]
         self.proxy = proxy_url(account.get("proxy"))
         self.proxy_family = account.get("proxy_family", "default")
+        self.auto_backup = account.get("auto_backup", "disabled")
 
     def _base(self):
         return {"linode": LINODE, "vultr": VULTR, "hetzner": HETZNER}[self.provider]
@@ -363,7 +409,8 @@ class Provider:
             return {"id": i["id"], "label": i.get("label"), "region": i.get("region"),
                     "country": region_country(self.provider, i.get("region")),
                     "ip": i.get("main_ip"), "status": i.get("status"),
-                    "plan": i.get("plan"), "default_password": i.get("default_password")}
+                    "plan": i.get("plan"), "default_password": i.get("default_password"),
+                    "features": i.get("features", [])}
         # hetzner
         d = await self._req("GET", f"/servers/{server_id}")
         i = d.get("server", d)
@@ -377,68 +424,141 @@ class Provider:
                 "plan": (i.get("server_type") or {}).get("name")}
 
     # -- choices for creation --------------------------------------------
-    async def regions(self):
+    async def regions(self, force: bool = False, ttl: int = CACHE_TTL_REGIONS):
+        account_id = str(self.account.get("id") or "")
+        cache_key = ((self.provider, "regions", account_id)
+                     if self.provider == "linode" else (self.provider, "regions"))
+        if not force:
+            cached = _get_cached(cache_key)
+            if cached is not None:
+                return cached
+
         if self.provider == "linode":
             d = await self._req("GET", "/regions?page_size=200")
-            return [(r["id"], location_text(self.provider,
-                                              r.get("label") or r["id"],
-                                              r.get("country")))
-                    for r in d.get("data", [])]
-        if self.provider == "vultr":
+            types = await self._linode_types(force=force)
+            try:
+                availability = await self._req("GET", "/account/availability?page_size=500")
+                service_by_region = {
+                    row.get("region"): row for row in availability.get("data", [])
+                    if row.get("region")
+                }
+            except Exception:
+                # Restricted tokens may not be able to read account availability.
+                service_by_region = {}
+
+            res = []
+            for r in d.get("data", []):
+                region_id = r["id"]
+                service = service_by_region.get(region_id)
+                linodes_allowed = (
+                    "Linodes" in (service.get("available") or [])
+                    if service is not None
+                    else "Linodes" in (r.get("capabilities") or [])
+                )
+                count = len(types) if linodes_allowed else 0
+                label = location_text(self.provider, r.get("label") or region_id,
+                                      r.get("country"))
+                label += (f" · {count} plans listed" if linodes_allowed
+                          else " · 0 plans (Linodes unavailable)")
+                res.append((region_id, label))
+        elif self.provider == "vultr":
             d = await self._req("GET", "/regions?per_page=200")
-            return [(r["id"], location_text(
+            res = [(r["id"], location_text(
                         self.provider,
                         f"{r.get('city','')} {r.get('country','')}".strip() or r["id"],
                         r.get("country")))
-                    for r in d.get("regions", [])]
-        # hetzner
-        d = await self._req("GET", "/locations?per_page=50")
-        return [(l["name"], location_text(
-                    self.provider,
-                    f"{l.get('city','')} {l.get('country','')}".strip() or l["name"],
-                    l.get("country_iso") or l.get("country")))
-                for l in d.get("locations", [])]
+                   for r in d.get("regions", [])]
+        else:
+            # hetzner
+            d = await self._req("GET", "/locations?per_page=50")
+            res = [(l["name"], location_text(
+                        self.provider,
+                        f"{l.get('city','')} {l.get('country','')}".strip() or l["name"],
+                        l.get("country_iso") or l.get("country")))
+                   for l in d.get("locations", [])]
 
-    async def plans(self, region=None):
+        _set_cached(cache_key, res, ttl)
+        return res
+
+    async def _linode_types(self, force: bool = False):
+        """Load the Linode type catalog once for region and plan choices."""
+        cache_key = (self.provider, "linode-types")
+        if not force:
+            cached = _get_cached(cache_key)
+            if cached is not None:
+                return cached
+        d = await self._req("GET", "/linode/types?page_size=500")
+        types = d.get("data", [])
+        _set_cached(cache_key, types, CACHE_TTL_PLANS)
+        return types
+
+    async def plans(self, region=None, force: bool = False, ttl: int = CACHE_TTL_PLANS):
+        cache_key = (self.provider, "plans", str(region or ""))
+        if not force:
+            cached = _get_cached(cache_key)
+            if cached is not None:
+                return cached
+
         if self.provider == "linode":
-            d = await self._req("GET", "/linode/types?page_size=500")
+            types = await self._linode_types(force=force)
             out = []
-            for t in d.get("data", []):
+            for t in types:
+                region_prices = t.get("region_prices") or []
                 price = (t.get("price") or {}).get("monthly")
+                if region:
+                    price = next((p.get("monthly") for p in region_prices
+                                  if p.get("id") == region), price)
                 transfer = t.get("transfer")
                 traffic = f" · 📡 {transfer} GB traffic" if transfer is not None else ""
                 out.append((t["id"],
                             f"{t.get('label', t['id'])}{traffic} - ${price}/mo"))
-            return out
-        if self.provider == "vultr":
-            path = f"/plans?per_page=500" + (f"&region={region}" if region else "")
-            d = await self._req("GET", path)
+            res = out
+        elif self.provider == "vultr":
+            d = await self._req("GET", "/plans?per_page=500")
+            avail_set = None
+            if region:
+                try:
+                    avail_data = await self._req("GET", f"/regions/{region}/availability")
+                    avail_set = set(avail_data.get("available_plans", []))
+                except Exception:
+                    pass
             out = []
             for p in d.get("plans", []):
+                pid = p.get("id")
+                if region:
+                    if avail_set is not None:
+                        if pid not in avail_set:
+                            continue
+                    elif region not in p.get("locations", []):
+                        continue
                 out.append((p["id"], f"{p.get('vcpu_count')}vCPU {p.get('ram')}MB "
                                      f"{p.get('disk')}GB - ${p.get('monthly_cost')}/mo"))
-            return out
-        # hetzner: server types; show only those available in the chosen location,
-        # and take the monthly price for that location.
-        d = await self._req("GET", "/server_types?per_page=100")
-        out = []
-        for t in d.get("server_types", []):
-            if t.get("deprecated"):
-                continue
-            price = ""
-            for pr in t.get("prices", []):
-                if not region or pr.get("location") == region:
-                    monthly = (pr.get("price_monthly") or {}).get("gross")
-                    if monthly:
-                        price = f" - €{float(monthly):.2f}/mo"
-                    break
-            else:
-                # not offered in this location
-                if region:
+            res = out
+        else:
+            # hetzner: server types; show only those available in the chosen location,
+            # and take the monthly price for that location.
+            d = await self._req("GET", "/server_types?per_page=100")
+            out = []
+            for t in d.get("server_types", []):
+                if t.get("deprecated"):
                     continue
-            out.append((t["name"], f"{t['name']} · {t.get('cores')}vCPU "
-                                   f"{t.get('memory')}GB {t.get('disk')}GB{price}"))
-        return out
+                price = ""
+                for pr in t.get("prices", []):
+                    if not region or pr.get("location") == region:
+                        monthly = (pr.get("price_monthly") or {}).get("gross")
+                        if monthly:
+                            price = f" - €{float(monthly):.2f}/mo"
+                        break
+                else:
+                    # not offered in this location
+                    if region:
+                        continue
+                out.append((t["name"], f"{t['name']} · {t.get('cores')}vCPU "
+                                       f"{t.get('memory')}GB {t.get('disk')}GB{price}"))
+            res = out
+
+        _set_cached(cache_key, res, ttl)
+        return res
 
     async def images(self):
         if self.provider == "linode":
@@ -467,7 +587,7 @@ class Provider:
                  i.get("description") or i.get("name")) for i in chosen[:40]]
 
     # -- create ----------------------------------------------------------
-    async def create_server(self, label, region, plan, image, root_password):
+    async def create_server(self, label, region, plan, image, root_password, auto_backup=None):
         """Returns {id, ip, label, root_password, default_password?}."""
         if self.provider == "linode":
             body = {
@@ -481,9 +601,11 @@ class Provider:
                     "country": region_country(self.provider, i.get("region")),
                     "plan": i.get("type"), "root_password": root_password}
         if self.provider == "vultr":
+            backup_val = auto_backup or self.acc.get("auto_backup") or "disabled"
             body = {
                 "label": label, "region": region, "plan": plan, "os_id": int(image),
                 "hostname": label,
+                "backups": backup_val,
             }
             d = await self._req("POST", "/instances", json=body)
             i = d.get("instance", d)
@@ -597,3 +719,11 @@ class Provider:
         if action not in ("start", "halt", "reboot"):
             raise ProviderError("unsupported Vultr power action")
         await self._req("POST", f"/instances/{server_id}/{action}")
+
+    async def set_vultr_backups(self, server_id, status="disabled"):
+        """Enable or disable auto-backups on an existing Vultr instance."""
+        if self.provider != "vultr":
+            raise ProviderError("auto-backup toggle is only available for Vultr")
+        if status not in ("disabled", "enabled"):
+            raise ProviderError("backup status must be 'disabled' or 'enabled'")
+        return await self._req("PATCH", f"/instances/{server_id}", json={"backups": status})
