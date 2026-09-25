@@ -24,7 +24,13 @@ from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import (CallbackQuery, InlineKeyboardButton, Message)
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    ReplyKeyboardMarkup,
+)
 from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 import secrets as _secrets
@@ -72,12 +78,160 @@ engines = {
     3: ScannerEngine(3, st, delivery_coordinator),
 }
 panel = Panel(PANEL_URL, PANEL_USER, PANEL_PASS)
-bot = Bot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 PROVIDER_LABEL = {"linode": "🟢 Linode", "vultr": "🔵 Vultr", "hetzner": "🔴 Hetzner"}
 PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
 account_check_status = {}
+
+# Custom emoji IDs belong to the Infrastructure Icons set owned by the bot's
+# owner.  Messages keep the regular emoji as a fallback for clients that do
+# not render custom emoji entities.
+CUSTOM_EMOJI_PACK = "https://t.me/addemoji/datacenter_emojis_by_vpnmanagerkiabot"
+CUSTOM_EMOJI_IDS = {
+    "datacenter": "5886535330965758128",
+    "server": "5886431328332685494",
+    "cloud": "5886643233429134178",
+    "firewall": "5886448078705139661",
+    "vpn": "5886753837426942576",
+    "database": "5886410927238028847",
+    "connection": "5884271771531617149",
+    "backup": "5886310455068073426",
+    "ok": "5886274789659647899",
+    "error": "5886323765171723965",
+}
+
+# Telegram supports custom-emoji icons on keyboard buttons as well as custom
+# emoji entities in message text.  Keep one replacement table here so new
+# menus do not accidentally reintroduce normal Unicode emoji.
+PREMIUM_EMOJI_NAME = {
+    "🖥️": "server", "🖥": "server", "☁️": "cloud", "⚙️": "server",
+    "🔧": "server", "✏️": "server", "🩺": "ok", "🔍": "connection",
+    "🔎": "connection", "🔗": "connection", "🔄": "connection",
+    "🔁": "connection", "🔀": "connection", "⏱": "connection",
+    "⏳": "connection", "⏸": "connection", "⏭": "connection", "⏹": "connection",
+    "▶️": "ok", "▶": "ok", "◀️": "connection", "◀": "connection",
+    "🟢": "ok", "✅": "ok", "🎁": "ok", "🚀": "ok", "🎯": "ok",
+    "⚪️": "ok", "⚪": "ok", "🔴": "error", "❌": "error",
+    "⚠️": "error", "⚠": "error", "⛔️": "error", "⛔": "error",
+    "🚫": "error", "🚨": "error", "🗑": "error", "🟠": "error",
+    "🔐": "vpn", "🔑": "vpn", "🔒": "vpn", "🔓": "vpn",
+    "🌐": "cloud", "🌍": "cloud", "🔵": "cloud", "🔹": "cloud",
+    "🇮🇷": "cloud", "🔌": "connection", "📡": "connection",
+    "👉": "connection", "🔙": "connection", "➕": "connection",
+    "🗄️": "datacenter", "📋": "datacenter", "📌": "datacenter",
+    "📍": "datacenter", "🏷": "datacenter", "🎨": "datacenter",
+    "💾": "database", "💿": "database", "💳": "database", "💰": "database",
+    "📊": "database", "🔢": "database", "🧾": "database", "📝": "database",
+    "💽": "backup", "📥": "backup", "♻️": "backup", "♻": "backup",
+    "📱": "server", "👤": "server",
+}
+PREMIUM_EMOJI_PATTERN = re.compile(
+    "|".join(re.escape(value) for value in sorted(PREMIUM_EMOJI_NAME, key=len, reverse=True))
+)
+
+
+def _custom_emoji_tag(sequence: str) -> str:
+    name = PREMIUM_EMOJI_NAME[sequence]
+    return f'<tg-emoji emoji-id="{CUSTOM_EMOJI_IDS[name]}">{sequence}</tg-emoji>'
+
+
+def premiumize_text(value: str | None) -> str | None:
+    """Replace normal UI emoji with custom-emoji entities in HTML text."""
+    if not value:
+        return value
+    protected: list[str] = []
+
+    def stash(match: re.Match[str]) -> str:
+        protected.append(match.group(0))
+        return f"\x00{len(protected) - 1}\x00"
+
+    value = re.sub(
+        r"<(?:tg-emoji|code|pre)\b[^>]*>.*?</(?:tg-emoji|code|pre)>",
+        stash,
+        value,
+        flags=re.DOTALL,
+    )
+    parts = re.split(r"(<[^>]+>)", value)
+    for index in range(0, len(parts), 2):
+        parts[index] = PREMIUM_EMOJI_PATTERN.sub(
+            lambda match: _custom_emoji_tag(match.group(0)), parts[index]
+        )
+    value = "".join(parts)
+    for index, original in enumerate(protected):
+        value = value.replace(f"\x00{index}\x00", original)
+    return value
+
+
+def _premiumize_markup(markup):
+    if isinstance(markup, InlineKeyboardMarkup):
+        rows, field = markup.inline_keyboard, "inline_keyboard"
+    elif isinstance(markup, ReplyKeyboardMarkup):
+        rows, field = markup.keyboard, "keyboard"
+    else:
+        return markup
+    changed = False
+    new_rows = []
+    for row in rows:
+        new_row = []
+        for button in row:
+            text = getattr(button, "text", None) or ""
+            match = PREMIUM_EMOJI_PATTERN.search(text)
+            if not match:
+                new_row.append(button)
+                continue
+            clean = PREMIUM_EMOJI_PATTERN.sub("", text)
+            clean = re.sub(r"\s{2,}", " ", clean).strip() or "•"
+            icon_id = CUSTOM_EMOJI_IDS[PREMIUM_EMOJI_NAME[match.group(0)]]
+            new_row.append(button.model_copy(update={
+                "text": clean,
+                "icon_custom_emoji_id": icon_id,
+            }))
+            changed = True
+        new_rows.append(new_row)
+    return markup.model_copy(update={field: new_rows}) if changed else markup
+
+
+def _premiumize_method(method):
+    updates = {}
+    if method.__class__.__name__ == "AnswerCallbackQuery":
+        value = getattr(method, "text", None)
+        if isinstance(value, str):
+            updates["text"] = re.sub(r"\s{2,}", " ", PREMIUM_EMOJI_PATTERN.sub("", value)).strip()
+    else:
+        for field in ("text", "caption"):
+            value = getattr(method, field, None)
+            if isinstance(value, str):
+                updates[field] = premiumize_text(value)
+        media = getattr(method, "media", None)
+        if isinstance(media, list):
+            updated_media = []
+            for item in media:
+                caption = getattr(item, "caption", None)
+                if isinstance(caption, str):
+                    item = item.model_copy(update={"caption": premiumize_text(caption)})
+                updated_media.append(item)
+            updates["media"] = updated_media
+    markup = getattr(method, "reply_markup", None)
+    if markup is not None:
+        updates["reply_markup"] = _premiumize_markup(markup)
+    return method.model_copy(update=updates) if updates else method
+
+
+class PremiumBot(Bot):
+    async def __call__(self, method, request_timeout=None):
+        return await super().__call__(_premiumize_method(method), request_timeout=request_timeout)
+
+
+bot = PremiumBot(TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+
+def tg_emoji(name: str, fallback: str) -> str:
+    """Return a custom emoji entity, with a valid plain emoji fallback."""
+    emoji_id = CUSTOM_EMOJI_IDS.get(name)
+    if not emoji_id:
+        return fallback
+    return f'<tg-emoji emoji-id="{emoji_id}">{fallback}</tg-emoji>'
 
 
 def _own_addresses() -> set[str]:
@@ -148,6 +302,7 @@ def kb_accounts():
                       f"{a['label']} {prx}", callback_data=f"acc:{a['id']}")
     if st.accounts():
         b.button(text="🔍 بررسی همه اکانت‌ها", callback_data="check_accounts")
+        b.button(text="🎨 آیکن‌های زیرساخت", url=CUSTOM_EMOJI_PACK)
     b.button(text="🔙 بازگشت", callback_data="home")
     b.adjust(1)
     return b.as_markup()
@@ -186,7 +341,7 @@ def account_settings_text(acc):
     backup_status = "فعال ✅" if acc.get("auto_backup") == "enabled" else "غیرفعال ❌ (بدون ۲۰٪ هزینه اضافی)"
     extra_vultr = f"\n💾 بکاپ خودکار سرورهای جدید: <b>{backup_status}</b>" if acc.get("provider") == "vultr" else ""
     return (
-        "⚙️ <b>تنظیمات اکانت</b>\n\n"
+        f"{tg_emoji('server', '🖥️')} <b>تنظیمات اکانت</b>\n\n"
         f"🏷 نام: <b>{html.escape(acc['label'])}</b>\n"
         f"☁️ ارائه‌دهنده: {PROVIDER_LABEL.get(acc['provider'], acc['provider'])}\n"
         f"🌐 پروکسی: <code>{html.escape(proxy_summary(acc['proxy']))}</code>\n"
@@ -215,7 +370,7 @@ def kb_account_settings(acc):
 async def start(msg: Message, state: FSMContext):
     await state.clear()
     await msg.answer(
-        "☁️ <b>مدیریت اکانت‌های ابری</b>\n\n"
+        f"{tg_emoji('cloud', '☁️')} <b>مدیریت اکانت‌های ابری</b>\n\n"
         "اکانت‌های Linode و Vultr را با API و پروکسی مدیریت کن: "
         "سرورها را ببین، بساز، پاک کن، و با یک دکمه نودِ پنل کن.",
         reply_markup=kb_main())
@@ -224,7 +379,7 @@ async def start(msg: Message, state: FSMContext):
 @dp.callback_query(F.data == "home")
 async def cb_home(cb: CallbackQuery, state: FSMContext):
     await state.clear()
-    await cb.message.edit_text("☁️ <b>مدیریت اکانت‌های ابری</b>", reply_markup=kb_main())
+    await cb.message.edit_text(f"{tg_emoji('cloud', '☁️')} <b>مدیریت اکانت‌های ابری</b>", reply_markup=kb_main())
     await cb.answer()
 
 
@@ -232,7 +387,7 @@ async def cb_home(cb: CallbackQuery, state: FSMContext):
 async def cb_accounts(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     accs = st.accounts()
-    text = f"🖥 <b>اکانت‌ها</b> ({len(accs)})" if accs else "هنوز اکانتی اضافه نکردی."
+    text = f"{tg_emoji('datacenter', '🗄️')} <b>اکانت‌ها</b> ({len(accs)})" if accs else "هنوز اکانتی اضافه نکردی."
     await cb.message.edit_text(text, reply_markup=kb_accounts())
     await cb.answer()
 
@@ -264,7 +419,9 @@ async def check_account(acc):
 async def cb_check_accounts(cb: CallbackQuery):
     accs = st.accounts()
     await cb.answer("در حال بررسی اکانت‌ها...")
-    await cb.message.edit_text("⏳ در حال بررسی کلیدهای API و صورتحساب اکانت‌ها...")
+    await cb.message.edit_text(
+        f"{tg_emoji('connection', '🔗')} در حال بررسی کلیدهای API و صورتحساب اکانت‌ها..."
+    )
     semaphore = asyncio.Semaphore(5)
 
     async def limited_check(acc):
@@ -272,10 +429,10 @@ async def cb_check_accounts(cb: CallbackQuery):
             return await check_account(acc)
 
     results = await asyncio.gather(*(limited_check(acc) for acc in accs))
-    lines = [f"🖥 <b>نتیجه بررسی اکانت‌ها</b> ({len(results)})"]
+    lines = [f"{tg_emoji('datacenter', '🗄️')} <b>نتیجه بررسی اکانت‌ها</b> ({len(results)})"]
     for acc, status, detail in results:
         account_check_status[acc["id"]] = status
-        marker = "🔴" if status == "problem" else "🟢"
+        marker = tg_emoji("error", "❌") if status == "problem" else tg_emoji("ok", "✅")
         label = html.escape(acc["label"])
         lines.append(f"{marker} <b>{label}</b> ({html.escape(acc['provider'])})\n{html.escape(detail)}")
     await cb.message.edit_text("\n\n".join(lines), reply_markup=kb_accounts())
