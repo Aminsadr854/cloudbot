@@ -84,6 +84,11 @@ Each account also has an inline **⚙️ Settings** screen for viewing its provi
 proxy endpoint and family preference, and for renaming or changing/removing its
 proxy.
 
+The **🖥 Accounts → 🔍 Check all accounts** button checks every API key and
+connection. It reads balances for Linode and Vultr, validates Hetzner project
+access, and marks accounts with API failures or an outstanding balance 🔴 in
+the account list until the next check or bot restart.
+
 For Vultr instances, the server screen can add a public IPv4 (Vultr reboots the
 instance) or create and attach a Reserved IPv4 floating IP. Vultr does not
 replace an existing primary IPv4 in place; the additional-address action keeps

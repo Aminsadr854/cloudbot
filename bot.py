@@ -77,6 +77,7 @@ dp = Dispatcher(storage=MemoryStorage())
 
 PROVIDER_LABEL = {"linode": "🟢 Linode", "vultr": "🔵 Vultr", "hetzner": "🔴 Hetzner"}
 PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
+account_check_status = {}
 
 
 def _own_addresses() -> set[str]:
@@ -141,8 +142,12 @@ def kb_accounts():
     b = InlineKeyboardBuilder()
     for a in st.accounts():
         prx = "🔒" if a["proxy"] else "🔓"
-        b.button(text=f"{PROVIDER_LABEL.get(a['provider'], a['provider'])} · "
+        status = account_check_status.get(a["id"])
+        marker = "🔴 " if status == "problem" else "🟢 " if status == "ok" else ""
+        b.button(text=f"{marker}{PROVIDER_LABEL.get(a['provider'], a['provider'])} · "
                       f"{a['label']} {prx}", callback_data=f"acc:{a['id']}")
+    if st.accounts():
+        b.button(text="🔍 بررسی همه اکانت‌ها", callback_data="check_accounts")
     b.button(text="🔙 بازگشت", callback_data="home")
     b.adjust(1)
     return b.as_markup()
@@ -230,6 +235,50 @@ async def cb_accounts(cb: CallbackQuery, state: FSMContext):
     text = f"🖥 <b>اکانت‌ها</b> ({len(accs)})" if accs else "هنوز اکانتی اضافه نکردی."
     await cb.message.edit_text(text, reply_markup=kb_accounts())
     await cb.answer()
+
+
+async def check_account(acc):
+    """Read billing where offered; validate Hetzner's project token."""
+    try:
+        provider = providers.Provider(acc)
+        if acc["provider"] == "hetzner":
+            await provider.whoami()
+            return acc, "ok", "کلید API فعال است؛ اطلاعات صورتحساب در API پروژه موجود نیست."
+        info = await provider.account_info()
+        if info is None:
+            raise ValueError("اطلاعات حساب دریافت نشد")
+        owed = float(info.get("owed") or 0)
+        pending = float(info.get("pending_charges") or 0)
+        credit = float(info.get("credit") or 0)
+        status = "problem" if owed > 0 else "ok"
+        billing = f"بدهی: ${owed:,.2f} · هزینه جاری: ${pending:,.2f} · اعتبار: ${credit:,.2f}"
+        return acc, status, billing
+    except Exception as exc:
+        log.warning("account check failed for acc %s: %s", acc["id"], exc)
+        match = re.search(r"HTTP (\d{3})", str(exc))
+        reason = f"HTTP {match.group(1)}" if match else "خطای اتصال یا API"
+        return acc, "problem", reason
+
+
+@dp.callback_query(F.data == "check_accounts")
+async def cb_check_accounts(cb: CallbackQuery):
+    accs = st.accounts()
+    await cb.answer("در حال بررسی اکانت‌ها...")
+    await cb.message.edit_text("⏳ در حال بررسی کلیدهای API و صورتحساب اکانت‌ها...")
+    semaphore = asyncio.Semaphore(5)
+
+    async def limited_check(acc):
+        async with semaphore:
+            return await check_account(acc)
+
+    results = await asyncio.gather(*(limited_check(acc) for acc in accs))
+    lines = [f"🖥 <b>نتیجه بررسی اکانت‌ها</b> ({len(results)})"]
+    for acc, status, detail in results:
+        account_check_status[acc["id"]] = status
+        marker = "🔴" if status == "problem" else "🟢"
+        label = html.escape(acc["label"])
+        lines.append(f"{marker} <b>{label}</b> ({html.escape(acc['provider'])})\n{html.escape(detail)}")
+    await cb.message.edit_text("\n\n".join(lines), reply_markup=kb_accounts())
 
 
 def format_account_details(info: dict | None, provider: str) -> str:
