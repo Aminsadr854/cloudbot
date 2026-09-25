@@ -90,13 +90,14 @@ access, and marks accounts with API failures or an outstanding balance 🔴 in
 the account list until the next check or bot restart.
 
 All bot messages and keyboard labels use the owner-created [Infrastructure Icons](https://t.me/addemoji/datacenter_emojis_by_vpnmanagerkiabot)
-custom-emoji pack. The pack contains ten static 100×100 PNG custom emojis
-(datacenter, server, cloud, firewall, VPN, database, connection, backup,
-healthy, and error); the bot converts normal Unicode emoji globally and keeps
-the same character as the fallback for clients that cannot render custom
-emoji. The source SVGs are downloaded from IBM Carbon Design System under
-Apache-2.0 and the reproducible renderer is
-`assets/emoji/datacenter/build_stickers.py`.
+custom-emoji pack. The pack contains thirteen static 100×100 PNG custom emojis:
+ten infrastructure/status icons plus the actual Linode, Vultr, and Hetzner
+provider marks. The bot converts normal Unicode emoji globally and keeps the
+same character as the fallback for clients that cannot render custom emoji.
+Carbon source SVGs are licensed under Apache-2.0; provider source URLs and
+licenses are recorded in `assets/emoji/datacenter/source/PROVIDER-LOGOS.txt`.
+The reproducible renderers are `assets/emoji/datacenter/build_stickers.py` and
+`assets/emoji/datacenter/build_provider_logos.py`.
 
 For Vultr instances, the server screen can add a public IPv4 (Vultr reboots the
 instance) or create and attach a Reserved IPv4 floating IP. Vultr does not

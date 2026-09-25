@@ -1,0 +1,26 @@
+Provider logo sources
+=====================
+
+Vultr and Hetzner
+-----------------
+Downloaded from the Simple Icons project, which publishes the SVG marks and
+their brand colors through its CDN:
+
+  https://cdn.simpleicons.org/vultr/007BFC
+  https://cdn.simpleicons.org/hetzner/D50C2D
+  https://github.com/simple-icons/simple-icons
+
+Simple Icons is distributed under CC0-1.0 for the icon artwork. Brand names
+and marks remain trademarks of their respective owners; use them for provider
+identification only.
+
+Linode
+------
+Downloaded from SVG Repo's Linode vector entry, which identifies the artwork as
+CC0:
+
+  https://www.svgrepo.com/svg/448237/linode
+  https://www.svgrepo.com/show/448237/linode.svg
+
+The Linode name and mark remain the property of Linode/Akamai. The renderer
+only rasterizes the downloaded vector onto a transparent 100x100 canvas.

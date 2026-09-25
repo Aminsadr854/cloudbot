@@ -80,7 +80,10 @@ engines = {
 panel = Panel(PANEL_URL, PANEL_USER, PANEL_PASS)
 dp = Dispatcher(storage=MemoryStorage())
 
-PROVIDER_LABEL = {"linode": "🟢 Linode", "vultr": "🔵 Vultr", "hetzner": "🔴 Hetzner"}
+# Provider markers use the real provider logo stickers from the Infrastructure
+# Icons set.  The Unicode symbols remain the fallback for clients without
+# custom-emoji support.
+PROVIDER_LABEL = {"linode": "🟣 Linode", "vultr": "🔷 Vultr", "hetzner": "🟦 Hetzner"}
 PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
 account_check_status = {}
 
@@ -99,6 +102,10 @@ CUSTOM_EMOJI_IDS = {
     "backup": "5886310455068073426",
     "ok": "5886274789659647899",
     "error": "5886323765171723965",
+    # Provider marks were added to the existing set with addStickerToSet.
+    "linode": "5886540742624551062",
+    "vultr": "5886294688243130732",
+    "hetzner": "5886689430097371033",
 }
 
 # Telegram supports custom-emoji icons on keyboard buttons as well as custom
@@ -117,6 +124,7 @@ PREMIUM_EMOJI_NAME = {
     "🚫": "error", "🚨": "error", "🗑": "error", "🟠": "error",
     "🔐": "vpn", "🔑": "vpn", "🔒": "vpn", "🔓": "vpn",
     "🌐": "cloud", "🌍": "cloud", "🔵": "cloud", "🔹": "cloud",
+    "🟣": "linode", "🔷": "vultr", "🟦": "hetzner",
     "🇮🇷": "cloud", "🔌": "connection", "📡": "connection",
     "👉": "connection", "🔙": "connection", "➕": "connection",
     "🗄️": "datacenter", "📋": "datacenter", "📌": "datacenter",

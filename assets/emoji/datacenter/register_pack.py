@@ -31,6 +31,9 @@ ASSETS = [
     ("backup", "💽", ["backup", "restore", "snapshot"]),
     ("ok", "✅", ["ok", "healthy", "success"]),
     ("error", "❌", ["error", "failed", "problem"]),
+    ("linode", "🟣", ["Linode", "provider", "cloud"]),
+    ("vultr", "🔷", ["Vultr", "provider", "cloud"]),
+    ("hetzner", "🟦", ["Hetzner", "provider", "cloud"]),
 ]
 
 
