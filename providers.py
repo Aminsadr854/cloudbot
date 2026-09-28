@@ -6,16 +6,16 @@ accounts may sit in different countries and a provider can refuse or mis-geo a
 call that arrives from the wrong place. The proxy is given as
 host:port:user:pass and turned into an authenticated HTTP proxy here.
 
-Only the handful of operations the bot exposes are implemented - list, create,
-delete servers, and the lookups needed to offer sane choices when creating one.
-Nothing is cached: a token or proxy can change between calls, so each call
-builds its own client.
+Only the operations exposed by the bot are implemented. Provider clients are
+created per request so token and proxy changes take effect immediately; the bot
+keeps its own short-lived server/IP snapshot for chat lookups.
 """
 import asyncio
 import ipaddress
 import logging
 import socket
 import time
+from datetime import date
 
 import aiohttp
 from yarl import URL
@@ -354,43 +354,81 @@ class Provider:
     # -- list servers ----------------------------------------------------
     async def list_servers(self):
         if self.provider == "linode":
-            d = await self._req("GET", "/linode/instances?page_size=200")
+            rows = []
+            page = 1
+            while True:
+                d = await self._req("GET", f"/linode/instances?page_size=500&page={page}")
+                current = d.get("data", [])
+                rows.extend(current)
+                if page >= int(d.get("pages") or 1) or not current:
+                    break
+                page += 1
             out = []
-            for i in d.get("data", []):
+            for i in rows:
+                ips = [ip for ip in (i.get("ipv4") or []) if ip]
                 out.append({
                     "id": i["id"], "label": i.get("label"),
                     "region": i.get("region"),
                     "country": region_country(self.provider, i.get("region")),
-                    "ip": (i.get("ipv4") or [None])[0],
+                    "ip": ips[0] if ips else None, "ips": ips,
                     "status": i.get("status"),
                     "plan": i.get("type"),
                 })
             return out
         if self.provider == "vultr":
-            d = await self._req("GET", "/instances?per_page=200")
+            rows = []
+            page = 1
+            while True:
+                d = await self._req("GET", f"/instances?per_page=500&page={page}")
+                current = d.get("instances", [])
+                rows.extend(current)
+                meta = d.get("meta") or {}
+                pages = meta.get("total_pages") or meta.get("last_page")
+                if not current or (pages is not None and page >= int(pages)):
+                    break
+                if pages is None and len(current) < 500:
+                    break
+                page += 1
             out = []
-            for i in d.get("instances", []):
+            for i in rows:
+                main_ip = i.get("main_ip")
+                ips = [main_ip] if main_ip and main_ip != "0.0.0.0" else []
                 out.append({
                     "id": i["id"], "label": i.get("label") or i.get("hostname"),
                     "region": i.get("region"),
                     "country": region_country(self.provider, i.get("region")),
-                    "ip": i.get("main_ip") if i.get("main_ip", "0.0.0.0") != "0.0.0.0" else "(provisioning)",
+                    "ip": main_ip if ips else "(provisioning)", "ips": ips,
                     "status": i.get("status") + "/" + i.get("power_status", ""),
                     "plan": i.get("plan"),
                 })
             return out
         # hetzner
-        d = await self._req("GET", "/servers?per_page=50")
+        rows = []
+        page = 1
+        while True:
+            d = await self._req("GET", f"/servers?per_page=50&page={page}")
+            rows.extend(d.get("servers", []))
+            pagination = (d.get("meta") or {}).get("pagination") or {}
+            last_page = pagination.get("last_page")
+            if last_page is not None and page >= int(last_page):
+                break
+            if not d.get("servers") or (last_page is None and len(d["servers"]) < 50):
+                break
+            page += 1
         out = []
-        for i in d.get("servers", []):
-            location = (i.get("datacenter") or {}).get("location") or {}
-            ipv4 = ((i.get("public_net") or {}).get("ipv4") or {}).get("ip")
+        for i in rows:
+            location = i.get("location") or (i.get("datacenter") or {}).get("location") or {}
+            public_net = i.get("public_net") or {}
+            ipv4 = (public_net.get("ipv4") or {}).get("ip")
+            ipv6 = (public_net.get("ipv6") or {}).get("ip")
+            ips = [ip for ip in (ipv4, ipv6) if ip]
             out.append({
                 "id": i["id"], "label": i.get("name"),
                 "region": location.get("name"),
                 "country": country_code(location.get("country_iso") or location.get("country"))
                            or region_country(self.provider, location.get("name")),
-                "ip": ipv4 or "(provisioning)",
+                "ip": ipv4 or ipv6 or "(provisioning)", "ips": ips,
+                "ipv4": ipv4, "ipv6": ipv6,
                 "status": i.get("status"),
                 "plan": (i.get("server_type") or {}).get("name"),
             })
@@ -414,13 +452,17 @@ class Provider:
         # hetzner
         d = await self._req("GET", f"/servers/{server_id}")
         i = d.get("server", d)
-        location = (i.get("datacenter") or {}).get("location") or {}
-        ipv4 = ((i.get("public_net") or {}).get("ipv4") or {}).get("ip")
+        location = i.get("location") or (i.get("datacenter") or {}).get("location") or {}
+        public_net = i.get("public_net") or {}
+        ipv4 = (public_net.get("ipv4") or {}).get("ip")
+        ipv6 = (public_net.get("ipv6") or {}).get("ip")
+        ips = [ip for ip in (ipv4, ipv6) if ip]
         return {"id": i["id"], "label": i.get("name"),
                 "region": location.get("name"),
                 "country": country_code(location.get("country_iso") or location.get("country"))
                            or region_country(self.provider, location.get("name")),
-                "ip": ipv4, "status": i.get("status"),
+                "ip": ipv4 or ipv6, "ips": ips, "ipv4": ipv4, "ipv6": ipv6,
+                "status": i.get("status"),
                 "plan": (i.get("server_type") or {}).get("name")}
 
     # -- choices for creation --------------------------------------------
@@ -469,13 +511,37 @@ class Provider:
                         r.get("country")))
                    for r in d.get("regions", [])]
         else:
-            # hetzner
-            d = await self._req("GET", "/locations?per_page=50")
-            res = [(l["name"], location_text(
-                        self.provider,
-                        f"{l.get('city','')} {l.get('country','')}".strip() or l["name"],
-                        l.get("country_iso") or l.get("country")))
-                   for l in d.get("locations", [])]
+            # Hetzner exposes per-location support and current availability on
+            # each Server Type. Locations alone includes places where none of
+            # the account's plans can currently be ordered.
+            d, server_types = await asyncio.gather(
+                self._req("GET", "/locations?per_page=50"),
+                self._hetzner_server_types(force=force, ttl=ttl),
+            )
+            available_counts = {}
+            for server_type in server_types:
+                if (server_type.get("deprecated")
+                        or self._hetzner_deprecation_expired(
+                            server_type.get("deprecation"))):
+                    continue
+                for location in server_type.get("locations") or []:
+                    name = str(location.get("name") or "")
+                    if (name and location.get("available") is True
+                            and not self._hetzner_deprecation_expired(
+                                location.get("deprecation"))
+                            and self._hetzner_price_for_location(server_type, name) is not None):
+                        available_counts[name] = available_counts.get(name, 0) + 1
+            res = []
+            for location in d.get("locations", []):
+                name = location.get("name")
+                count = available_counts.get(str(name), 0)
+                if not name or not count:
+                    continue
+                place = f"{location.get('city','')} {location.get('country','')}".strip() or name
+                label = location_text(
+                    self.provider, place,
+                    location.get("country_iso") or location.get("country"))
+                res.append((name, f"{label} · {count} available plans"))
 
         _set_cached(cache_key, res, ttl)
         return res
@@ -491,6 +557,46 @@ class Provider:
         types = d.get("data", [])
         _set_cached(cache_key, types, CACHE_TTL_PLANS)
         return types
+
+    async def _hetzner_server_types(self, force: bool = False,
+                                    ttl: int = CACHE_TTL_PLANS):
+        """Return Hetzner's per-location support and current availability data."""
+        cache_key = (self.provider, "server-types", str(self.account.get("id") or ""))
+        if not force:
+            cached = _get_cached(cache_key)
+            if cached is not None:
+                return cached
+        data = await self._req("GET", "/server_types?per_page=100")
+        server_types = data.get("server_types", [])
+        _set_cached(cache_key, server_types, ttl)
+        return server_types
+
+    @staticmethod
+    def _hetzner_location_entry(server_type, region):
+        region = str(region or "")
+        return next((location for location in server_type.get("locations") or []
+                     if region in (str(location.get("name") or ""),
+                                   str(location.get("id") or ""))), None)
+
+    @staticmethod
+    def _hetzner_deprecation_expired(deprecation):
+        if not isinstance(deprecation, dict):
+            return False
+        unavailable_after = str(deprecation.get("unavailable_after") or "")[:10]
+        if not unavailable_after:
+            return False
+        try:
+            return date.fromisoformat(unavailable_after) <= date.today()
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _hetzner_price_for_location(server_type, region):
+        price = next((item for item in server_type.get("prices") or []
+                      if str(item.get("location") or "") == str(region or "")), None)
+        if not price:
+            return None
+        return (price.get("price_monthly") or {}).get("gross")
 
     async def plans(self, region=None, force: bool = False, ttl: int = CACHE_TTL_PLANS):
         cache_key = (self.provider, "plans", str(region or ""))
@@ -535,24 +641,22 @@ class Provider:
                                      f"{p.get('disk')}GB - ${p.get('monthly_cost')}/mo"))
             res = out
         else:
-            # hetzner: server types; show only those available in the chosen location,
-            # and take the monthly price for that location.
-            d = await self._req("GET", "/server_types?per_page=100")
+            # Hetzner's per-location availability flag is the purchase filter.
+            # Prices describe billing; they do not mean a type can be ordered there.
+            server_types = await self._hetzner_server_types(force=force, ttl=ttl)
             out = []
-            for t in d.get("server_types", []):
+            for t in server_types:
                 if t.get("deprecated"):
                     continue
-                price = ""
-                for pr in t.get("prices", []):
-                    if not region or pr.get("location") == region:
-                        monthly = (pr.get("price_monthly") or {}).get("gross")
-                        if monthly:
-                            price = f" - €{float(monthly):.2f}/mo"
-                        break
-                else:
-                    # not offered in this location
-                    if region:
-                        continue
+                location = self._hetzner_location_entry(t, region)
+                if (not location or location.get("available") is not True
+                        or self._hetzner_deprecation_expired(location.get("deprecation"))
+                        or self._hetzner_deprecation_expired(t.get("deprecation"))):
+                    continue
+                monthly = self._hetzner_price_for_location(t, region)
+                if monthly is None:
+                    continue
+                price = f" - €{float(monthly):.2f}/mo"
                 out.append((t["name"], f"{t['name']} · {t.get('cores')}vCPU "
                                        f"{t.get('memory')}GB {t.get('disk')}GB{price}"))
             res = out
@@ -681,24 +785,55 @@ class Provider:
         """Create a Vultr Reserved IPv4 and attach it to the given instance."""
         if self.provider != "vultr":
             raise ProviderError("floating IP is only available for Vultr")
-        created = await self._req("POST", "/reserved-ips", json={
-            "region": region, "ip_type": "v4", "label": label[:128],
-        })
+        try:
+            created = await self._req("POST", "/reserved-ips", json={
+                "region": region, "ip_type": "v4", "label": label[:128],
+            })
+        except Exception as exc:
+            raise ProviderError(f"Vultr Reserved-IP create request failed: {exc}") from exc
         reserved = created.get("reserved_ip", created)
         reserved_id = reserved.get("id")
         if not reserved_id:
             raise ProviderError("Vultr did not return the new floating IP ID")
-        await self._req("POST", f"/reserved-ips/{reserved_id}/attach",
-                        json={"instance_id": str(server_id)})
+        try:
+            await self._req("POST", f"/reserved-ips/{reserved_id}/attach",
+                            json={"instance_id": str(server_id)})
+        except Exception as exc:
+            address = reserved.get("ip") or reserved.get("ip_address") or reserved_id
+            try:
+                await self._req("DELETE", f"/reserved-ips/{reserved_id}")
+            except Exception as cleanup_exc:
+                raise ProviderError(
+                    f"Vultr attach request failed after creating {address}; "
+                    f"automatic cleanup also failed: {cleanup_exc}") from exc
+            raise ProviderError(
+                f"Vultr attach request failed; newly created Reserved IP {address} "
+                f"was removed: {exc}") from exc
         return reserved
 
     async def vultr_floating_ips(self, server_id):
         """List every Reserved IP currently attached to this Vultr instance."""
+        return [ip for ip in await self.vultr_reserved_ips()
+                if str(ip.get("instance_id")) == str(server_id)]
+
+    async def vultr_reserved_ips(self):
+        """List all Vultr Reserved IPs so account caches need only one request."""
         if self.provider != "vultr":
             raise ProviderError("floating IP is only available for Vultr")
-        data = await self._req("GET", "/reserved-ips?per_page=500")
-        return [ip for ip in data.get("reserved_ips", [])
-                if str(ip.get("instance_id")) == str(server_id)]
+        rows = []
+        page = 1
+        while True:
+            data = await self._req("GET", f"/reserved-ips?per_page=500&page={page}")
+            current = data.get("reserved_ips", [])
+            rows.extend(current)
+            meta = data.get("meta") or {}
+            pages = meta.get("total_pages") or meta.get("last_page")
+            if not current or (pages is not None and page >= int(pages)):
+                break
+            if pages is None and len(current) < 500:
+                break
+            page += 1
+        return rows
 
     async def vultr_floating_ip(self, reserved_ip_id):
         if self.provider != "vultr":
@@ -727,3 +862,79 @@ class Provider:
         if status not in ("disabled", "enabled"):
             raise ProviderError("backup status must be 'disabled' or 'enabled'")
         return await self._req("PATCH", f"/instances/{server_id}", json={"backups": status})
+
+    # -- Hetzner Floating IPs -------------------------------------------
+    async def hetzner_floating_ips(self, server_id=None):
+        """List the Hetzner project Floating IPs, following every result page."""
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner Floating IPs are only available for Hetzner")
+        rows = []
+        page = 1
+        while True:
+            data = await self._req("GET", f"/floating_ips?per_page=50&page={page}")
+            current = data.get("floating_ips", [])
+            rows.extend(current)
+            pagination = (data.get("meta") or {}).get("pagination") or {}
+            last_page = pagination.get("last_page")
+            if last_page is not None and page >= int(last_page):
+                break
+            if not current or (last_page is None and len(current) < 50):
+                break
+            page += 1
+        if server_id is not None:
+            return [row for row in rows if str(row.get("server")) == str(server_id)]
+        return rows
+
+    async def hetzner_floating_ip(self, floating_ip_id):
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner Floating IPs are only available for Hetzner")
+        data = await self._req("GET", f"/floating_ips/{floating_ip_id}")
+        return data.get("floating_ip", data)
+
+    async def _wait_hetzner_action(self, result):
+        action = result.get("action") or {}
+        action_id = action.get("id")
+        if not action_id:
+            return action
+        for attempt in range(60):
+            if action.get("status") == "success":
+                return action
+            if action.get("status") == "error":
+                error = action.get("error") or {}
+                detail = error.get("message") if isinstance(error, dict) else str(error)
+                raise ProviderError(f"Hetzner action failed: {detail or action.get('command')}")
+            await asyncio.sleep(1)
+            data = await self._req("GET", f"/actions/{action_id}")
+            action = data.get("action", data)
+        raise ProviderError(f"Hetzner action {action_id} did not finish within 60 seconds")
+
+    async def create_hetzner_floating_ip(self, server_id, ip_type, name):
+        """Create and assign a Hetzner IPv4 or IPv6 Floating IP."""
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner Floating IPs are only available for Hetzner")
+        if ip_type not in ("ipv4", "ipv6"):
+            raise ProviderError("Floating IP type must be ipv4 or ipv6")
+        result = await self._req("POST", "/floating_ips", json={
+            "type": ip_type, "server": int(server_id), "name": str(name)[:63],
+        })
+        floating = result.get("floating_ip", result)
+        if result.get("action"):
+            await self._wait_hetzner_action(result)
+        return floating
+
+    async def delete_hetzner_floating_ip(self, floating_ip_id):
+        """Unassign and delete a Hetzner Floating IP after the caller confirms."""
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner Floating IPs are only available for Hetzner")
+        floating = await self.hetzner_floating_ip(floating_ip_id)
+        if (floating.get("protection") or {}).get("delete"):
+            result = await self._req(
+                "POST", f"/floating_ips/{floating_ip_id}/actions/change_protection",
+                json={"delete": False})
+            await self._wait_hetzner_action(result)
+        if floating.get("server") is not None:
+            result = await self._req(
+                "POST", f"/floating_ips/{floating_ip_id}/actions/unassign")
+            await self._wait_hetzner_action(result)
+        await self._req("DELETE", f"/floating_ips/{floating_ip_id}")
+        return True

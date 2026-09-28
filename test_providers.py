@@ -87,18 +87,18 @@ class CacheTests(unittest.IsolatedAsyncioTestCase):
         p._req = AsyncMock(return_value={"data": [{
             "id": "g6-standard-1", "label": "Linode 2GB", "transfer": 2000,
             "price": {"monthly": 12},
+            "region_prices": [
+                {"id": "us-east", "monthly": 12},
+                {"id": "eu-central", "monthly": 15},
+            ],
         }]})
         first = await p.plans("us-east")
         second = await p.plans("us-east")
         self.assertEqual(first, second)
         self.assertEqual(p._req.await_count, 1)
 
-        p._req.return_value = {"data": [{
-            "id": "g6-standard-2", "label": "Linode 4GB", "transfer": 4000,
-            "price": {"monthly": 24},
-        }]}
         third = await p.plans("eu-central")
-        self.assertEqual(p._req.await_count, 2)
+        self.assertEqual(p._req.await_count, 1)
         self.assertNotEqual(first, third)
 
     async def test_clear_cache_by_provider_or_all(self):
@@ -234,7 +234,7 @@ class VultrIpTests(unittest.IsolatedAsyncioTestCase):
         ]})
         self.assertEqual(await p.vultr_floating_ips("instance-1"),
                          [{"id": "one", "instance_id": "instance-1"}])
-        p._req.assert_awaited_once_with("GET", "/reserved-ips?per_page=500")
+        p._req.assert_awaited_once_with("GET", "/reserved-ips?per_page=500&page=1")
 
     async def test_power_and_delete_use_correct_vultr_endpoints(self):
         p = self._provider()

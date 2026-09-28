@@ -16,6 +16,11 @@ file, so the database on its own is inert.
 
 The server-creation wizard accepts up to 10 names, one per line, and creates
 them sequentially with a separate password for each.
+Hetzner locations and plans are filtered by the API's per-location availability
+and refreshed before provisioning, so unsupported or unavailable plan/location
+combinations are not offered. A last-second capacity change is reported with a
+button to reload the choices. Root passwords are encrypted in the bot database
+and appear only when you open that server's SSH details.
 
 **Panel nodes.** Provision a new server and attach it to a Pasarguard/Marzban
 panel in one step: firewall down, node installed, certificate and API key read
@@ -80,14 +85,21 @@ Cloud provider accounts are added from **➕ Add account**, each with its own
 proxy if it needs one. After entering a proxy, choose whether Cloudbot reaches
 that proxy using its default DNS behavior, IPv4 only, or IPv6 only. The latter
 two resolve the proxy hostname to the requested family before provider calls.
-Each account also has an inline **⚙️ Settings** screen for viewing its provider,
-proxy endpoint and family preference, and for renaming or changing/removing its
-proxy.
+Each account appears on one row. Open it and choose **⚙️ Manage account** to
+rename it or manage its proxy, including editing individual fields. The family
+choice affects Cloudbot's connection to the proxy; the proxy's own outbound
+address is what a provider API access allowlist sees.
+
+Cloudbot loads server and attached Floating IP addresses into memory at startup
+in the background. Opening **🖥 Accounts**, an account, or its server list also
+starts a background refresh. Sending an IP address by itself returns its cached
+server card immediately; a cache miss gets a not-found reply without waiting
+for provider APIs.
 
 The **🖥 Accounts → 🔍 Check all accounts** button checks every API key and
 connection. It reads balances for Linode and Vultr, validates Hetzner project
-access, and marks accounts with API failures or an outstanding balance 🔴 in
-the account list until the next check or bot restart.
+access, and marks accounts with API failures or an outstanding balance with `!`
+in the account list until the next check or bot restart.
 
 All bot messages and keyboard labels use the owner-created [Infrastructure Icons](https://t.me/addemoji/datacenter_emojis_by_vpnmanagerkiabot)
 custom-emoji pack. The pack contains thirteen static 100×100 PNG custom emojis:
@@ -104,7 +116,17 @@ instance) or create and attach a Reserved IPv4 floating IP. Vultr does not
 replace an existing primary IPv4 in place; the additional-address action keeps
 the original primary address. The Vultr IP manager lists the floating IPs
 attached to that instance and can create or permanently remove them; it also
-offers confirmed start, stop, and reboot controls.
+offers confirmed start, stop, and reboot controls. Its cached view opens
+immediately when available; provider lookups acknowledge the tap and show
+progress, while failures remain visible with retry and back buttons.
+
+For Hetzner servers, **🌐 Manage IPs** lists attached Floating IPs and can
+create or permanently remove IPv4 and IPv6 Floating IPs. IPv6 Floating IPs are
+allocated as a `/64` network; Hetzner bills Floating IPs monthly. The API
+assignment does not configure the guest OS. The manager and server card show a
+copyable command for temporarily adding each address; it is lost at reboot.
+Configure the OS network for persistence, and remove the guest address
+separately when deleting the IP.
 
 ## Requirements
 
