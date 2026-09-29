@@ -3,3 +3,4 @@ aiohttp
 aiohttp-socks
 asyncssh
 cryptography
+mcp>=2.0,<3

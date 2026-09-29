@@ -4,8 +4,9 @@ A Telegram bot that runs the unglamorous half of a VPN operation: cloud
 accounts, tunnels, DNS, and a watchdog that notices a config is dead before the
 customers do — and usually fixes it.
 
-Everything is configured from inside Telegram. The installer asks for a bot
-token and an owner id; nothing else is ever written to a file or a unit.
+Most settings are configured from inside Telegram. The installer asks for the
+bot token, owner id, and initial panel settings; it also creates a separate
+root-only token for the local owner automation API.
 
 ## What it does
 
@@ -134,6 +135,15 @@ separately when deleting the IP.
 * A box inside Iran you can reach over SSH — the watchdog and the scanner are
   worthless measured from anywhere else
 * `paytun` in `assets/` if you want tunnels (see the paytun project)
+
+## API and MCP for AI clients
+
+The owner automation API listens on `127.0.0.1:9601` with its own bearer token.
+An MCP stdio server exposes named tools through SSH and calls that API. They can
+inspect accounts, servers, watchdog status, tunnels, and DNS, as well as create
+servers, manage Floating IPs, control Vultr power, and update DNS with explicit
+confirmation values. See [AI_API_MCP.md](AI_API_MCP.md) for installation,
+authentication, the full operation table, examples, and MCP client setup.
 
 ## Notes
 

@@ -36,11 +36,12 @@ apt-get install -y -qq python3 python3-venv python3-pip curl >/dev/null
 echo "→ installing into $DIR"
 install -d -m 755 "$DIR" "$DIR/data" "$DIR/assets"
 for f in *.py; do install -m 644 "$f" "$DIR/$f"; done
+install -m 644 requirements.txt "$DIR/requirements.txt"
 [ -f assets/paytun ] && install -m 755 assets/paytun "$DIR/assets/paytun"
 
 python3 -m venv "$DIR/venv"
 "$DIR/venv/bin/pip" -q install --upgrade pip
-"$DIR/venv/bin/pip" -q install aiogram aiohttp aiohttp-socks asyncssh cryptography
+"$DIR/venv/bin/pip" -q install -r "$DIR/requirements.txt"
 
 umask 077
 cat > "$DIR/cloudbot.env" <<ENV
@@ -55,6 +56,10 @@ CLOUDBOT_DB=$DIR/data/cloudbot.db
 CLOUDBOT_KEY=$DIR/data/secret.key
 ENV
 chmod 600 "$DIR/cloudbot.env"
+if [ ! -s "$DIR/data/control_api.token" ]; then
+  "$DIR/venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(48))' > "$DIR/data/control_api.token"
+fi
+chmod 600 "$DIR/data/control_api.token"
 
 cat > /etc/systemd/system/$SERVICE.service <<UNIT
 [Unit]
@@ -119,6 +124,31 @@ if systemctl is-active --quiet probeapi; then
   echo "✅ probeapi is running."
 else
   echo "⚠️  probeapi did not start (non-fatal). Check: journalctl -u probeapi -n 20"
+fi
+
+echo "→ setting up cloudbot-control-api.service"
+cat > /etc/systemd/system/cloudbot-control-api.service <<UNIT3
+[Unit]
+Description=Cloudbot owner automation API (loopback only)
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=$DIR
+EnvironmentFile=$DIR/cloudbot.env
+ExecStart=$DIR/venv/bin/python $DIR/control_api.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+UNIT3
+systemctl daemon-reload
+systemctl enable --now cloudbot-control-api
+if systemctl is-active --quiet cloudbot-control-api; then
+  echo "✅ owner automation API is running on 127.0.0.1:9601."
+else
+  echo "⚠️  owner automation API did not start. Check: journalctl -u cloudbot-control-api -n 20"
 fi
 
 echo
