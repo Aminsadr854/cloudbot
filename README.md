@@ -67,7 +67,7 @@ one appears.
 ## Install
 
 ```
-git clone <this repo> cloudbot && cd cloudbot
+git clone git@github.com:Aminsadr854/cloudbot.git && cd cloudbot
 sudo ./install.sh
 ```
 
@@ -121,7 +121,20 @@ offers confirmed start, stop, and reboot controls. Its cached view opens
 immediately when available; provider lookups acknowledge the tap and show
 progress, while failures remain visible with retry and back buttons.
 
-For Hetzner servers, **🌐 Manage IPs** lists attached Floating IPs and can
+For Hetzner accounts and servers, **🌐 Primary IPها** opens the paginated
+project-wide IPv4/IPv6 inventory, including unassigned allocations. Create
+1–20 IPs at a time by choosing location, family, and count; rename them, toggle
+delete protection or deletion with the server, assign/replace, unassign, or
+delete free IPs. Purchases and changes require an expiring single-use
+confirmation. Servers have confirmed shutdown/start buttons; assignment and
+unassignment require the server to be off and assignment requires the same
+location. Replacement retains the old IP with auto-delete disabled and attempts
+to restore it if assignment fails. Free IPs still incur charges. Bulk creation
+stops on the first failure and reports the allocations already created. After
+changing IPs, start the server and update dependent SSH, DNS, panel, and tunnel
+settings as needed. IPv6 may need guest network configuration.
+
+**🌐 Manage IPs** on Hetzner servers lists attached Floating IPs and can
 create or permanently remove IPv4 and IPv6 Floating IPs. IPv6 Floating IPs are
 allocated as a `/64` network; Hetzner bills Floating IPs monthly. The API
 assignment does not configure the guest OS. The manager and server card show a

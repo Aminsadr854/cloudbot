@@ -334,6 +334,8 @@ def kb_account(acc):
     b = InlineKeyboardBuilder()
     b.button(text="📋 سرورها", callback_data=f"srvs:{acc['id']}")
     b.button(text="➕ ساخت سرور", callback_data=f"new:{acc['id']}")
+    if acc["provider"] == "hetzner":
+        b.button(text="🌐 Primary IPها", callback_data=f"hp:list:{acc['id']}:0")
     b.button(text="⚙️ مدیریت اکانت", callback_data=f"accset:{acc['id']}")
     b.button(text="🔑 حذف اکانت", callback_data=f"delacc:{acc['id']}")
     b.button(text="🔙 اکانت‌ها", callback_data="accounts")
@@ -1286,6 +1288,9 @@ def build_server_card(acc_id, srv_id, acc, s, floating_ips):
         b.button(text="🔑 ثبت رمز این سرور", callback_data=f"srvpw:{acc_id}:{srv_id}")
     if acc.get("provider") == "hetzner":
         b.button(text="🌐 مدیریت IPها", callback_data=f"hetzipman:{acc_id}:{srv_id}")
+        b.button(text="🌐 Primary IPها / تغییر IP", callback_data=f"hp:list:{acc_id}:0")
+        b.button(text="⏹ خاموش کردن", callback_data=f"hp:ask:{acc_id}:shutdown:{srv_id}")
+        b.button(text="▶️ روشن کردن", callback_data=f"hp:ask:{acc_id}:poweron:{srv_id}")
         b.button(text="🔄 ریست رمز روت", callback_data=f"srvrst:{acc_id}:{srv_id}")
     if acc["provider"] == "vultr":
         b.button(text="🌐 مدیریت IPها", callback_data=f"ipman:{acc_id}:{srv_id}")
@@ -1626,6 +1631,237 @@ async def vultr_ip_manager(cb: CallbackQuery):
 @dp.callback_query(F.data.startswith("ipman_refresh:"))
 async def vultr_ip_manager_refresh(cb: CallbackQuery):
     await vultr_ip_manager(cb)
+
+
+# Primary IP confirmations are single-use, expire, and bind to the message.
+primary_confirmations = {}
+primary_operation_locks = {}
+
+
+class PrimaryInput(StatesGroup):
+    value = State()
+
+
+def primary_kb(rows):
+    b = InlineKeyboardBuilder()
+    for label, callback in rows:
+        b.button(text=label[:64], callback_data=callback)
+    b.adjust(1)
+    return b.as_markup()
+
+
+async def primary_confirm(cb, account_id, operation, args, text):
+    now = time.monotonic()
+    for key, pending in list(primary_confirmations.items()):
+        if pending[0] < now:
+            primary_confirmations.pop(key, None)
+    token = secrets.token_hex(8)
+    primary_confirmations[token] = (
+        now + 300, cb.message.chat.id, cb.message.message_id,
+        account_id, operation, args)
+    await cb.message.edit_text(text, reply_markup=primary_kb([
+        ("✅ تأیید", f"hp:ok:{account_id}:{token}"),
+        ("🔙 انصراف", f"hp:list:{account_id}:0")]))
+
+
+@dp.callback_query(F.data.startswith("hp:"))
+async def primary_manager(cb: CallbackQuery, state: FSMContext):
+    if cb.from_user.id != OWNER:
+        await cb.answer("این ربات خصوصی است.", show_alert=True)
+        return
+    await cb.answer()
+    await state.clear()
+    _, action, account_id, *args = cb.data.split(":")
+    account_id = int(account_id)
+    acc = st.account(account_id)
+    if not acc or acc["provider"] != "hetzner":
+        await cb.message.edit_text("❌ اکانت Hetzner پیدا نشد.")
+        return
+    p = providers.Provider(acc)
+    back = ("🔙 Primary IPها", f"hp:list:{account_id}:0")
+    try:
+        if action == "list":
+            items = await p.hetzner_primary_ips()
+            page = max(0, min(int(args[0]), max(0, (len(items)-1)//8)))
+            rows = []
+            for ip in items[page*8:page*8+8]:
+                owner = f"سرور {ip['assignee_id']}" if ip.get("assignee_id") else "آزاد"
+                rows.append((f"{ip['ip']} · {owner}", f"hp:ip:{account_id}:{ip['id']}"))
+            if page:
+                rows.append(("⬅️ قبلی", f"hp:list:{account_id}:{page-1}"))
+            if (page+1)*8 < len(items):
+                rows.append(("➡️ بعدی", f"hp:list:{account_id}:{page+1}"))
+            rows += [("➕ ساخت چند Primary IP", f"hp:new:{account_id}"),
+                     ("🔄 تازه‌سازی", f"hp:list:{account_id}:{page}"),
+                     ("🔙 اکانت", f"acc:{account_id}")]
+            await cb.message.edit_text(
+                f"🌐 <b>Primary IPها — {html.escape(acc['label'])}</b>\n"
+                f"تعداد: {len(items)} · صفحه {page+1}\n"
+                "IPv4 و IPv6، متصل و آزاد. IP آزاد هم هزینه دارد.\n"
+                "برای اتصال، جداسازی یا تعویض، سرور باید خاموش باشد.",
+                reply_markup=primary_kb(rows))
+        elif action == "ip":
+            ip = await p.hetzner_primary_ip(args[0])
+            ip_id = ip["id"]
+            rows = [("🔗 اتصال / تعویض IP سرور", f"hp:servers:{account_id}:{ip_id}:0")]
+            if ip.get("assignee_id"):
+                rows += [("🔓 جداسازی", f"hp:ask:{account_id}:unassign:{ip_id}"),
+                         ("🖥 سرور", f"srv:{account_id}:{ip['assignee_id']}"),
+                         ("⏹ خاموش کردن سرور", f"hp:ask:{account_id}:shutdown:{ip['assignee_id']}"),
+                         ("▶️ روشن کردن سرور", f"hp:ask:{account_id}:poweron:{ip['assignee_id']}")]
+            protected = bool((ip.get("protection") or {}).get("delete"))
+            rows += [("✏️ تغییر نام", f"hp:rename:{account_id}:{ip_id}"),
+                     (f"🛡 محافظت حذف: {'فعال' if protected else 'غیرفعال'}",
+                      f"hp:ask:{account_id}:protect:{ip_id}:{int(not protected)}"),
+                     (f"🗑 حذف با سرور: {'فعال' if ip.get('auto_delete') else 'غیرفعال'}",
+                      f"hp:ask:{account_id}:auto:{ip_id}:{int(not ip.get('auto_delete'))}"),
+                     ("🗑 حذف دائمی IP", f"hp:ask:{account_id}:delete:{ip_id}"), back]
+            loc = ip.get("location") or (ip.get("datacenter") or {}).get("location") or {}
+            await cb.message.edit_text(
+                f"🌐 <b>{html.escape(ip['name'])}</b>\n<code>{html.escape(ip['ip'])}</code>\n"
+                f"نوع: {ip['type']} · منطقه: {html.escape(loc.get('name', '?'))}\n"
+                f"سرور: {ip.get('assignee_id') or 'آزاد'} · ID: {ip_id}",
+                reply_markup=primary_kb(rows))
+        elif action == "servers":
+            ip = await p.hetzner_primary_ip(args[0])
+            loc = ip.get("location") or (ip.get("datacenter") or {}).get("location") or {}
+            servers = [s for s in await p.servers() if s.get("region") == loc.get("name")]
+            page = max(0, min(int(args[1]), max(0, (len(servers)-1)//8)))
+            rows = [(f"{s['label']} · {s['status']}",
+                     f"hp:ask:{account_id}:assign:{ip['id']}:{s['id']}")
+                    for s in servers[page*8:page*8+8]]
+            if page:
+                rows.append(("⬅️ قبلی", f"hp:servers:{account_id}:{ip['id']}:{page-1}"))
+            if (page+1)*8 < len(servers):
+                rows.append(("➡️ بعدی", f"hp:servers:{account_id}:{ip['id']}:{page+1}"))
+            rows.append(("🔙 IP", f"hp:ip:{account_id}:{ip['id']}"))
+            await cb.message.edit_text(
+                "🖥 سرور هم‌منطقه را انتخاب کنید. ابتدا از صفحهٔ سرور خاموشش کنید.\n"
+                "IP قبلی حفظ می‌شود و به‌صورت آزاد باقی می‌ماند.", reply_markup=primary_kb(rows))
+        elif action == "new":
+            data = await p._req("GET", "/locations")
+            rows = [(f"{loc['name']} · {family}",
+                     f"hp:count:{account_id}:{loc['name']}:{family}")
+                    for loc in data["locations"] for family in ("ipv4", "ipv6")]
+            await cb.message.edit_text("🌍 منطقه و نوع IP را انتخاب کنید:",
+                                       reply_markup=primary_kb(rows + [back]))
+        elif action == "count":
+            await state.set_state(PrimaryInput.value)
+            await state.update_data(primary_account=account_id, primary_action="create",
+                                    primary_args=args)
+            await cb.message.edit_text("🔢 تعداد IP را بفرستید (۱ تا ۲۰). قبل از خرید تأیید می‌گیرید.",
+                                       reply_markup=primary_kb([back]))
+        elif action == "rename":
+            await state.set_state(PrimaryInput.value)
+            await state.update_data(primary_account=account_id, primary_action="rename",
+                                    primary_args=args)
+            await cb.message.edit_text("✏️ نام جدید IP را بفرستید (۱ تا ۶۳ حرف):",
+                                       reply_markup=primary_kb([back]))
+        elif action == "ask":
+            operation, *values = args
+            if operation == "assign":
+                ip = await p.hetzner_primary_ip(values[0])
+                srv = await p.server(values[1])
+                detail = (f"اتصال <code>{html.escape(ip['ip'])}</code> به "
+                          f"<b>{html.escape(str(srv['label']))}</b>\n"
+                          f"IP فعلی: <code>{html.escape(str(srv.get(ip['type']) or 'ندارد'))}</code>\n"
+                          "IP قبلی آزاد و حفظ می‌شود. سرور باید خاموش باشد؛ پس از تغییر روشنش کنید.\n"
+                          "آدرس اتصال SSH، DNS، پنل و تونل‌های وابسته ممکن است نیاز به تغییر داشته باشند.")
+            elif operation in ("shutdown", "poweron"):
+                srv = await p.server(values[0])
+                detail = f"{'خاموش' if operation == 'shutdown' else 'روشن'} کردن سرور {html.escape(str(srv['label']))}؟"
+            else:
+                ip = await p.hetzner_primary_ip(values[0])
+                labels = {"unassign": "جداسازی (IP حفظ می‌شود؛ اتصال قطع می‌شود)",
+                          "delete": "حذف دائمی و غیرقابل‌بازگشت IP آزاد",
+                          "protect": "تغییر محافظت حذف", "auto": "تغییر حذف خودکار همراه سرور"}
+                detail = f"{labels[operation]}: <code>{html.escape(ip['ip'])}</code>؟"
+            await primary_confirm(cb, account_id, operation, values, "⚠️ " + detail)
+        elif action == "ok":
+            pending = primary_confirmations.pop(args[0], None)
+            if (not pending or pending[0] < time.monotonic()
+                    or pending[1:4] != (cb.message.chat.id, cb.message.message_id, account_id)):
+                await cb.message.edit_text("❌ تأیید منقضی یا قبلاً استفاده شده؛ دوباره از منو شروع کنید.",
+                                           reply_markup=primary_kb([back]))
+                return
+            operation, values = pending[4:]
+            await cb.message.edit_text("⏳ در حال انجام…")
+            async with primary_operation_locks.setdefault(account_id, asyncio.Lock()):
+                result = "✅ انجام شد."
+                try:
+                    if operation == "create":
+                        location, family, count = values
+                        count = int(count)
+                        if not 1 <= count <= 20 or family not in ("ipv4", "ipv6"):
+                            raise ValueError("Invalid batch")
+                        created = []
+                        for _ in range(count):
+                            try:
+                                ip = await p.create_hetzner_primary_ip(
+                                    location, family, f"cloudbot-primary-{secrets.token_hex(6)}")
+                                created.append(ip['ip'])
+                            except Exception as exc:
+                                result = f"⚠️ {len(created)} از {count} ساخته شد؛ ادامه متوقف شد: {html.escape(str(exc))}"
+                                break
+                        else:
+                            result = f"✅ {count} IP آزاد ساخته شد."
+                        result += "\n" + "\n".join(f"<code>{html.escape(x)}</code>" for x in created)
+                    elif operation == "assign":
+                        await p.assign_hetzner_primary_ip(*values)
+                        result += "\nIP قبلی حفظ شد. اکنون سرور را روشن کنید."
+                    elif operation == "unassign":
+                        await p.unassign_hetzner_primary_ip(*values)
+                    elif operation == "delete":
+                        await p.delete_hetzner_primary_ip(*values)
+                    elif operation == "protect":
+                        await p.protect_hetzner_primary_ip(values[0], bool(int(values[1])))
+                    elif operation == "auto":
+                        await p.update_hetzner_primary_ip(values[0], auto_delete=bool(int(values[1])))
+                    elif operation == "rename":
+                        await p.update_hetzner_primary_ip(values[0], name=values[1])
+                    elif operation in ("shutdown", "poweron"):
+                        await p.hetzner_power(values[0], operation)
+                    else:
+                        raise ValueError("Unsupported operation")
+                finally:
+                    # Invalidate immediately: old addresses must not open stale cards.
+                    await remove_account_server_ip_cache(account_id)
+                    schedule_account_server_ip_cache_refresh(account_id, acc, force=True)
+            await cb.message.edit_text(result[:3500], reply_markup=primary_kb([back, ("🔙 سرورها", f"srvs:{account_id}")]))
+    except Exception as exc:
+        log.exception("Primary IP operation failed: account=%s action=%s", account_id, action)
+        await cb.message.edit_text("❌ " + html.escape(str(exc))[:3000],
+                                   reply_markup=primary_kb([back]))
+
+
+@dp.message(PrimaryInput.value)
+async def primary_input(msg: Message, state: FSMContext):
+    if msg.from_user.id != OWNER:
+        return
+    data = await state.get_data()
+    account_id = data["primary_account"]
+    value = (msg.text or "").strip()
+    operation = data["primary_action"]
+    if operation == "create":
+        if not value.isdecimal() or not 1 <= int(value) <= 20:
+            await msg.answer("تعداد باید بین ۱ تا ۲۰ باشد.")
+            return
+        args = [*data["primary_args"], int(value)]
+        text = f"⚠️ خرید {int(value)} Primary {args[1]} در {html.escape(args[0])}؟ IPها آزاد ساخته می‌شوند؛ حتی بدون سرور هزینه دارند."
+    else:
+        if not 1 <= len(value) <= 63 or any(ord(c) < 32 for c in value):
+            await msg.answer("نام باید ۱ تا ۶۳ حرف باشد.")
+            return
+        args = [*data["primary_args"], value]
+        text = f"⚠️ تغییر نام به {html.escape(value)}؟"
+    await state.clear()
+    sent = await msg.answer(text)
+    token = secrets.token_hex(8)
+    primary_confirmations[token] = (time.monotonic()+300, sent.chat.id, sent.message_id,
+                                    account_id, operation, args)
+    await sent.edit_reply_markup(reply_markup=primary_kb([
+        ("✅ تأیید", f"hp:ok:{account_id}:{token}"),
+        ("🔙 انصراف", f"hp:list:{account_id}:0")]))
 
 
 @dp.callback_query(F.data.startswith("hetzipman:"))

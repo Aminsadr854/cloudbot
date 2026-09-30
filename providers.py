@@ -863,6 +863,124 @@ class Provider:
             raise ProviderError("backup status must be 'disabled' or 'enabled'")
         return await self._req("PATCH", f"/instances/{server_id}", json={"backups": status})
 
+    # -- Hetzner Primary IPs --------------------------------------------
+    def _primary_provider(self):
+        if self.provider != "hetzner":
+            raise ProviderError("Primary IPs are only available for Hetzner")
+
+    async def hetzner_primary_ips(self):
+        self._primary_provider()
+        rows, page = [], 1
+        while True:
+            data = await self._req("GET", f"/primary_ips?per_page=50&page={page}")
+            current = data.get("primary_ips", [])
+            rows.extend(current)
+            pagination = (data.get("meta") or {}).get("pagination") or {}
+            next_page = pagination.get("next_page")
+            if next_page:
+                page = int(next_page)
+            elif pagination or len(current) < 50:
+                return rows
+            else:
+                page += 1
+
+    async def hetzner_primary_ip(self, ip_id):
+        self._primary_provider()
+        data = await self._req("GET", f"/primary_ips/{int(ip_id)}")
+        return data["primary_ip"]
+
+    async def create_hetzner_primary_ip(self, location, ip_type, name):
+        self._primary_provider()
+        if ip_type not in ("ipv4", "ipv6"):
+            raise ProviderError("Primary IP type must be ipv4 or ipv6")
+        result = await self._req("POST", "/primary_ips", json={
+            "location": location, "type": ip_type, "name": name,
+            "assignee_type": "server", "auto_delete": False,
+        })
+        await self._wait_hetzner_action(result)
+        return result["primary_ip"]
+
+    async def update_hetzner_primary_ip(self, ip_id, **changes):
+        self._primary_provider()
+        if not changes or set(changes) - {"name", "auto_delete"}:
+            raise ProviderError("Unsupported Primary IP update")
+        data = await self._req("PUT", f"/primary_ips/{int(ip_id)}", json=changes)
+        return data["primary_ip"]
+
+    async def protect_hetzner_primary_ip(self, ip_id, enabled):
+        self._primary_provider()
+        await self._wait_hetzner_action(await self._req(
+            "POST", f"/primary_ips/{int(ip_id)}/actions/change_protection",
+            json={"delete": bool(enabled)}))
+
+    async def _primary_server_off(self, server_id):
+        data = await self._req("GET", f"/servers/{int(server_id)}")
+        server = data["server"]
+        if server.get("status") != "off":
+            raise ProviderError("ابتدا سرور را خاموش کنید؛ تغییر Primary IP نیاز به خاموشی دارد.")
+        return server
+
+    async def unassign_hetzner_primary_ip(self, ip_id):
+        ip = await self.hetzner_primary_ip(ip_id)
+        if ip.get("assignee_id") is None:
+            return
+        await self._primary_server_off(ip["assignee_id"])
+        await self._wait_hetzner_action(await self._req(
+            "POST", f"/primary_ips/{int(ip_id)}/actions/unassign"))
+
+    async def assign_hetzner_primary_ip(self, ip_id, server_id):
+        """Replace the same-family IP, retaining the old allocation with rollback."""
+        ip = await self.hetzner_primary_ip(ip_id)
+        if ip.get("assignee_id") is not None:
+            if str(ip["assignee_id"]) == str(server_id):
+                return
+            raise ProviderError("این IP به سرور دیگری متصل است؛ ابتدا آن را جدا کنید.")
+        server = await self._primary_server_off(server_id)
+        location = server.get("location") or (server.get("datacenter") or {}).get("location") or {}
+        ip_location = ip.get("location") or (ip.get("datacenter") or {}).get("location") or {}
+        if not location.get("name") or location.get("name") != ip_location.get("name"):
+            raise ProviderError("IP و سرور باید در یک منطقه باشند.")
+        old = (server.get("public_net", {}).get(ip["type"]) or {}).get("id")
+        if old:
+            await self.update_hetzner_primary_ip(old, auto_delete=False)
+            await self.unassign_hetzner_primary_ip(old)
+        try:
+            await self._wait_hetzner_action(await self._req(
+                "POST", f"/primary_ips/{int(ip_id)}/actions/assign",
+                json={"assignee_type": "server", "assignee_id": int(server_id)}))
+        except Exception as exc:
+            if old:
+                try:
+                    # An action may have completed after its response was lost.
+                    current = (await self._req("GET", f"/servers/{int(server_id)}"))["server"]
+                    attached = (current.get("public_net", {}).get(ip["type"]) or {}).get("id")
+                    if str(attached) == str(ip_id):
+                        return
+                    if attached:
+                        raise ProviderError("Another IP is now attached; inspect the server")
+                    await self._wait_hetzner_action(await self._req(
+                        "POST", f"/primary_ips/{old}/actions/assign",
+                        json={"assignee_type": "server", "assignee_id": int(server_id)}))
+                except Exception as rollback:
+                    raise ProviderError(f"Assign failed: {exc}; restore old IP {old} manually: {rollback}") from exc
+                raise ProviderError(f"Assign failed; old IP {old} restored: {exc}") from exc
+            raise
+
+    async def delete_hetzner_primary_ip(self, ip_id):
+        ip = await self.hetzner_primary_ip(ip_id)
+        if ip.get("assignee_id") is not None:
+            raise ProviderError("ابتدا IP را از سرور جدا کنید.")
+        if (ip.get("protection") or {}).get("delete"):
+            raise ProviderError("ابتدا محافظت حذف را غیرفعال کنید.")
+        await self._req("DELETE", f"/primary_ips/{int(ip_id)}")
+
+    async def hetzner_power(self, server_id, action):
+        self._primary_provider()
+        if action not in ("shutdown", "poweron"):
+            raise ProviderError("Unsupported power action")
+        await self._wait_hetzner_action(await self._req(
+            "POST", f"/servers/{int(server_id)}/actions/{action}"))
+
     # -- Hetzner Floating IPs -------------------------------------------
     async def hetzner_floating_ips(self, server_id=None):
         """List the Hetzner project Floating IPs, following every result page."""
