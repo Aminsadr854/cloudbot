@@ -22,6 +22,7 @@ from urllib.parse import quote, unquote, urlsplit
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -41,6 +42,7 @@ import time
 
 import cfscanner
 import providers
+from menu_cache import MenuCache
 import replacer
 import subscription
 import tunnelwatch
@@ -88,6 +90,8 @@ dp = Dispatcher(storage=MemoryStorage())
 PROVIDER_LABEL = {"linode": "🟣 Linode", "vultr": "🔷 Vultr", "hetzner": "🟦 Hetzner"}
 PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
 account_check_status = {}
+menu_cache = MenuCache()
+server_ip_cache_updated = {}
 server_ip_cache: dict[str, set[tuple[int, str]]] = {}
 server_network_cache: dict[object, set[tuple[int, str]]] = {}
 server_cache: dict[tuple[int, str], dict] = {}
@@ -468,6 +472,7 @@ def _server_networks(server, floating_ips=()):
 
 
 def _remove_account_server_ip_cache_locked(acc_id):
+    server_ip_cache_updated.pop(int(acc_id), None)
     for key in [key for key in server_cache if key[0] == int(acc_id)]:
         server_cache.pop(key, None)
         floating_ip_cache.pop(key, None)
@@ -482,11 +487,13 @@ def _remove_account_server_ip_cache_locked(acc_id):
 
 
 async def remove_account_server_ip_cache(acc_id):
+    menu_cache.invalidate(acc_id)
     async with ip_cache_lock:
         _remove_account_server_ip_cache_locked(acc_id)
 
 
 async def remove_server_ip_cache(acc_id, server_id):
+    menu_cache.invalidate(acc_id)
     key = (int(acc_id), str(server_id))
     async with ip_cache_lock:
         server_cache.pop(key, None)
@@ -501,6 +508,70 @@ async def remove_server_ip_cache(acc_id, server_id):
                 server_network_cache.pop(network, None)
 
 
+async def edit_menu_message(message, text, **kwargs):
+    try:
+        await message.edit_text(text, **kwargs)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).lower():
+            raise
+
+
+async def menu_servers(acc, force=False):
+    return await menu_cache.get(acc, "servers", providers.Provider(acc).list_servers, force=force)
+
+
+async def menu_primary_ips(acc, force=False):
+    return await menu_cache.get(acc, "primary_ips", providers.Provider(acc).hetzner_primary_ips, force=force)
+
+
+async def menu_primary_ip(acc, ip_id):
+    items = await menu_primary_ips(acc)
+    for ip in items:
+        if str(ip["id"]) == str(ip_id):
+            return ip
+    raise providers.ProviderError("IP پیدا نشد؛ فهرست را تازه‌سازی کنید.")
+
+
+async def menu_server(acc, server_id):
+    if acc["provider"] == "hetzner":
+        for server in await menu_servers(acc):
+            if str(server["id"]) == str(server_id):
+                return server
+        raise providers.ProviderError("سرور پیدا نشد؛ فهرست را تازه‌سازی کنید.")
+    p = providers.Provider(acc)
+    return await menu_cache.get(acc, f"server:{server_id}", lambda: p.server(server_id))
+
+
+async def menu_floating_ips(acc, server_id=None, force=False):
+    p = providers.Provider(acc)
+    if acc["provider"] == "hetzner":
+        items = await menu_cache.get(acc, "floating_ips", p.hetzner_floating_ips, force=force)
+        return [ip for ip in items if str(ip.get("server")) == str(server_id)] if server_id else items
+    if acc["provider"] == "vultr":
+        items = await menu_cache.get(acc, "floating_ips", p.vultr_reserved_ips, force=force)
+        return [ip for ip in items if str(ip.get("instance_id")) == str(server_id)] if server_id else items
+    return []
+
+
+async def menu_locations(acc, force=False):
+    p = providers.Provider(acc)
+    return await menu_cache.get(acc, "locations", lambda: p._req("GET", "/locations"), force=force, ttl=3600)
+
+
+async def refresh_account_menu_metadata(acc, force=False):
+    p = providers.Provider(acc)
+    loads = [menu_cache.get(acc, "account_info", p.account_info, force=force)]
+    if acc["provider"] == "hetzner":
+        loads += [menu_primary_ips(acc, force), menu_locations(acc)]
+    await asyncio.gather(*loads, return_exceptions=True)
+
+
+async def menu_cache_scheduler():
+    while True:
+        schedule_all_server_ip_cache_refresh()
+        await asyncio.sleep(60)
+
+
 async def refresh_account_server_ip_cache(acc_id, acc=None, servers=None):
     acc_id = int(acc_id)
     acc = acc or st.account(acc_id)
@@ -508,20 +579,20 @@ async def refresh_account_server_ip_cache(acc_id, acc=None, servers=None):
         raise ValueError("account not found")
     account_lock = ip_cache_account_locks.setdefault(acc_id, asyncio.Lock())
     async with account_lock:
-        provider = providers.Provider(acc)
+        revision = menu_cache.revision(acc)
+        _track_background_task(refresh_account_menu_metadata(acc, force=True),
+                               f"menu-metadata-{acc_id}")
         try:
-            if servers is None:
-                servers = await provider.list_servers()
-            if acc["provider"] == "vultr":
-                reserved_ips = await provider.vultr_reserved_ips()
-            elif acc["provider"] == "hetzner":
-                reserved_ips = await provider.hetzner_floating_ips()
-            else:
-                reserved_ips = []
+            servers, reserved_ips = await asyncio.gather(
+                menu_servers(acc, force=True), menu_floating_ips(acc, force=True))
         except Exception as exc:
             log.warning("server IP cache refresh failed for account %s (%s)",
                         acc_id, type(exc).__name__)
             raise
+        if (not menu_cache.current(acc, revision)
+                or not st.account(acc_id)
+                or menu_cache.revision(st.account(acc_id)) != revision):
+            return servers
 
         floating_by_server = {}
         for floating in reserved_ips:
@@ -542,7 +613,10 @@ async def refresh_account_server_ip_cache(acc_id, acc=None, servers=None):
             entries[key] = (cached, cached_floating)
 
         async with ip_cache_lock:
+            if not menu_cache.current(acc, revision):
+                return servers
             _remove_account_server_ip_cache_locked(acc_id)
+            server_ip_cache_updated[acc_id] = time.monotonic()
             for key, (server, floating) in entries.items():
                 server_cache[key] = server
                 floating_ip_cache[key] = floating
@@ -583,7 +657,8 @@ async def refresh_all_server_ip_caches():
         async def refresh_one(acc):
             async with semaphore:
                 try:
-                    await refresh_account_server_ip_cache(acc["id"], acc)
+                    if time.monotonic() - server_ip_cache_updated.get(acc["id"], 0) >= 60:
+                        await refresh_account_server_ip_cache(acc["id"], acc)
                     return True
                 except Exception:
                     return False
@@ -614,6 +689,12 @@ def schedule_all_server_ip_cache_refresh():
 
 def schedule_account_server_ip_cache_refresh(acc_id, acc=None, servers=None, force=False):
     acc_id = int(acc_id)
+    if force:
+        menu_cache.invalidate(acc_id)
+    elif (servers is None and acc
+          and time.monotonic() - server_ip_cache_updated.get(acc_id, 0) < 60
+          and menu_cache.fresh(acc, "servers")):
+        return None
     if (not force and ip_cache_full_refresh_task
             and not ip_cache_full_refresh_task.done()):
         return ip_cache_full_refresh_task
@@ -626,7 +707,11 @@ def schedule_account_server_ip_cache_refresh(acc_id, acc=None, servers=None, for
     async def refresh():
         current_servers = servers
         while True:
-            await refresh_account_server_ip_cache(acc_id, acc, servers=current_servers)
+            try:
+                await refresh_account_server_ip_cache(acc_id, st.account(acc_id), servers=current_servers)
+            except Exception:
+                if acc_id not in ip_cache_account_refresh_again:
+                    raise
             current_servers = None
             if acc_id not in ip_cache_account_refresh_again:
                 return
@@ -752,18 +837,15 @@ async def cb_account(cb: CallbackQuery):
     schedule_account_server_ip_cache_refresh(acc["id"], acc)
     prx = proxy_summary(acc["proxy"])
     family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
-    details_str = ""
-    try:
-        info = await providers.Provider(acc).account_info()
-        details_str = format_account_details(info, acc["provider"])
-    except Exception as e:
-        log.warning("failed to fetch account_info for acc %s: %s", acc.get("id"), e)
-    await cb.message.edit_text(
+    await cb.answer()
+    info = menu_cache.peek(acc, "account_info")
+    details_str = format_account_details(info, acc["provider"]) if info is not None else ""
+    _track_background_task(refresh_account_menu_metadata(acc), f"account-menu-{acc['id']}")
+    await edit_menu_message(cb.message,
         f"{PROVIDER_LABEL.get(acc['provider'])} <b>{html.escape(acc['label'])}</b>\n"
         f"🌐 پروکسی: <code>{html.escape(prx)}</code> · {family}"
         f"{details_str}",
         reply_markup=kb_account(acc))
-    await cb.answer()
 
 
 @dp.callback_query(F.data.startswith("accset:"))
@@ -1246,6 +1328,28 @@ async def del_acc_ok(cb: CallbackQuery):
 # --------------------------------------------------------------------------
 # list servers
 # --------------------------------------------------------------------------
+@dp.callback_query(F.data.startswith("menurefresh:"))
+async def refresh_menu(cb: CallbackQuery):
+    if cb.from_user.id != OWNER:
+        await cb.answer("این ربات خصوصی است.", show_alert=True)
+        return
+    _, acc_id, *server_id = cb.data.split(":")
+    acc = st.account(int(acc_id))
+    await cb.answer()
+    if not acc:
+        return
+    await cb.message.edit_text("⏳ در حال تازه‌سازی…")
+    try:
+        task = schedule_account_server_ip_cache_refresh(acc["id"], acc, force=True)
+        await asyncio.shield(task)
+        await refresh_account_menu_metadata(acc, force=True)
+        destination = f"hetzipman:{acc_id}:{server_id[0]}" if server_id else f"srvs:{acc_id}"
+        await cb.message.edit_text("✅ تازه‌سازی شد.", reply_markup=primary_kb([
+            ("🔙 بازگشت", destination)]))
+    except Exception:
+        await cb.message.edit_text("❌ تازه‌سازی انجام نشد؛ دوباره تلاش کنید.", reply_markup=kb_account(acc))
+
+
 @dp.callback_query(F.data.startswith("srvs:"))
 async def cb_servers(cb: CallbackQuery):
     acc_id = int(cb.data.split(":")[1])
@@ -1253,13 +1357,14 @@ async def cb_servers(cb: CallbackQuery):
     if not acc:
         await cb.answer("اکانت پیدا نشد", show_alert=True)
         return
-    await cb.message.edit_text("در حال گرفتن سرورها…")
+    if menu_cache.peek(acc, "servers") is None:
+        await edit_menu_message(cb.message, "در حال گرفتن سرورها…")
     await cb.answer()
     try:
-        servers = await providers.Provider(acc).list_servers()
-        schedule_account_server_ip_cache_refresh(acc_id, acc, servers)
+        servers = await menu_servers(acc)
+        schedule_account_server_ip_cache_refresh(acc_id, acc)
     except Exception as e:
-        await cb.message.edit_text(f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>",
+        await edit_menu_message(cb.message, f"❌ خطا: <code>{html.escape(str(e)[:250])}</code>",
                                    reply_markup=kb_account(acc))
         return
     b = InlineKeyboardBuilder()
@@ -1267,10 +1372,11 @@ async def cb_servers(cb: CallbackQuery):
         where = providers.location_text(acc["provider"], s.get("region"), s.get("country"))
         b.button(text=f"{s['label']} · {where} · {s['ip']} · {s['status']}",
                  callback_data=f"srv:{acc_id}:{s['id']}")
+    b.button(text="🔄 تازه‌سازی", callback_data=f"menurefresh:{acc_id}")
     b.button(text="🔙 بازگشت", callback_data=f"acc:{acc_id}")
     b.adjust(1)
     head = f"📋 <b>{len(servers)} سرور</b>" if servers else "سروری در این اکانت نیست."
-    await cb.message.edit_text(head, reply_markup=b.as_markup())
+    await edit_menu_message(cb.message, head, reply_markup=b.as_markup())
 
 
 def build_server_card(acc_id, srv_id, acc, s, floating_ips):
@@ -1349,21 +1455,15 @@ async def cb_server(cb: CallbackQuery):
     if not acc:
         await cb.answer("اکانت پیدا نشد", show_alert=True)
         return
+    await cb.answer()
     try:
-        prov = providers.Provider(acc)
-        s = await prov.server(srv_id)
-        if acc["provider"] == "vultr":
-            floating_ips = await prov.vultr_floating_ips(srv_id)
-        elif acc["provider"] == "hetzner":
-            floating_ips = await prov.hetzner_floating_ips(srv_id)
-        else:
-            floating_ips = []
+        s, floating_ips = await asyncio.gather(
+            menu_server(acc, srv_id), menu_floating_ips(acc, srv_id))
     except Exception as e:
         await cb.answer(str(e)[:180], show_alert=True)
         return
     text, markup = build_server_card(acc_id, srv_id, acc, s, floating_ips)
-    await cb.message.edit_text(text, reply_markup=markup)
-    await cb.answer()
+    await edit_menu_message(cb.message, text, reply_markup=markup)
 
 
 @dp.callback_query(F.data.startswith("disbackup:"))
@@ -1376,6 +1476,7 @@ async def cb_disable_backup(cb: CallbackQuery):
     except Exception as e:
         await cb.answer(f"❌ خطا: {str(e)[:150]}", show_alert=True)
         return
+    schedule_account_server_ip_cache_refresh(acc_id, acc, force=True)
     await cb_server(cb)
 
 
@@ -1675,13 +1776,13 @@ async def primary_manager(cb: CallbackQuery, state: FSMContext):
     account_id = int(account_id)
     acc = st.account(account_id)
     if not acc or acc["provider"] != "hetzner":
-        await cb.message.edit_text("❌ اکانت Hetzner پیدا نشد.")
+        await edit_menu_message(cb.message, "❌ اکانت Hetzner پیدا نشد.")
         return
     p = providers.Provider(acc)
     back = ("🔙 Primary IPها", f"hp:list:{account_id}:0")
     try:
-        if action == "list":
-            items = await p.hetzner_primary_ips()
+        if action in ("list", "refresh"):
+            items = await menu_primary_ips(acc, force=action == "refresh")
             page = max(0, min(int(args[0]), max(0, (len(items)-1)//8)))
             rows = []
             for ip in items[page*8:page*8+8]:
@@ -1692,16 +1793,16 @@ async def primary_manager(cb: CallbackQuery, state: FSMContext):
             if (page+1)*8 < len(items):
                 rows.append(("➡️ بعدی", f"hp:list:{account_id}:{page+1}"))
             rows += [("➕ ساخت چند Primary IP", f"hp:new:{account_id}"),
-                     ("🔄 تازه‌سازی", f"hp:list:{account_id}:{page}"),
+                     ("🔄 تازه‌سازی", f"hp:refresh:{account_id}:{page}"),
                      ("🔙 اکانت", f"acc:{account_id}")]
-            await cb.message.edit_text(
+            await edit_menu_message(cb.message,
                 f"🌐 <b>Primary IPها — {html.escape(acc['label'])}</b>\n"
                 f"تعداد: {len(items)} · صفحه {page+1}\n"
                 "IPv4 و IPv6، متصل و آزاد. IP آزاد هم هزینه دارد.\n"
                 "برای اتصال، جداسازی یا تعویض، سرور باید خاموش باشد.",
                 reply_markup=primary_kb(rows))
         elif action == "ip":
-            ip = await p.hetzner_primary_ip(args[0])
+            ip = await menu_primary_ip(acc, args[0])
             ip_id = ip["id"]
             rows = [("🔗 اتصال / تعویض IP سرور", f"hp:servers:{account_id}:{ip_id}:0")]
             if ip.get("assignee_id"):
@@ -1717,15 +1818,15 @@ async def primary_manager(cb: CallbackQuery, state: FSMContext):
                       f"hp:ask:{account_id}:auto:{ip_id}:{int(not ip.get('auto_delete'))}"),
                      ("🗑 حذف دائمی IP", f"hp:ask:{account_id}:delete:{ip_id}"), back]
             loc = ip.get("location") or (ip.get("datacenter") or {}).get("location") or {}
-            await cb.message.edit_text(
+            await edit_menu_message(cb.message,
                 f"🌐 <b>{html.escape(ip['name'])}</b>\n<code>{html.escape(ip['ip'])}</code>\n"
                 f"نوع: {ip['type']} · منطقه: {html.escape(loc.get('name', '?'))}\n"
                 f"سرور: {ip.get('assignee_id') or 'آزاد'} · ID: {ip_id}",
                 reply_markup=primary_kb(rows))
         elif action == "servers":
-            ip = await p.hetzner_primary_ip(args[0])
+            ip = await menu_primary_ip(acc, args[0])
             loc = ip.get("location") or (ip.get("datacenter") or {}).get("location") or {}
-            servers = [s for s in await p.servers() if s.get("region") == loc.get("name")]
+            servers = [s for s in await menu_servers(acc) if s.get("region") == loc.get("name")]
             page = max(0, min(int(args[1]), max(0, (len(servers)-1)//8)))
             rows = [(f"{s['label']} · {s['status']}",
                      f"hp:ask:{account_id}:assign:{ip['id']}:{s['id']}")
@@ -1735,27 +1836,27 @@ async def primary_manager(cb: CallbackQuery, state: FSMContext):
             if (page+1)*8 < len(servers):
                 rows.append(("➡️ بعدی", f"hp:servers:{account_id}:{ip['id']}:{page+1}"))
             rows.append(("🔙 IP", f"hp:ip:{account_id}:{ip['id']}"))
-            await cb.message.edit_text(
+            await edit_menu_message(cb.message,
                 "🖥 سرور هم‌منطقه را انتخاب کنید. ابتدا از صفحهٔ سرور خاموشش کنید.\n"
                 "IP قبلی حفظ می‌شود و به‌صورت آزاد باقی می‌ماند.", reply_markup=primary_kb(rows))
         elif action == "new":
-            data = await p._req("GET", "/locations")
+            data = await menu_locations(acc)
             rows = [(f"{loc['name']} · {family}",
                      f"hp:count:{account_id}:{loc['name']}:{family}")
                     for loc in data["locations"] for family in ("ipv4", "ipv6")]
-            await cb.message.edit_text("🌍 منطقه و نوع IP را انتخاب کنید:",
+            await edit_menu_message(cb.message, "🌍 منطقه و نوع IP را انتخاب کنید:",
                                        reply_markup=primary_kb(rows + [back]))
         elif action == "count":
             await state.set_state(PrimaryInput.value)
             await state.update_data(primary_account=account_id, primary_action="create",
                                     primary_args=args)
-            await cb.message.edit_text("🔢 تعداد IP را بفرستید (۱ تا ۲۰). قبل از خرید تأیید می‌گیرید.",
+            await edit_menu_message(cb.message, "🔢 تعداد IP را بفرستید (۱ تا ۲۰). قبل از خرید تأیید می‌گیرید.",
                                        reply_markup=primary_kb([back]))
         elif action == "rename":
             await state.set_state(PrimaryInput.value)
             await state.update_data(primary_account=account_id, primary_action="rename",
                                     primary_args=args)
-            await cb.message.edit_text("✏️ نام جدید IP را بفرستید (۱ تا ۶۳ حرف):",
+            await edit_menu_message(cb.message, "✏️ نام جدید IP را بفرستید (۱ تا ۶۳ حرف):",
                                        reply_markup=primary_kb([back]))
         elif action == "ask":
             operation, *values = args
@@ -1781,11 +1882,11 @@ async def primary_manager(cb: CallbackQuery, state: FSMContext):
             pending = primary_confirmations.pop(args[0], None)
             if (not pending or pending[0] < time.monotonic()
                     or pending[1:4] != (cb.message.chat.id, cb.message.message_id, account_id)):
-                await cb.message.edit_text("❌ تأیید منقضی یا قبلاً استفاده شده؛ دوباره از منو شروع کنید.",
+                await edit_menu_message(cb.message, "❌ تأیید منقضی یا قبلاً استفاده شده؛ دوباره از منو شروع کنید.",
                                            reply_markup=primary_kb([back]))
                 return
             operation, values = pending[4:]
-            await cb.message.edit_text("⏳ در حال انجام…")
+            await edit_menu_message(cb.message, "⏳ در حال انجام…")
             async with primary_operation_locks.setdefault(account_id, asyncio.Lock()):
                 result = "✅ انجام شد."
                 try:
@@ -1827,10 +1928,10 @@ async def primary_manager(cb: CallbackQuery, state: FSMContext):
                     # Invalidate immediately: old addresses must not open stale cards.
                     await remove_account_server_ip_cache(account_id)
                     schedule_account_server_ip_cache_refresh(account_id, acc, force=True)
-            await cb.message.edit_text(result[:3500], reply_markup=primary_kb([back, ("🔙 سرورها", f"srvs:{account_id}")]))
+            await edit_menu_message(cb.message, result[:3500], reply_markup=primary_kb([back, ("🔙 سرورها", f"srvs:{account_id}")]))
     except Exception as exc:
         log.exception("Primary IP operation failed: account=%s action=%s", account_id, action)
-        await cb.message.edit_text("❌ " + html.escape(str(exc))[:3000],
+        await edit_menu_message(cb.message, "❌ " + html.escape(str(exc))[:3000],
                                    reply_markup=primary_kb([back]))
 
 
@@ -1871,10 +1972,10 @@ async def hetzner_ip_manager(cb: CallbackQuery):
     if not acc or acc["provider"] != "hetzner":
         await cb.answer("این عملیات فقط برای سرورهای Hetzner است", show_alert=True)
         return
+    await cb.answer()
     try:
-        provider = providers.Provider(acc)
-        server = await provider.server(srv_id)
-        floating_ips = await provider.hetzner_floating_ips(srv_id)
+        server, floating_ips = await asyncio.gather(
+            menu_server(acc, srv_id), menu_floating_ips(acc, srv_id))
     except Exception as exc:
         await cb.answer(str(exc)[:180], show_alert=True)
         return
@@ -1887,7 +1988,7 @@ async def hetzner_ip_manager(cb: CallbackQuery):
     for floating in floating_ips:
         b.button(text=f"🗑 حذف {_floating_ip_value(floating)}",
                  callback_data=f"hetzfloatdel:{acc_id}:{srv_id}:{floating['id']}")
-    b.button(text="🔄 تازه‌سازی", callback_data=f"hetzipman:{acc_id}:{srv_id}")
+    b.button(text="🔄 تازه‌سازی", callback_data=f"menurefresh:{acc_id}:{srv_id}")
     b.button(text="🔙 سرور", callback_data=f"srv:{acc_id}:{srv_id}")
     b.adjust(1)
     listed = ("\n".join(
@@ -1897,7 +1998,7 @@ async def hetzner_ip_manager(cb: CallbackQuery):
         + (f"\n  ↳ <code>{html.escape(_hetzner_floating_ip_command(item))}</code>"
            if _hetzner_floating_ip_command(item) else "")
         for item in floating_ips) if floating_ips else "ندارد")
-    await cb.message.edit_text(
+    await edit_menu_message(cb.message,
         "🌐 <b>مدیریت IPهای Hetzner</b>\n\n"
         f"📡 IPv4 اصلی: <code>{html.escape(str(server.get('ipv4') or '—'))}</code>\n"
         f"📡 شبکه IPv6 اصلی: <code>{html.escape(str(server.get('ipv6') or '—'))}</code>\n\n"
@@ -1906,7 +2007,6 @@ async def hetzner_ip_manager(cb: CallbackQuery):
         "برای فعال‌سازی موقت، دستور کنار هر IP را روی همان سرور و با دسترسی root اجرا کن. "
         "این تنظیم بعد از راه‌اندازی مجدد از بین می‌رود؛ برای ماندگاری باید تنظیم شبکهٔ سیستم‌عامل را تغییر داد.",
         reply_markup=b.as_markup())
-    await cb.answer()
 
 
 @dp.callback_query(F.data.startswith("hetzfloat:"))
@@ -2263,6 +2363,7 @@ async def del_srv_ok(cb: CallbackQuery):
         return
     st.forget_server(int(acc_id), srv_id)
     await remove_server_ip_cache(acc_id, srv_id)
+    schedule_account_server_ip_cache_refresh(acc_id, acc, force=True)
 
     note = "✅ سرور حذف شد."
     if ip:
@@ -5959,6 +6060,7 @@ async def route_server_ip(msg: Message):
 
 
 async def main():
+    asyncio.create_task(menu_cache_scheduler())
     asyncio.create_task(scan_scheduler())
     asyncio.create_task(phone_recheck())
     asyncio.create_task(watch_scheduler())

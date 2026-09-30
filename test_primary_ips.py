@@ -147,3 +147,51 @@ class PrimaryBotTests(unittest.IsolatedAsyncioTestCase):
              patch.object(self.b.providers, 'Provider', return_value=p):
             await self.b.primary_manager(cb, AsyncMock())
         p.delete_hetzner_primary_ip.assert_not_awaited()
+
+    async def test_primary_navigation_uses_warm_cache_without_api_calls(self):
+        from menu_cache import MenuCache
+        cache = MenuCache()
+        acc = {'id': 1, 'provider': 'hetzner', 'label': 'Test', 'token': 'test'}
+        ip = {'id': 2, 'name': 'ip', 'ip': '192.0.2.2', 'type': 'ipv4',
+              'location': {'name': 'nbg1'}, 'assignee_id': None}
+        servers = [{'id': 9, 'label': 'server', 'status': 'off', 'region': 'nbg1'}]
+        for name, value in [('primary_ips', [ip]), ('servers', servers),
+                            ('locations', {'locations': [{'name': 'nbg1'}]})]:
+            await cache.get(acc, name, AsyncMock(return_value=value))
+        p = SimpleNamespace(hetzner_primary_ips=AsyncMock(), list_servers=AsyncMock(),
+                            _req=AsyncMock())
+        with patch.object(self.b, 'menu_cache', cache), \
+             patch.object(self.b.st, 'account', return_value=acc), \
+             patch.object(self.b.providers, 'Provider', return_value=p):
+            for action in ('list:1:0', 'ip:1:2', 'servers:1:2:0', 'new:1'):
+                cb = self.cb('hp:'+action)
+                await self.b.primary_manager(cb, AsyncMock())
+                text = cb.message.edit_text.call_args.args[0]
+                self.assertNotIn('❌', text)
+        p.hetzner_primary_ips.assert_not_awaited()
+        p.list_servers.assert_not_awaited()
+        p._req.assert_not_awaited()
+
+    async def test_mutation_during_refresh_runs_a_second_fetch(self):
+        from menu_cache import MenuCache
+        entered, release = self.b.asyncio.Event(), self.b.asyncio.Event()
+        calls = []
+        async def refresh(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                entered.set()
+                await release.wait()
+                raise RuntimeError('invalidated request')
+        with patch.object(self.b, 'menu_cache', MenuCache()), \
+             patch.object(self.b, 'ip_cache_full_refresh_task', None), \
+             patch.object(self.b, 'ip_cache_account_refresh_tasks', {}), \
+             patch.object(self.b, 'ip_cache_account_refresh_again', set()), \
+             patch.object(self.b.st, 'account', return_value={'id': 1}), \
+             patch.object(self.b, 'refresh_account_server_ip_cache', side_effect=refresh):
+            task = self.b.schedule_account_server_ip_cache_refresh(1)
+            await entered.wait()
+            second = self.b.schedule_account_server_ip_cache_refresh(1, force=True)
+            self.assertIs(task, second)
+            release.set()
+            await task
+        self.assertEqual(len(calls), 2)

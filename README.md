@@ -91,11 +91,14 @@ rename it or manage its proxy, including editing individual fields. The family
 choice affects Cloudbot's connection to the proxy; the proxy's own outbound
 address is what a provider API access allowlist sees.
 
-Cloudbot loads server and attached Floating IP addresses into memory at startup
-in the background. Opening **🖥 Accounts**, an account, or its server list also
-starts a background refresh. Sending an IP address by itself returns its cached
-server card immediately; a cache miss gets a not-found reply without waiting
-for provider APIs.
+Cloudbot warms local account, server, Floating IP, and Hetzner Primary IP
+snapshots at startup. Account/server menus, primary IP pages, and location
+choices reuse them immediately; stale data refreshes in the background. A
+minute-based refresh detects changes made outside the bot, and refresh buttons
+fetch current data on demand. Bot mutations invalidate the affected account
+and refresh it; old in-flight responses cannot repopulate an invalidated cache.
+Provider checks for confirmations and IP changes remain live. Sending an IP
+opens its locally indexed server card; cache misses return immediately.
 
 The **🖥 Accounts → 🔍 Check all accounts** button checks every API key and
 connection. It reads balances for Linode and Vultr, validates Hetzner project
