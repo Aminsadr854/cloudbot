@@ -1,0 +1,2243 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Cloudbot | Multi-Cloud Hosting Console</title>
+  <link rel="stylesheet" href="/ui/style.css">
+  <link rel="icon" type="image/svg+xml" href="/ui/assets/cloud.svg">
+</head>
+<body>
+  <div class="app-layout">
+    <!-- ==================== SIDEBAR ==================== -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <a href="#overview" class="brand" data-tab="tab-overview">
+          <div class="brand-icon-wrap">
+            <svg viewBox="0 0 24 24" class="brand-icon"><path fill="currentColor" d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>
+          </div>
+          <div class="brand-text">
+            <span>Cloudbot</span>
+            <span class="brand-badge">Hosting</span>
+          </div>
+        </a>
+        <button class="mobile-nav-toggle" id="btn-mobile-nav" aria-label="Toggle navigation">
+          <span>☰</span>
+        </button>
+      </div>
+
+      <div class="sidebar-content">
+        <!-- Main Navigation Section -->
+        <div class="nav-section">
+          <div class="nav-section-title">Overview</div>
+          <button class="nav-item active" data-tab="tab-overview">
+            <div class="nav-item-left">
+              <span class="nav-icon">📊</span>
+              <span>Overview</span>
+            </div>
+          </button>
+        </div>
+
+        <!-- Cloud Providers & Accounts -->
+        <div class="nav-section">
+          <div class="nav-section-title">Cloud Infrastructure</div>
+          <button class="nav-item" data-tab="tab-accounts">
+            <div class="nav-item-left">
+              <span class="nav-icon">👥</span>
+              <span>Account Management</span>
+            </div>
+            <span class="nav-count-badge" id="badge-accounts-count">0</span>
+          </button>
+          <button class="nav-item" data-tab="tab-hetzner">
+            <div class="nav-item-left">
+              <img src="/ui/assets/hetzner.svg" alt="Hetzner" class="nav-provider-logo">
+              <span>Hetzner Cloud</span>
+            </div>
+            <span class="nav-count-badge" id="badge-hetzner-count">0</span>
+          </button>
+          <button class="nav-item" data-tab="tab-vultr">
+            <div class="nav-item-left">
+              <img src="/ui/assets/vultr.svg" alt="Vultr" class="nav-provider-logo">
+              <span>Vultr</span>
+            </div>
+            <span class="nav-count-badge" id="badge-vultr-count">0</span>
+          </button>
+          <button class="nav-item" data-tab="tab-linode">
+            <div class="nav-item-left">
+              <img src="/ui/assets/linode.svg" alt="Linode" class="nav-provider-logo">
+              <span>Linode / Akamai</span>
+            </div>
+            <span class="nav-count-badge" id="badge-linode-count">0</span>
+          </button>
+        </div>
+
+        <!-- Networking & Security -->
+        <div class="nav-section">
+          <div class="nav-section-title">Networking & Security</div>
+          <button class="nav-item" data-tab="tab-proxies">
+            <div class="nav-item-left">
+              <span class="nav-icon">🛡️</span>
+              <span>Proxy Management</span>
+            </div>
+            <span class="nav-count-badge" id="badge-proxies-count">0</span>
+          </button>
+          <button class="nav-item" data-tab="tab-compute">
+            <div class="nav-item-left">
+              <span class="nav-icon">🖥️</span>
+              <span>All Instances</span>
+            </div>
+            <span class="nav-count-badge" id="badge-total-servers">0</span>
+          </button>
+          <button class="nav-item" data-tab="tab-ips">
+            <div class="nav-item-left">
+              <span class="nav-icon">🌐</span>
+              <span>IP Management</span>
+            </div>
+            <span class="nav-count-badge" id="badge-fips-count">0</span>
+          </button>
+          <button class="nav-item" data-tab="tab-ssh">
+            <div class="nav-item-left">
+              <span class="nav-icon">🔑</span>
+              <span>SSH Key Vault</span>
+            </div>
+            <span class="nav-count-badge" id="badge-ssh-count">0</span>
+          </button>
+          <button class="nav-item" data-tab="tab-dns">
+            <div class="nav-item-left">
+              <img src="/ui/assets/cloudflare.svg" alt="Cloudflare" class="nav-provider-logo">
+              <span>Cloudflare DNS</span>
+            </div>
+          </button>
+          <button class="nav-item" data-tab="tab-watchdog">
+            <div class="nav-item-left">
+              <span class="nav-icon">📡</span>
+              <span>Watchdog & Tunnels</span>
+            </div>
+          </button>
+        </div>
+      </div>
+
+      <!-- Sidebar Footer Status -->
+      <div class="sidebar-footer">
+        <div class="system-status-card">
+          <div class="status-indicator">
+            <span class="status-dot"></span>
+            <span id="connection-status-text">Connected</span>
+          </div>
+          <button class="btn-icon-xs" id="btn-refresh-all" title="Refresh all data">🔄</button>
+        </div>
+        <div class="user-profile-row">
+          <div class="user-profile-info">
+            <div class="user-avatar">👑</div>
+            <span class="font-mono text-xs text-secondary" id="auth-user-label">@vpnmanagerkiabot</span>
+          </div>
+          <button class="btn-icon-xs" id="btn-auth-switch" title="Manage Auth / Token">⚙️</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ==================== MAIN VIEWPORT ==================== -->
+    <main class="main-viewport">
+      <!-- App Top Header -->
+      <header class="app-header">
+        <div class="header-left">
+          <div class="header-title-block">
+            <h1 id="view-title">Infrastructure Overview</h1>
+          </div>
+          <div class="header-search">
+            <svg viewBox="0 0 24 24" class="header-search-icon"><path fill="none" stroke="currentColor" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z"/></svg>
+            <input type="text" class="header-search-input" id="global-search-input" placeholder="Search servers, IPs, accounts..." autocomplete="off">
+            <button class="search-clear-btn" id="btn-search-clear" title="Clear search" aria-label="Clear search">✕</button>
+            <span class="kbd-shortcut" id="search-kbd-hint">/</span>
+
+            <!-- Floating Quick Search Results Dropdown -->
+            <div class="search-dropdown" id="global-search-dropdown">
+              <div class="search-dropdown-header">
+                <span id="search-results-summary">Quick Search</span>
+                <span class="text-xs text-muted">ESC to dismiss</span>
+              </div>
+              <div class="search-dropdown-results" id="global-search-results">
+                <!-- Injected via JavaScript from SQLite cached state -->
+              </div>
+              <div class="search-dropdown-footer">
+                <span><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+                <span><kbd>↵</kbd> select</span>
+                <span><kbd>esc</kbd> close</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="header-right">
+          <button class="btn btn-secondary btn-sm" id="btn-open-alloc-ip">
+            <span>+ Allocate IP</span>
+          </button>
+          <button class="btn btn-secondary btn-sm" id="btn-open-add-account">
+            <span>+ Add Account</span>
+          </button>
+          <button class="btn btn-primary btn-sm" id="btn-open-deploy-modal">
+            <span>🚀 Deploy Instance</span>
+          </button>
+        </div>
+      </header>
+
+      <!-- App Body Content -->
+      <div class="content-body">
+
+        <!-- ==================== TAB 1: EXECUTIVE OVERVIEW ==================== -->
+        <section class="tab-pane active" id="tab-overview">
+          <!-- Metric Highlights Ribbon -->
+          <div class="stats-grid">
+            <div class="stat-card" data-jump-tab="tab-compute" style="cursor: pointer;" title="View all compute instances">
+              <div class="stat-card-header">
+                <span class="stat-card-label">Active Cloud Instances</span>
+                <span class="stat-card-icon">🖥️</span>
+              </div>
+              <div class="stat-card-value text-primary" id="stat-total-instances">0</div>
+              <div class="stat-card-subtext" id="stat-instances-subtext">Across 3 cloud providers</div>
+            </div>
+
+            <div class="stat-card" data-jump-tab="tab-accounts" style="cursor: pointer;" title="View cloud accounts and live billing">
+              <div class="stat-card-header">
+                <span class="stat-card-label">Connected Cloud Accounts</span>
+                <span class="stat-card-icon">🔑</span>
+              </div>
+              <div class="stat-card-value text-primary" id="stat-total-accounts">0</div>
+              <div class="stat-card-subtext">All routing through proxy pool</div>
+            </div>
+          </div>
+
+          <!-- Section: Provider Hubs (Separated Provider Sections) -->
+          <div class="section-heading-row">
+            <div>
+              <h2 class="section-title">Cloud Infrastructure Hubs</h2>
+            </div>
+          </div>
+
+          <div class="provider-hubs-grid">
+            <!-- Hetzner Card -->
+            <div class="provider-hub-card hetzner" data-jump-tab="tab-hetzner">
+              <div class="hub-card-header">
+                <div class="hub-brand-badge">
+                  <img src="/ui/assets/hetzner.svg" alt="Hetzner" class="hub-provider-logo">
+                  <div>
+                    <div class="hub-provider-name">Hetzner Cloud</div>
+                    <span class="badge badge-hetzner">Germany & Europe</span>
+                  </div>
+                </div>
+                <div class="hub-arrow-btn">➔</div>
+              </div>
+              <div class="hub-metrics-row">
+                <div class="hub-metric">
+                  <div class="hub-metric-num" id="hub-hetzner-servers">0</div>
+                  <div class="hub-metric-title">Instances</div>
+                </div>
+                <div class="hub-metric">
+                  <div class="hub-metric-num" id="hub-hetzner-accounts">0</div>
+                  <div class="hub-metric-title">Accounts</div>
+                </div>
+                <div class="hub-metric">
+                  <div class="hub-metric-num" id="hub-hetzner-fips">0</div>
+                  <div class="hub-metric-title">Floating / Primary IPs</div>
+                </div>
+              </div>
+              <div class="hub-account-chips" id="hub-hetzner-account-chips">
+                <span class="text-xs text-muted">No accounts loaded</span>
+              </div>
+              <div class="hub-card-footer">
+                <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); openDeployModalForProvider('hetzner')">+ Deploy on Hetzner</button>
+                <span class="text-xs text-secondary font-mono">View Hub ➔</span>
+              </div>
+            </div>
+
+            <!-- Vultr Card -->
+            <div class="provider-hub-card vultr" data-jump-tab="tab-vultr">
+              <div class="hub-card-header">
+                <div class="hub-brand-badge">
+                  <img src="/ui/assets/vultr.svg" alt="Vultr" class="hub-provider-logo">
+                  <div>
+                    <div class="hub-provider-name">Vultr Cloud</div>
+                    <span class="badge badge-vultr">Global Edge</span>
+                  </div>
+                </div>
+                <div class="hub-arrow-btn">➔</div>
+              </div>
+              <div class="hub-metrics-row">
+                <div class="hub-metric">
+                  <div class="hub-metric-num" id="hub-vultr-servers">0</div>
+                  <div class="hub-metric-title">Instances</div>
+                </div>
+                <div class="hub-metric">
+                  <div class="hub-metric-num" id="hub-vultr-accounts">0</div>
+                  <div class="hub-metric-title">Accounts</div>
+                </div>
+                <div class="hub-metric">
+                  <div class="hub-metric-num" id="hub-vultr-fips">0</div>
+                  <div class="hub-metric-title">Reserved IPs</div>
+                </div>
+              </div>
+              <div class="hub-account-chips" id="hub-vultr-account-chips">
+                <span class="text-xs text-muted">No accounts loaded</span>
+              </div>
+              <div class="hub-card-footer">
+                <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); openDeployModalForProvider('vultr')">+ Deploy on Vultr</button>
+                <span class="text-xs text-secondary font-mono">View Hub ➔</span>
+              </div>
+            </div>
+
+            <!-- Linode Card -->
+            <div class="provider-hub-card linode" data-jump-tab="tab-linode">
+              <div class="hub-card-header">
+                <div class="hub-brand-badge">
+                  <img src="/ui/assets/linode.svg" alt="Linode" class="hub-provider-logo">
+                  <div>
+                    <div class="hub-provider-name">Linode / Akamai</div>
+                    <span class="badge badge-linode">Cloud Compute</span>
+                  </div>
+                </div>
+                <div class="hub-arrow-btn">➔</div>
+              </div>
+              <div class="hub-metrics-row">
+                <div class="hub-metric">
+                  <div class="hub-metric-num" id="hub-linode-servers">0</div>
+                  <div class="hub-metric-title">Instances</div>
+                </div>
+                <div class="hub-metric">
+                  <div class="hub-metric-num" id="hub-linode-accounts">0</div>
+                  <div class="hub-metric-title">Accounts</div>
+                </div>
+                <div class="hub-metric">
+                  <div class="hub-metric-num">-</div>
+                  <div class="hub-metric-title">Standard IPs</div>
+                </div>
+              </div>
+              <div class="hub-account-chips" id="hub-linode-account-chips">
+                <span class="text-xs text-muted">No accounts loaded</span>
+              </div>
+              <div class="hub-card-footer">
+                <button class="btn btn-secondary btn-sm" onclick="event.stopPropagation(); openDeployModalForProvider('linode')">+ Deploy on Linode</button>
+                <span class="text-xs text-secondary font-mono">View Hub ➔</span>
+              </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== TAB: ACCOUNT MANAGEMENT ==================== -->
+        <section class="tab-pane" id="tab-accounts">
+          <div class="provider-banner mb-4">
+            <div class="provider-banner-left">
+              <div class="banner-icon-badge">👥</div>
+              <div>
+                <h2 class="provider-banner-title">Cloud Accounts</h2>
+              </div>
+            </div>
+            <div class="provider-banner-actions">
+              <button class="btn btn-warning" id="btn-auto-heal-accounts" onclick="runAutoHealProxies()" title="Automatically find and bind working proxies for all accounts with errors">
+                <span>🛠️ Auto-Fix Failed Proxies</span>
+              </button>
+              <button class="btn btn-secondary" id="btn-refresh-all-billing" onclick="refreshAllBillingDetails()">
+                <span id="refresh-billing-icon">🔄</span>
+                <span>Refresh Live Details</span>
+              </button>
+              <button class="btn btn-primary" onclick="openAddAccountModal()">
+                <span>+ Add Cloud Account</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Accounts Filter & Actions Toolbar -->
+          <div class="section-toolbar mb-4">
+            <div class="pill-filter-group" id="account-provider-filters">
+              <button class="pill-filter active" data-filter="all" onclick="filterAccountsByProvider('all')">All (<span id="filter-acc-count-all">0</span>)</button>
+              <button class="pill-filter" data-filter="hetzner" onclick="filterAccountsByProvider('hetzner')">Hetzner (<span id="filter-acc-count-hetzner">0</span>)</button>
+              <button class="pill-filter" data-filter="vultr" onclick="filterAccountsByProvider('vultr')">Vultr (<span id="filter-acc-count-vultr">0</span>)</button>
+              <button class="pill-filter" data-filter="linode" onclick="filterAccountsByProvider('linode')">Linode (<span id="filter-acc-count-linode">0</span>)</button>
+            </div>
+            <div class="flex items-center gap-2">
+              <input type="text" class="input-search-sm" id="search-accounts-input" oninput="filterAccountsList()" placeholder="Filter by label, ID, region, proxy...">
+            </div>
+          </div>
+
+          <!-- Accounts Master Container -->
+          <div class="accounts-master-container" id="accounts-master-grid">
+            <div class="text-secondary text-sm py-8 text-center">Loading accounts from database...</div>
+          </div>
+        </section>
+
+        <!-- ==================== TAB: PROXY POOL & MANAGEMENT ==================== -->
+        <section class="tab-pane" id="tab-proxies">
+          <div class="provider-banner">
+            <div class="provider-banner-left">
+              <div class="banner-icon-badge">🛡️</div>
+              <div>
+                <h2 class="provider-banner-title">Proxy Pool & Management</h2>
+              </div>
+            </div>
+            <div class="provider-banner-actions">
+              <button class="btn btn-warning" id="btn-auto-heal-proxies" onclick="runAutoHealProxies()" title="Automatically find and bind working proxies for all accounts with errors">
+                <span>🛠️ Auto-Fix Failed Proxies</span>
+              </button>
+              <button class="btn btn-secondary" id="btn-bulk-import-sessions" onclick="openBulkSessionsModal()" title="Bulk import proxies and automatically parse session IDs">
+                <span>📥 Bulk Import Sessions</span>
+              </button>
+              <button class="btn btn-secondary" id="btn-open-check-proxy" onclick="openTestProxyModal()" title="Test and verify any proxy address or account route">
+                <span>🔍 Check Proxy</span>
+              </button>
+              <button class="btn btn-primary" onclick="openAddProxyProviderModal()">
+                <span>+ Add Rotating Proxy Pool</span>
+              </button>
+            </div>
+          </div>
+
+          <!-- Proxy Metrics Ribbon -->
+          <div class="stats-grid mb-6">
+            <div class="stat-card">
+              <div class="stat-card-header">
+                <span class="stat-card-label">Active Rotating Pools</span>
+                <span class="stat-card-icon">🌐</span>
+              </div>
+              <div class="stat-card-value text-primary" id="proxy-stat-providers">0</div>
+              <div class="stat-card-subtext">Configured upstream pools</div>
+            </div>
+
+            <div class="stat-card">
+              <div class="stat-card-header">
+                <span class="stat-card-label">Total Rotating Sessions</span>
+                <span class="stat-card-icon">🔄</span>
+              </div>
+              <div class="stat-card-value text-success" id="proxy-stat-sessions">0</div>
+              <div class="stat-card-subtext">Unique egress tunnels</div>
+            </div>
+
+            <div class="stat-card">
+              <div class="stat-card-header">
+                <span class="stat-card-label">Accounts Protected</span>
+                <span class="stat-card-icon">🔐</span>
+              </div>
+              <div class="stat-card-value text-primary" id="proxy-stat-accounts">0</div>
+              <div class="stat-card-subtext">Bound to dedicated proxy route</div>
+            </div>
+
+            <div class="stat-card">
+              <div class="stat-card-header">
+                <span class="stat-card-label">Average Egress Latency</span>
+                <span class="stat-card-icon">⚡</span>
+              </div>
+              <div class="stat-card-value text-primary" id="proxy-stat-latency">—</div>
+              <div class="stat-card-subtext">Across tested routes</div>
+            </div>
+          </div>
+
+          <!-- Section: Rotating Proxy Pools -->
+          <div class="section-heading-row">
+            <div>
+              <h3 class="section-title">Rotating Proxy Pools</h3>
+            </div>
+          </div>
+          <div class="proxy-providers-grid mb-8" id="proxy-providers-grid">
+            <div class="text-secondary text-sm py-6">Loading proxy providers...</div>
+          </div>
+
+          <!-- Section: Account Direct Proxy Bindings -->
+          <div class="section-heading-row">
+            <div>
+              <h3 class="section-title">Cloud Account Proxies</h3>
+            </div>
+            <div class="flex items-center gap-2">
+              <button class="btn btn-secondary btn-sm" id="btn-check-all-proxies" onclick="checkAllAccountProxies(this)" title="Test connectivity and latency for all account proxies">
+                <span>⚡ Check All Proxies</span>
+              </button>
+            </div>
+          </div>
+
+          <div class="data-table-container">
+            <div class="table-responsive">
+              <table class="data-table" id="account-proxies-table">
+                <thead>
+                  <tr>
+                    <th>Cloud Account</th>
+                    <th>Provider</th>
+                    <th>Proxy</th>
+                    <th>IP Family</th>
+                    <th>Proxy Status & Latency</th>
+                    <th class="text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="account-proxies-tbody">
+                  <tr>
+                    <td colspan="6" class="text-center py-6 text-secondary">Loading account routes...</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== TAB 2: HETZNER CLOUD HUB ==================== -->
+        <section class="tab-pane" id="tab-hetzner">
+          <div class="provider-banner">
+            <div class="provider-banner-left">
+              <img src="/ui/assets/hetzner.svg" alt="Hetzner" class="provider-banner-logo">
+              <div>
+                <h2 class="provider-banner-title">Hetzner Cloud Hub</h2>
+              </div>
+            </div>
+            <div class="provider-banner-actions">
+              <button class="btn btn-secondary" onclick="openAddAccountModalFor('hetzner')">+ Add Hetzner Account</button>
+              <button class="btn btn-primary" onclick="openDeployModalForProvider('hetzner')">🚀 Deploy Hetzner Instance</button>
+            </div>
+          </div>
+
+          <!-- Hetzner Accounts View (Default) -->
+          <div id="hetzner-accounts-view">
+            <div class="section-heading-row">
+              <div>
+                <h3 class="section-title">Hetzner Cloud Accounts</h3>
+                <p class="text-xs text-secondary mt-0.5">Click any account to view and manage its cloud instances</p>
+              </div>
+              <div id="hetzner-summary-stats" class="flex items-center gap-2 flex-wrap"></div>
+            </div>
+            <div class="accounts-cards-grid" id="hetzner-accounts-grid">
+              <div class="text-secondary text-sm">Loading Hetzner accounts...</div>
+            </div>
+          </div>
+
+          <!-- Hetzner Account Instances Drilldown View (Shown on Account Click) -->
+          <div id="hetzner-servers-view" style="display: none;"></div>
+        </section>
+
+        <!-- ==================== TAB 3: VULTR CLOUD HUB ==================== -->
+        <section class="tab-pane" id="tab-vultr">
+          <div class="provider-banner">
+            <div class="provider-banner-left">
+              <img src="/ui/assets/vultr.svg" alt="Vultr" class="provider-banner-logo">
+              <div>
+                <h2 class="provider-banner-title">Vultr Cloud Hub</h2>
+              </div>
+            </div>
+            <div class="provider-banner-actions">
+              <button class="btn btn-secondary" onclick="openAddAccountModalFor('vultr')">+ Add Vultr Account</button>
+              <button class="btn btn-primary" onclick="openDeployModalForProvider('vultr')">🚀 Deploy Vultr Instance</button>
+            </div>
+          </div>
+
+          <!-- Vultr Accounts View (Default) -->
+          <div id="vultr-accounts-view">
+            <div class="section-heading-row">
+              <div>
+                <h3 class="section-title">Vultr Accounts</h3>
+                <p class="text-xs text-secondary mt-0.5">Click any account to view and manage its cloud instances</p>
+              </div>
+              <div id="vultr-summary-stats" class="flex items-center gap-2 flex-wrap"></div>
+            </div>
+            <div class="accounts-cards-grid" id="vultr-accounts-grid">
+              <div class="text-secondary text-sm">Loading Vultr accounts...</div>
+            </div>
+          </div>
+
+          <!-- Vultr Account Instances Drilldown View (Shown on Account Click) -->
+          <div id="vultr-servers-view" style="display: none;"></div>
+        </section>
+
+        <!-- ==================== TAB 4: LINODE CLOUD HUB ==================== -->
+        <section class="tab-pane" id="tab-linode">
+          <div class="provider-banner">
+            <div class="provider-banner-left">
+              <img src="/ui/assets/linode.svg" alt="Linode" class="provider-banner-logo">
+              <div>
+                <h2 class="provider-banner-title">Linode / Akamai Cloud Hub</h2>
+              </div>
+            </div>
+            <div class="provider-banner-actions">
+              <button class="btn btn-secondary" onclick="openAddAccountModalFor('linode')">+ Add Linode Account</button>
+              <button class="btn btn-primary" onclick="openDeployModalForProvider('linode')">🚀 Deploy Linode Instance</button>
+            </div>
+          </div>
+
+          <!-- Linode Accounts View (Default) -->
+          <div id="linode-accounts-view">
+            <div class="section-heading-row">
+              <div>
+                <h3 class="section-title">Linode Accounts</h3>
+                <p class="text-xs text-secondary mt-0.5">Click any account to view and manage its cloud instances</p>
+              </div>
+              <div id="linode-summary-stats" class="flex items-center gap-2 flex-wrap"></div>
+            </div>
+            <div class="accounts-cards-grid" id="linode-accounts-grid">
+              <div class="text-secondary text-sm">Loading Linode accounts...</div>
+            </div>
+          </div>
+
+          <!-- Linode Account Instances Drilldown View (Shown on Account Click) -->
+          <div id="linode-servers-view" style="display: none;"></div>
+        </section>
+
+        <!-- ==================== TAB 5: ALL COMPUTE ==================== -->
+        <section class="tab-pane" id="tab-compute">
+          <div class="section-heading-row">
+            <div>
+              <h2 class="section-title">All Compute Instances</h2>
+            </div>
+            <div class="flex gap-2">
+              <select id="filter-all-provider" class="select-input text-xs" style="width:160px">
+                <option value="all">All Providers</option>
+                <option value="hetzner">Hetzner Cloud</option>
+                <option value="vultr">Vultr</option>
+                <option value="linode">Linode</option>
+              </select>
+            </div>
+          </div>
+
+          <!-- Bulk Actions Toolbar for Compute Instances -->
+          <div id="compute-bulk-bar" class="bulk-actions-toolbar" style="display: none;">
+            <div class="flex items-center gap-2">
+              <span class="bulk-count-badge" id="compute-bulk-count">0</span>
+              <span class="text-sm font-medium">instances selected</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="clearServerSelection()">Deselect All</button>
+              <button type="button" class="btn btn-danger btn-sm" id="btn-compute-bulk-delete" onclick="deleteSelectedServers(this)">
+                🗑️ Delete Selected Instances (<span id="compute-bulk-btn-count">0</span>)
+              </button>
+            </div>
+          </div>
+
+          <div class="data-table-container">
+            <div class="table-responsive">
+              <table class="data-table" id="all-compute-table">
+                <thead>
+                  <tr>
+                    <th style="width: 38px; text-align: center;">
+                      <input type="checkbox" id="cb-all-compute-select-all" class="cb-select-all" onchange="toggleSelectAllInView(this, 'all-compute-tbody')" title="Select all visible instances">
+                    </th>
+                    <th>Instance Name</th>
+                    <th>Status</th>
+                    <th>Provider & Account</th>
+                    <th>Location</th>
+                    <th>Primary IP</th>
+                    <th>Attached Floating IP</th>
+                    <th>Plan</th>
+                    <th class="text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="all-compute-tbody">
+                  <tr><td colspan="9" class="text-center py-8 text-secondary">Loading instances...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== TAB 6: IP MANAGEMENT ==================== -->
+        <section class="tab-pane" id="tab-ips">
+          <div class="section-heading-row">
+            <div>
+              <h2 class="section-title">IP Management</h2>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-alloc-ip-tab">+ Allocate New Floating IP</button>
+          </div>
+
+          <!-- Account Filter Pills for IP Management -->
+          <div class="ips-account-filter-pills" id="ips-account-filter-pills">
+            <!-- Dynamically populated: [ All Accounts ] [ Hetzner: ... ] [ Vultr: ... ] -->
+          </div>
+
+          <!-- Bulk Actions Toolbar for IPs -->
+          <div id="ips-bulk-bar" class="bulk-actions-toolbar mb-4" style="display: none;">
+            <div class="flex items-center gap-2">
+              <span class="bulk-count-badge" id="ips-bulk-count">0</span>
+              <span class="text-sm font-medium">IPs selected</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="clearIpSelection()">Deselect All</button>
+              <button type="button" class="btn btn-danger btn-sm" id="btn-ips-bulk-delete" onclick="deleteSelectedIps(this)">
+                🗑️ Delete Selected IPs (<span id="ips-bulk-btn-count">0</span>)
+              </button>
+            </div>
+          </div>
+
+          <!-- Section 1: Floating & Reserved IPs -->
+          <div class="hetzner-ip-section-card" id="ips-floating-section">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div class="flex items-center gap-2">
+                <span class="text-base font-bold text-primary">🌐 Floating & Reserved IPs</span>
+                <span class="badge badge-secondary text-xs" id="floating-ips-count-badge">0</span>
+              </div>
+              <span class="text-xs text-secondary">Routable virtual IPs that can move between cloud instances</span>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table" id="ips-table">
+                <thead>
+                  <tr>
+                    <th style="width: 38px; text-align: center;"><input type="checkbox" id="cb-select-all-fips" class="checkbox-input" onchange="toggleSelectAllIpsInTable(this, 'ips-tbody')"></th>
+                    <th>IP Address / Subnet</th>
+                    <th>Type</th>
+                    <th>Provider & Account</th>
+                    <th>Location</th>
+                    <th>Assigned Server</th>
+                    <th>Reverse DNS (PTR)</th>
+                    <th class="text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="ips-tbody">
+                  <tr><td colspan="8" class="text-center py-8 text-secondary">Loading floating IPs...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          <!-- Section 2: Hetzner Primary IPs (Separate Section) -->
+          <div class="hetzner-ip-section-card" id="hetzner-primary-ips-wrapper">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div class="flex items-center gap-2">
+                <span class="text-base font-bold text-primary">🏷️ Hetzner Primary IPs</span>
+                <span class="badge badge-hetzner text-xs" id="primary-ips-count-badge">0</span>
+              </div>
+              <span class="text-xs text-secondary">Fixed interface network IPs allocated directly to Hetzner cloud servers</span>
+            </div>
+            <div class="table-responsive">
+              <table class="data-table" id="primary-ips-table">
+                <thead>
+                  <tr>
+                    <th style="width: 38px; text-align: center;"><input type="checkbox" id="cb-select-all-pips" class="checkbox-input" onchange="toggleSelectAllIpsInTable(this, 'primary-ips-tbody')"></th>
+                    <th>IP Address</th>
+                    <th>Type</th>
+                    <th>Account</th>
+                    <th>Datacenter</th>
+                    <th>Assigned Server</th>
+                    <th>Auto Delete</th>
+                    <th class="text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="primary-ips-tbody">
+                  <tr><td colspan="8" class="text-center py-8 text-secondary">Loading primary IPs...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== TAB 7: SSH KEY VAULT ==================== -->
+        <section class="tab-pane" id="tab-ssh">
+          <div class="section-heading-row">
+            <div>
+              <h2 class="section-title">SSH Key Vault</h2>
+            </div>
+            <div class="flex gap-2">
+              <button class="btn btn-secondary btn-sm" id="btn-generate-key-modal">⚡ Generate Ed25519 Key</button>
+              <button class="btn btn-primary btn-sm" id="btn-add-ssh-key-modal">+ Add Public Key</button>
+            </div>
+          </div>
+
+          <div class="data-table-container">
+            <div class="table-responsive">
+              <table class="data-table" id="ssh-keys-table">
+                <thead>
+                  <tr>
+                    <th>Key Name</th>
+                    <th>Fingerprint (SHA-256)</th>
+                    <th>Public Key Preview</th>
+                    <th>Added Date</th>
+                    <th class="text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="ssh-keys-tbody">
+                  <tr><td colspan="5" class="text-center py-8 text-secondary">Loading SSH keys...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== TAB 8: CLOUDFLARE DNS ==================== -->
+        <section class="tab-pane" id="tab-dns">
+          <div class="section-heading-row">
+            <div>
+              <h2 class="section-title">Cloudflare DNS Management</h2>
+            </div>
+            <div class="flex items-center gap-3">
+              <select id="select-dns-zone" class="select-input text-xs" style="width:200px">
+                <option value="">Select Zone...</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="data-table-container">
+            <div class="table-responsive">
+              <table class="data-table" id="dns-records-table">
+                <thead>
+                  <tr>
+                    <th>Hostname (Name)</th>
+                    <th>Type</th>
+                    <th>Content (IP Target)</th>
+                    <th>Proxy Status</th>
+                    <th>TTL</th>
+                    <th class="text-right">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="dns-records-tbody">
+                  <tr><td colspan="6" class="text-center py-8 text-secondary">Select a zone to view DNS records</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <!-- ==================== TAB 9: WATCHDOG & TUNNELS ==================== -->
+        <section class="tab-pane" id="tab-watchdog">
+          <div class="section-heading-row">
+            <div>
+              <h2 class="section-title">Watchdog Probing & Tunnels</h2>
+            </div>
+          </div>
+
+          <div class="stats-grid mb-6">
+            <div class="stat-card">
+              <div class="stat-card-header">
+                <span class="stat-card-label">Watchdog Probing</span>
+                <span class="stat-card-icon">📡</span>
+              </div>
+              <div class="stat-card-value" id="watchdog-state">Active</div>
+              <div class="stat-card-subtext" id="watchdog-last-probe">Probing configs from Iran</div>
+            </div>
+            <div class="stat-card">
+              <div class="stat-card-header">
+                <span class="stat-card-label">Registered Tunnels</span>
+                <span class="stat-card-icon">🚇</span>
+              </div>
+              <div class="stat-card-value" id="stat-tunnels-count">0</div>
+              <div class="stat-card-subtext">Active GRE & Paytun tunnels</div>
+            </div>
+          </div>
+
+          <div class="data-table-container">
+            <div class="table-responsive">
+              <table class="data-table" id="tunnels-table">
+                <thead>
+                  <tr>
+                    <th>Tunnel ID</th>
+                    <th>Type</th>
+                    <th>Foreign Endpoint</th>
+                    <th>Iran Relay</th>
+                    <th>Forwarded Ports</th>
+                  </tr>
+                </thead>
+                <tbody id="tunnels-tbody">
+                  <tr><td colspan="5" class="text-center py-8 text-secondary">Loading tunnels...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+      </div>
+    </main>
+  </div>
+
+  <!-- ==================== MODALS ==================== -->
+
+  <!-- Modal: Deploy Server Wizard -->
+  <div class="modal-backdrop" id="modal-deploy-server">
+    <div class="modal-box modal-lg">
+      <div class="modal-header">
+        <h3 class="modal-title">Deploy Cloud Instance</h3>
+        <button class="modal-close" data-close="modal-deploy-server">&times;</button>
+      </div>
+      <form id="form-deploy-server">
+        <div class="modal-body">
+          <!-- Step 1: Select Cloud Provider visually -->
+          <div class="form-group">
+            <label class="form-label">1. Choose Cloud Provider</label>
+            <div class="provider-picker-grid">
+              <div class="provider-picker-btn active" data-prov="hetzner">
+                <img src="/ui/assets/hetzner.svg" alt="Hetzner" class="provider-picker-logo">
+                <span class="provider-picker-name">Hetzner Cloud</span>
+              </div>
+              <div class="provider-picker-btn" data-prov="vultr">
+                <img src="/ui/assets/vultr.svg" alt="Vultr" class="provider-picker-logo">
+                <span class="provider-picker-name">Vultr</span>
+              </div>
+              <div class="provider-picker-btn" data-prov="linode">
+                <img src="/ui/assets/linode.svg" alt="Linode" class="provider-picker-logo">
+                <span class="provider-picker-name">Linode</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Step 2: Select Cloud Account -->
+          <div class="form-group">
+            <label class="form-label">2. Target Cloud Account</label>
+            <select id="deploy-account-select" class="select-input" required>
+              <option value="">Select Account...</option>
+            </select>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <!-- Region Selection -->
+            <div class="form-group">
+              <label class="form-label">3. Region / Datacenter</label>
+              <select id="deploy-region-select" class="select-input" required disabled>
+                <option value="">Choose region...</option>
+              </select>
+            </div>
+
+            <!-- Hardware Plan Selection -->
+            <div class="form-group">
+              <label class="form-label">4. Hardware Plan</label>
+              <select id="deploy-plan-select" class="select-input" required disabled>
+                <option value="">Choose plan...</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <!-- OS Image -->
+            <div class="form-group">
+              <label class="form-label">5. Operating System</label>
+              <select id="deploy-image-select" class="select-input" required disabled>
+                <option value="">Choose image...</option>
+              </select>
+            </div>
+
+            <!-- Server Label / Hostname -->
+            <div class="form-group">
+              <label class="form-label">6. Server Hostname / Label Prefix</label>
+              <input type="text" id="deploy-name-input" class="text-input" placeholder="e.g. node-01" required oninput="updateDeployCountPreview()">
+              <div class="text-xs text-muted mt-1">Start & end with letters/digits (e.g. <code>node-01</code>). For batch, numbers will increment.</div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 gap-4">
+            <!-- Attach SSH Key -->
+            <div class="form-group">
+              <label class="form-label">7. SSH Key (Recommended)</label>
+              <select id="deploy-ssh-select" class="select-input">
+                <option value="">Auto-inject all vault SSH keys</option>
+              </select>
+            </div>
+
+            <!-- Server Quantity / Count -->
+            <div class="form-group">
+              <label class="form-label">8. Quantity (Batch Deploy)</label>
+              <div class="flex items-center gap-2">
+                <input type="number" id="deploy-count-input" class="text-input" min="1" max="10" value="1" style="width: 80px;" required oninput="updateDeployCountPreview()">
+                <span class="text-xs text-secondary" id="deploy-count-hint">Deploy 1 instance</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Hetzner Network Configuration (IPv6 disabled by default) -->
+          <div class="form-group" id="deploy-hetzner-options" style="display: none; margin-top: 0.5rem;">
+            <label class="form-label">9. Hetzner Network Configuration</label>
+            <div class="flex items-center gap-2 p-2.5 rounded" style="background: var(--bg-surface); border: 1px solid var(--border-subtle);">
+              <input type="checkbox" id="deploy-enable-ipv6" style="cursor: pointer; width: 16px; height: 16px;">
+              <label for="deploy-enable-ipv6" class="text-sm font-medium cursor-pointer" style="margin: 0; user-select: none;">
+                Enable Public IPv6
+              </label>
+              <span class="text-xs text-secondary">(Disabled by default for Hetzner to avoid unwanted subnets/costs)</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-deploy-server">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-deploy">
+            <span>Deploy Instance</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Allocate Floating IP -->
+  <div class="modal-backdrop" id="modal-alloc-ip">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Allocate Floating / Reserved IP</h3>
+        <button class="modal-close" data-close="modal-alloc-ip">&times;</button>
+      </div>
+      <form id="form-alloc-ip">
+        <div class="modal-body">
+          <div id="alloc-form-fields">
+            <div class="form-group">
+              <label class="form-label">Cloud Account</label>
+              <select id="alloc-account-select" class="select-input" required>
+                <option value="">Select Account...</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">IP Family</label>
+              <select id="alloc-type-select" class="select-input" required>
+                <option value="ipv4">IPv4 (Single Public Address)</option>
+                <option value="ipv6">IPv6 (/64 Network)</option>
+              </select>
+            </div>
+
+            <div class="form-group">
+              <label class="form-label">Attach Directly to Server (Optional)</label>
+              <select id="alloc-server-select" class="select-input">
+                <option value="">Keep unassigned (allocate to pool)</option>
+              </select>
+            </div>
+
+            <div class="form-group" id="alloc-location-wrap">
+              <label class="form-label">Home Location (for unassigned Hetzner IPs)</label>
+              <select id="alloc-location-select" class="select-input">
+                <option value="fsn1">Falkenstein (fsn1)</option>
+                <option value="nbg1">Nuremberg (nbg1)</option>
+                <option value="hel1">Helsinki (hel1)</option>
+                <option value="ash">Ashburn, USA (ash)</option>
+              </select>
+            </div>
+          </div>
+          <div id="alloc-progress" style="display: none;" class="fip-modal-state py-6 text-center">
+            <div class="btn-spinner mb-3" style="width: 2.2rem; height: 2.2rem; border-width: 3px; display: inline-block;"></div>
+            <div id="alloc-progress-msg" class="text-base font-semibold text-primary">🌐 Contacting cloud provider...</div>
+            <div class="text-xs text-muted mt-1">Allocating dedicated IP and configuring routing tables...</div>
+          </div>
+          <div id="alloc-success" style="display: none;" class="fip-modal-state py-2 text-center">
+          </div>
+        </div>
+
+        <div class="modal-footer" id="alloc-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-alloc-ip" id="btn-cancel-alloc-ip">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-alloc-ip">
+            <span>Allocate IP</span>
+          </button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Attach Floating IP -->
+  <div class="modal-backdrop" id="modal-attach-fip">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Attach Floating IP to Instance</h3>
+        <button class="modal-close" data-close="modal-attach-fip">&times;</button>
+      </div>
+      <form id="form-attach-fip">
+        <input type="hidden" id="attach-fip-id">
+        <input type="hidden" id="attach-fip-acc-id">
+        <div class="modal-body">
+          <p class="text-sm text-secondary mb-4">Select the target server to route traffic for <code id="attach-fip-label" class="text-primary font-mono font-bold"></code>:</p>
+          <div class="form-group">
+            <label class="form-label">Target Server</label>
+            <select id="attach-target-server-select" class="select-input" required>
+              <option value="">Select server...</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-attach-fip">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-attach-fip">Confirm Attach</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: OS Configuration Helper -->
+  <div class="modal-backdrop" id="modal-os-config">
+    <div class="modal-box modal-lg">
+      <div class="modal-header">
+        <h3 class="modal-title">Guest OS Network Configuration</h3>
+        <button class="modal-close" data-close="modal-os-config">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-sm text-secondary mb-3">Floating IPs route traffic to your instance, but the guest Linux OS must have the address configured on its network interface to accept incoming packets.</p>
+        
+        <div class="form-group">
+          <label class="form-label font-bold">Temporary Activation (lost at reboot):</label>
+          <div class="code-copy-box">
+            <code id="os-config-cmd" class="font-mono text-sm text-primary"></code>
+            <button class="btn btn-sm btn-secondary copy-btn" data-copy-target="os-config-cmd">Copy</button>
+          </div>
+        </div>
+
+        <div class="form-group mt-4">
+          <label class="form-label font-bold">Persistent Netplan Configuration (Ubuntu/Debian):</label>
+          <div class="code-copy-box">
+            <pre id="os-config-netplan" class="font-mono text-xs text-secondary"></pre>
+            <button class="btn btn-sm btn-secondary copy-btn" data-copy-target="os-config-netplan">Copy</button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-close="modal-os-config">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Add SSH Key -->
+  <div class="modal-backdrop" id="modal-add-ssh">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Add Public SSH Key</h3>
+        <button class="modal-close" data-close="modal-add-ssh">&times;</button>
+      </div>
+      <form id="form-add-ssh">
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label">Key Name / Identifier</label>
+            <input type="text" id="ssh-key-name" class="text-input" placeholder="e.g. macbook-pro-ed25519" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Public Key (OpenSSH format)</label>
+            <textarea id="ssh-public-key" class="text-input font-mono" rows="4" placeholder="ssh-ed25519 AAAAC3NzaC1lZDI1NTE5..." required></textarea>
+          </div>
+          <div class="form-group">
+            <label class="checkbox-container">
+              <input type="checkbox" id="ssh-sync-providers" checked>
+              <span class="checkbox-mark"></span>
+              <span class="text-sm text-secondary">Auto-sync key into all connected cloud provider accounts</span>
+            </label>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-add-ssh">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-add-ssh">Save Key</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Generate Ed25519 Keypair -->
+  <div class="modal-backdrop" id="modal-gen-key">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Generate In-Browser Ed25519 Keypair</h3>
+        <button class="modal-close" data-close="modal-gen-key">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-sm text-secondary mb-4">Keys are generated locally using browser WebCrypto cryptography. The private key never leaves your machine.</p>
+        
+        <div class="form-group">
+          <label class="form-label">Key Identifier</label>
+          <input type="text" id="gen-key-name" class="text-input" placeholder="e.g. devops-primary-key" value="cloudbot-admin-key">
+        </div>
+
+        <div id="gen-key-results" class="hidden">
+          <div class="form-group">
+            <label class="form-label text-success font-bold">Public Key (Saved to Vault):</label>
+            <div class="code-copy-box">
+              <code id="gen-public-key" class="font-mono text-xs"></code>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label text-danger font-bold">Private Key (Download & Keep Safe):</label>
+            <button type="button" class="btn btn-secondary btn-block" id="btn-download-privkey">
+              <span>💾 Download Private Key (id_ed25519)</span>
+            </button>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-close="modal-gen-key">Close</button>
+        <button type="button" class="btn btn-primary" id="btn-run-generate-key">Generate Keypair</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Add Cloud Account -->
+  <div class="modal-backdrop" id="modal-add-account">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Add Cloud Provider Account</h3>
+        <button class="modal-close" data-close="modal-add-account">&times;</button>
+      </div>
+      <form id="form-add-account">
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label">Cloud Provider</label>
+            <select id="acc-provider" class="select-input" required>
+              <option value="hetzner">Hetzner Cloud</option>
+              <option value="vultr">Vultr</option>
+              <option value="linode">Linode / Akamai</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Account Label</label>
+            <input type="text" id="acc-label" class="text-input" placeholder="e.g. hetzner-prod-01" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label">API Access Token</label>
+            <input type="password" id="acc-token" class="text-input font-mono" placeholder="Paste provider API token" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Account Country Code (e.g. DE, UAE, NL, US)</label>
+            <div class="flex items-center gap-2 mb-2">
+              <input type="text" id="acc-region" class="text-input uppercase font-mono font-bold text-base" maxlength="4" placeholder="e.g. DE, UAE, US" style="max-width: 130px; text-align: center; letter-spacing: 0.1em;">
+              <span id="add-acc-flag-preview" class="text-2xl">🌐</span>
+              <span class="text-xs text-secondary">Any 2-letter ISO or UAE</span>
+            </div>
+            <div class="flex flex-wrap gap-1">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('DE')">🇩🇪 DE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('NL')">🇳🇱 NL</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('US')">🇺🇸 US</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('AE')">🇦🇪 UAE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('GB')">🇬🇧 GB</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('SE')">🇸🇪 SE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('BR')">🇧🇷 BR</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('SK')">🇸🇰 SK</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setAddAccRegion('MY')">🇲🇾 MY</button>
+            </div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Egress Proxy Configuration (Optional)</label>
+            <div class="flex items-center gap-3 mb-2 flex-wrap">
+              <label class="radio-label flex items-center gap-1.5 cursor-pointer text-sm">
+                <input type="radio" name="add-acc-proxy-type" value="none" checked onchange="switchAddAccountProxyMode('none')">
+                <span>Direct (No Proxy)</span>
+              </label>
+              <label class="radio-label flex items-center gap-1.5 cursor-pointer text-sm">
+                <input type="radio" name="add-acc-proxy-type" value="pool" onchange="switchAddAccountProxyMode('pool')">
+                <span class="font-bold text-primary">⚡ Rotating Pool (By Region)</span>
+              </label>
+              <label class="radio-label flex items-center gap-1.5 cursor-pointer text-sm">
+                <input type="radio" name="add-acc-proxy-type" value="custom" onchange="switchAddAccountProxyMode('custom')">
+                <span>Custom Proxy</span>
+              </label>
+            </div>
+
+            <!-- Panel: Pool Allocation -->
+            <div id="add-acc-proxy-pool-panel" class="hidden p-3 bg-card border rounded mt-2">
+              <div class="flex items-center justify-between mb-1.5">
+                <label class="form-label text-xs font-bold text-secondary uppercase mb-0">Proxy Provider</label>
+                <span id="add-acc-proxy-pool-avail-badge" class="badge text-xs">Ready</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <select id="add-acc-proxy-provider-select" class="select-input text-sm flex-1" onchange="checkAddAccProxyAvailability()">
+                  <option value="auto">⚡ Auto (Best provider matching account region)</option>
+                </select>
+                <button type="button" class="btn btn-secondary btn-sm" onclick="checkAddAccProxyAvailability()">Check Avail</button>
+              </div>
+              <div id="add-acc-proxy-pool-hint" class="text-xs text-secondary mt-2 flex items-center gap-1.5">
+                <span>🌐 Will dynamically allocate an active proxy for region:</span>
+                <span id="add-acc-proxy-pool-region-badge" class="badge badge-primary font-mono text-xs font-bold">DE</span>
+              </div>
+              <div id="add-acc-proxy-pool-status" class="text-xs mt-1.5 hidden"></div>
+            </div>
+
+            <!-- Panel: Custom Proxy -->
+            <div id="add-acc-proxy-custom-panel" class="hidden mt-2">
+              <input type="text" id="acc-proxy" class="text-input font-mono text-sm" placeholder="e.g. 1.2.3.4:8080:user:pass or socks5://...">
+              <span class="text-xs text-secondary mt-1 block">Supported formats: <code>host:port:user:pass</code>, <code>http://...</code>, or <code>socks5://...</code></span>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-add-account">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-add-acc">Add Account</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Apply Linode Promo Code -->
+  <div class="modal-backdrop" id="modal-linode-promo">
+    <div class="modal-box" style="max-width: 480px;">
+      <div class="modal-header">
+        <div class="flex items-center gap-2">
+          <span class="text-xl">🎟</span>
+          <div>
+            <h3 class="modal-title font-bold text-base" id="linode-promo-modal-title">Apply Linode Promo Code</h3>
+            <div class="text-xs text-secondary" id="linode-promo-modal-subtitle">Add promotional credits to this Linode account</div>
+          </div>
+        </div>
+        <button class="modal-close" data-close="modal-linode-promo">&times;</button>
+      </div>
+      <form id="form-linode-promo">
+        <input type="hidden" id="linode-promo-acc-id">
+        <div class="modal-body">
+          <div class="p-3 mb-3 bg-card border rounded flex items-center justify-between">
+            <div class="flex items-center gap-2">
+              <img src="/ui/assets/linode.svg" width="20" height="20">
+              <span class="font-bold text-sm" id="linode-promo-acc-label">Linode Account</span>
+            </div>
+            <span class="badge text-xs font-mono" id="linode-promo-acc-id-badge">#ID</span>
+          </div>
+          <div class="form-group">
+            <label class="form-label font-bold text-sm">Promo Code</label>
+            <input type="text" id="linode-promo-code-input" class="text-input font-mono uppercase font-bold text-base" placeholder="e.g. DOCS100, LINODE100" required autofocus>
+            <span class="text-xs text-secondary mt-1 block">Enter your Akamai / Linode promotional credit voucher or code.</span>
+          </div>
+          <div id="linode-promo-result" class="hidden mt-3 p-3 bg-card border rounded text-xs"></div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-linode-promo">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-linode-promo">🎟 Apply Promo Code</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Reveal Server Password -->
+  <div class="modal-backdrop" id="modal-show-password">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Root Password Vault</h3>
+        <button class="modal-close" data-close="modal-show-password">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-sm text-secondary mb-3">Decrypted from the secure server secrets vault:</p>
+        <div class="code-copy-box">
+          <code id="revealed-password-text" class="font-mono text-base font-bold text-success">••••••••••••••••</code>
+          <button class="btn btn-sm btn-secondary copy-btn" data-copy-target="revealed-password-text">Copy</button>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-close="modal-show-password">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Login / Authentication -->
+  <div class="modal-backdrop" id="modal-auth-login">
+    <div class="modal-box modal-auth">
+      <div class="text-center mb-4">
+        <div class="brand-icon-wrap mx-auto mb-3" style="width:48px;height:48px;">
+          <svg viewBox="0 0 24 24" style="width:24px;height:24px;color:#fff"><path fill="currentColor" d="M19.35 10.04C18.67 6.59 15.64 4 12 4 9.11 4 6.6 5.64 5.35 8.04 2.34 8.36 0 10.91 0 14c0 3.31 2.69 6 6 6h13c2.76 0 5-2.24 5-5 0-2.64-2.05-4.78-4.65-4.96z"/></svg>
+        </div>
+        <h2 class="text-xl font-bold">Cloudbot Hosting Console</h2>
+        <p class="text-xs text-secondary mt-1">Sign in to manage your multi-cloud hosting infrastructure</p>
+      </div>
+
+      <div class="telegram-login-section mb-4">
+        <a href="https://t.me/vpnmanagerkiabot?start=login" target="_blank" class="btn btn-telegram btn-block" id="btn-tg-magic-link">
+          <img src="/ui/assets/telegram.svg" alt="Telegram" width="18" height="18">
+          <span>Sign In with Telegram</span>
+        </a>
+        <div id="telegram-widget-wrapper" class="telegram-widget-box mt-3"></div>
+      </div>
+
+      <div class="auth-divider">
+        <span>or sign in with Access Token</span>
+      </div>
+
+      <form id="form-auth-token">
+        <div class="form-group">
+          <label class="form-label">Owner Access Token</label>
+          <input type="password" id="auth-token-input" class="text-input font-mono" placeholder="Paste control_api.token">
+        </div>
+        <div class="form-group">
+          <label class="checkbox-container">
+            <input type="checkbox" id="auth-remember-token" checked>
+            <span class="checkbox-mark"></span>
+            <span class="text-xs text-secondary">Remember on this browser</span>
+          </label>
+        </div>
+        <button type="submit" class="btn btn-primary btn-block" id="btn-submit-auth">Access Console</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Edit / Assign Account Proxy -->
+  <div class="modal-backdrop" id="modal-edit-proxy">
+    <div class="modal-box" style="max-width: 540px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Account Proxy & Region</h3>
+        <button class="modal-close" data-close="modal-edit-proxy">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="edit-proxy-account-id">
+        <div class="mb-4 p-3 bg-surface rounded-md border border-subtle flex items-center justify-between">
+          <div>
+            <div class="text-xs text-secondary">Target Account</div>
+            <div class="font-bold text-primary" id="edit-proxy-account-label">—</div>
+          </div>
+          <div class="text-right">
+            <div class="text-xs text-secondary">Saved Region</div>
+            <div id="edit-proxy-account-current-region" class="font-bold text-primary">🌐 Auto</div>
+          </div>
+        </div>
+
+        <!-- Mode Toggle Tabs -->
+        <div class="pill-filter-group mb-4" id="proxy-mode-tabs">
+          <button type="button" class="pill-filter active" id="tab-btn-mode-pool" onclick="switchProxyMode('pool')">🔀 Rotating Pool</button>
+          <button type="button" class="pill-filter" id="tab-btn-mode-custom" onclick="switchProxyMode('custom')">✍️ Custom Proxy</button>
+          <button type="button" class="pill-filter" id="tab-btn-mode-direct" onclick="switchProxyMode('direct')">🌐 Direct</button>
+        </div>
+
+        <!-- Tab 1: Rotating Pool Provider -->
+        <form id="form-proxy-pool-assign" class="proxy-mode-panel">
+          <div class="form-group">
+            <label class="form-label">Rotating Pool Provider</label>
+            <select id="pool-assign-provider" class="select-input" required>
+              <!-- Loaded dynamically -->
+            </select>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Target Country Code (e.g. DE, UAE, NL, US, BR)</label>
+            <div class="flex items-center gap-2 mb-2">
+              <input type="text" id="pool-assign-country" class="text-input uppercase font-mono font-bold text-base" maxlength="4" placeholder="DE, UAE" required style="max-width: 130px; text-align: center; letter-spacing: 0.1em;">
+              <span id="pool-assign-flag-preview" class="text-2xl">🌐</span>
+              <span id="pool-assign-name-preview" class="text-xs text-secondary">Target pool country</span>
+            </div>
+            <div class="flex flex-wrap gap-1">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('DE')">🇩🇪 DE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('NL')">🇳🇱 NL</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('US')">🇺🇸 US</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('AE')">🇦🇪 UAE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('GB')">🇬🇧 GB</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('SE')">🇸🇪 SE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('BR')">🇧🇷 BR</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('SK')">🇸🇰 SK</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setPoolAssignCountry('MY')">🇲🇾 MY</button>
+            </div>
+          </div>
+
+          <div class="p-3 bg-surface rounded-md border border-subtle mb-4">
+            <div class="flex items-center justify-between">
+              <span class="text-xs text-secondary">Session Capacity</span>
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-check-pool-avail">Check Availability</button>
+            </div>
+            <div id="pool-avail-status" class="text-xs font-mono text-secondary mt-2">Ready to query session availability.</div>
+          </div>
+
+          <div class="modal-footer px-0 pb-0">
+            <button type="button" class="btn btn-secondary" data-close="modal-edit-proxy">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-submit-pool-assign">🔀 Allocate & Bind Session</button>
+          </div>
+        </form>
+
+        <!-- Tab 2: Custom Proxy -->
+        <form id="form-proxy-custom-assign" class="proxy-mode-panel" style="display: none;">
+          <div class="form-group">
+            <label class="form-label">Proxy (host:port:user:pass or socks5://...)</label>
+            <input type="text" id="custom-proxy-input" class="text-input font-mono" placeholder="e.g. socks5://user:pass@1.2.3.4:1080">
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">Account Country Code (e.g. DE, UAE, NL, US)</label>
+            <div class="flex items-center gap-2 mb-2">
+              <input type="text" id="custom-proxy-region" class="text-input uppercase font-mono font-bold text-base" maxlength="4" placeholder="e.g. DE, UAE" style="max-width: 130px; text-align: center; letter-spacing: 0.1em;">
+              <span id="custom-proxy-flag-preview" class="text-2xl">🌐</span>
+              <span id="custom-proxy-name-preview" class="text-xs text-secondary">Optional region tag</span>
+            </div>
+            <div class="flex flex-wrap gap-1">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setCustomProxyRegion('DE')">🇩🇪 DE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setCustomProxyRegion('NL')">🇳🇱 NL</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setCustomProxyRegion('US')">🇺🇸 US</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setCustomProxyRegion('AE')">🇦🇪 UAE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setCustomProxyRegion('GB')">🇬🇧 GB</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setCustomProxyRegion('SE')">🇸🇪 SE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setCustomProxyRegion('BR')">🇧🇷 BR</button>
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label class="form-label">IP Family</label>
+            <select id="custom-proxy-family" class="select-input">
+              <option value="default">Default (Dual-Stack)</option>
+              <option value="ipv4">IPv4 Only</option>
+              <option value="ipv6">IPv6 Only</option>
+            </select>
+          </div>
+
+          <div class="p-3 bg-surface rounded-md border border-subtle mb-4">
+            <div class="flex items-center justify-between">
+              <span class="text-xs text-secondary">Proxy Verification</span>
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-verify-custom-proxy">⚡ Test Proxy</button>
+            </div>
+            <div id="custom-proxy-test-result" class="text-xs font-mono text-secondary mt-2">Not tested yet.</div>
+          </div>
+
+          <div class="modal-footer px-0 pb-0">
+            <button type="button" class="btn btn-secondary" data-close="modal-edit-proxy">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btn-submit-custom-proxy">Save Custom Proxy</button>
+          </div>
+        </form>
+
+        <!-- Tab 3: Direct Connection -->
+        <div id="proxy-direct-panel" class="proxy-mode-panel" style="display: none;">
+          <div class="p-4 bg-surface rounded-md border border-subtle mb-4 text-center">
+            <div class="text-2xl mb-2">🌐</div>
+            <div class="font-bold text-primary mb-1">Direct Connection (No Proxy)</div>
+            <div class="text-xs text-secondary">API requests for this account will route directly through this server without a proxy.</div>
+          </div>
+
+          <div class="modal-footer px-0 pb-0">
+            <button type="button" class="btn btn-secondary" data-close="modal-edit-proxy">Cancel</button>
+            <button type="button" class="btn btn-warning" id="btn-submit-clear-proxy">Disconnect Proxy & Use Direct</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Quick Edit Account Region -->
+  <div class="modal-backdrop" id="modal-edit-region">
+    <div class="modal-box" style="max-width: 460px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Set Account Region</h3>
+        <button class="modal-close" data-close="modal-edit-region">&times;</button>
+      </div>
+      <form id="form-edit-account-region">
+        <div class="modal-body">
+          <input type="hidden" id="edit-region-account-id">
+          <div class="form-group">
+            <label class="form-label">Country Code (e.g. DE, UAE, NL, US)</label>
+            <div class="flex items-center gap-2 mb-2">
+              <input type="text" id="edit-region-select" class="text-input uppercase font-mono font-bold text-base" maxlength="4" placeholder="e.g. DE, UAE" required style="max-width: 130px; text-align: center; letter-spacing: 0.1em;">
+              <span id="edit-region-flag-preview" class="text-2xl">🌐</span>
+              <span id="edit-region-name-preview" class="text-xs text-secondary">Type 2-letter ISO or UAE</span>
+            </div>
+            <div class="text-xs text-tertiary mb-1">Quick Select:</div>
+            <div class="flex flex-wrap gap-1">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('DE')">🇩🇪 DE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('NL')">🇳🇱 NL</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('US')">🇺🇸 US</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('AE')">🇦🇪 UAE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('GB')">🇬🇧 GB</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('SE')">🇸🇪 SE</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('BR')">🇧🇷 BR</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('SK')">🇸🇰 SK</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('FR')">🇫🇷 FR</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('SG')">🇸🇬 SG</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('MY')">🇲🇾 MY</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('ID')">🇮🇩 ID</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('KR')">🇰🇷 KR</button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="setEditRegionCode('JP')">🇯🇵 JP</button>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-edit-region">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-save-account-region">Save Region</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Bulk Import Proxy Sessions -->
+  <div class="modal-backdrop" id="modal-add-proxy-sessions">
+    <div class="modal-box" style="max-width: 580px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Bulk Import Proxy Sessions</h3>
+        <button class="modal-close" data-close="modal-add-proxy-sessions">&times;</button>
+      </div>
+      <form id="form-add-proxy-sessions">
+        <div class="modal-body">
+          <div class="form-group">
+            <label class="form-label">Target Proxy Provider</label>
+            <select id="bulk-sessions-provider" class="select-input" required>
+              <!-- Loaded dynamically -->
+            </select>
+          </div>
+          <div class="form-group">
+            <div class="flex items-center justify-between mb-1">
+              <label class="form-label mb-0">Paste Proxies / Sessions (Any format)</label>
+              <span id="bulk-sessions-count-badge" class="badge badge-status-running text-xs">0 sessions detected</span>
+            </div>
+            <textarea id="bulk-sessions-input" class="textarea-input font-mono text-xs" rows="8" placeholder="Paste full proxy lines or raw session IDs, e.g.:
+eu.swiftproxy.net:7878:user_country_MY_sid_27369618_time_10:acou234KD
+eu.swiftproxy.net:7878:user_country_MY_sid_27369619_time_10:acou234KD
+or socks5://user-ssid-abc123:pass@host:port
+or plain session IDs (one per line)"></textarea>
+            <div class="text-xs text-secondary mt-1">
+              ✨ Automatic parser instantly extracts session IDs based on provider pattern (`sid_...`, `ssid_...`, credentials, or tokens).
+            </div>
+          </div>
+          <div class="p-3 bg-surface rounded-md border border-subtle mb-3">
+            <div class="text-xs text-tertiary mb-1">Live Extraction Preview:</div>
+            <div id="bulk-sessions-preview" class="font-mono text-xs text-primary max-h-24 overflow-y-auto">
+              Paste proxy lines above to preview extracted session tokens.
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-add-proxy-sessions">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-bulk-sessions">📥 Import Sessions to Pool</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Add Rotating Proxy Pool Provider -->
+  <div class="modal-backdrop" id="modal-add-proxy-provider">
+    <div class="modal-box modal-lg">
+      <div class="modal-header">
+        <h3 class="modal-title">Add Rotating Proxy Pool Provider</h3>
+        <button class="modal-close" data-close="modal-add-proxy-provider">&times;</button>
+      </div>
+      <form id="form-add-proxy-provider">
+        <div class="modal-body">
+          <div class="form-group mb-3">
+            <label class="form-label">Provider Pool Label</label>
+            <input type="text" id="proxy-provider-label" class="text-input" placeholder="e.g. Webshare SOCKS5 Pool, Swiftproxy Residential..." required>
+          </div>
+
+          <!-- Proxy Creation Mode Tabs -->
+          <div class="proxy-mode-tabs mb-3">
+            <button type="button" class="proxy-mode-tab active" data-proxy-mode="builder" onclick="switchProxyCreationMode('builder')">Guided Builder</button>
+            <button type="button" class="proxy-mode-tab" data-proxy-mode="url" onclick="switchProxyCreationMode('url')">Full URL Template</button>
+            <button type="button" class="proxy-mode-tab" data-proxy-mode="sample" onclick="switchProxyCreationMode('sample')">Auto-Detect from Sample</button>
+          </div>
+
+          <!-- Mode 1: Guided Form Builder -->
+          <div id="proxy-mode-builder-pane">
+            <div class="form-group mb-3">
+              <label class="form-label">Proxy Protocol / Type</label>
+              <div class="proxy-type-pill-group" id="builder-proxy-type-group">
+                <button type="button" class="proxy-type-pill active" data-scheme="http" onclick="selectProxyScheme('http')">HTTP</button>
+                <button type="button" class="proxy-type-pill" data-scheme="https" onclick="selectProxyScheme('https')">HTTPS</button>
+                <button type="button" class="proxy-type-pill" data-scheme="socks5" onclick="selectProxyScheme('socks5')">SOCKS5</button>
+                <button type="button" class="proxy-type-pill" data-scheme="socks4" onclick="selectProxyScheme('socks4')">SOCKS4</button>
+              </div>
+              <input type="hidden" id="builder-proxy-scheme" value="http">
+            </div>
+
+            <div class="grid grid-cols-3 gap-3 mb-3">
+              <div class="col-span-2">
+                <label class="form-label">Host / Gateway</label>
+                <input type="text" id="builder-proxy-host" class="text-input font-mono" placeholder="p.webshare.io or proxy.example.com" oninput="updateBuilderTemplatePreview()">
+              </div>
+              <div>
+                <label class="form-label">Port</label>
+                <input type="number" id="builder-proxy-port" class="text-input font-mono" placeholder="80" min="1" max="65535" oninput="updateBuilderTemplatePreview()">
+              </div>
+            </div>
+
+            <div class="form-group mb-3">
+              <div class="flex items-center justify-between mb-1">
+                <label class="form-label mb-0">Username Pattern</label>
+                <div class="flex items-center gap-1">
+                  <span class="text-xs text-muted">Insert token:</span>
+                  <button type="button" class="token-insert-pill" onclick="insertTokenToUsername('{country}')">+{country}</button>
+                  <button type="button" class="token-insert-pill" onclick="insertTokenToUsername('{session}')">+{session}</button>
+                </div>
+              </div>
+              <input type="text" id="builder-proxy-user" class="text-input font-mono" placeholder="e.g. user-{country}-{session} or token_country_{country}_sid_{session}_time_10" oninput="updateBuilderTemplatePreview()">
+              <div class="text-xs text-secondary mt-1">Must include <code class="text-primary">{country}</code> (ISO code) and <code class="text-primary">{session}</code> (session ID).</div>
+            </div>
+
+            <div class="form-group mb-3">
+              <label class="form-label">Password / Auth Secret</label>
+              <input type="password" id="builder-proxy-pass" class="text-input font-mono" placeholder="Proxy password or token" oninput="updateBuilderTemplatePreview()">
+            </div>
+          </div>
+
+          <!-- Mode 2: Full URL / Raw Template String -->
+          <div id="proxy-mode-url-pane" style="display: none;">
+            <div class="form-group mb-3">
+              <label class="form-label">Proxy Template Format</label>
+              <input type="text" id="proxy-provider-template" class="text-input font-mono" placeholder="socks5://user-{country}-{session}:password@p.webshare.io:1080">
+              <span class="text-xs text-secondary mt-1">Must contain <code class="text-primary">{country}</code> and <code class="text-primary">{session}</code>. Supported schemes: <code>http://</code>, <code>https://</code>, <code>socks5://</code>, <code>socks4://</code></span>
+            </div>
+          </div>
+
+          <!-- Mode 3: Auto-detect from Sample Lines -->
+          <div id="proxy-mode-sample-pane" style="display: none;">
+            <div class="form-group mb-3">
+              <label class="form-label">Paste 1-2 Sample Proxy Lines from Provider</label>
+              <textarea id="proxy-sample-lines-input" class="textarea-input font-mono text-xs" rows="3" placeholder="e.g.
+eu.swiftproxy.net:7878:user_country_MY_sid_27369618_time_10:mypassword
+eu.swiftproxy.net:7878:user_country_MY_sid_27369619_time_10:mypassword"></textarea>
+              <div class="flex items-center justify-between mt-2">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="parseSampleProxyLines()">⚡ Auto-Detect Pattern & Sessions</button>
+                <span class="text-xs text-secondary" id="proxy-sample-status"></span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Resulting Template Preview -->
+          <div class="p-3 bg-surface rounded-md border border-subtle mb-3">
+            <div class="text-xs text-tertiary mb-1">Generated Template Model:</div>
+            <div id="proxy-template-preview" class="font-mono text-xs text-primary truncate">
+              http://user-{country}-{session}:••••••@host:port
+            </div>
+          </div>
+
+          <!-- Session IDs input -->
+          <div class="form-group mb-3">
+            <label class="form-label">Initial Session IDs (Range or List)</label>
+            <input type="text" id="proxy-provider-sessions" class="text-input font-mono" placeholder="1-50 or sess1,sess2,sess3" required>
+            <span class="text-xs text-secondary mt-1">Examples: <code class="text-primary">1-50</code> (generates 50 sessions), or comma-separated tokens. You can also bulk import more later.</span>
+          </div>
+
+          <div class="form-group mb-2">
+            <label class="form-label">Address Family</label>
+            <select id="proxy-provider-family" class="select-input">
+              <option value="default">Default</option>
+              <option value="ipv4">IPv4</option>
+              <option value="ipv6">IPv6</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-add-proxy-provider">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-add-proxy-provider">+ Create Proxy Pool</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Manage Pool Sessions -->
+  <div class="modal-backdrop" id="modal-manage-proxy-sessions">
+    <div class="modal-box modal-xl">
+      <div class="modal-header">
+        <div>
+          <h3 class="modal-title">Manage Proxy Sessions</h3>
+          <div class="text-xs text-secondary mt-0.5" id="manage-sessions-subtitle">Pool: Loading...</div>
+        </div>
+        <button class="modal-close" data-close="modal-manage-proxy-sessions">&times;</button>
+      </div>
+      <div class="modal-body">
+        <!-- Stats Bar -->
+        <div class="session-stats-bar" id="manage-sessions-stats-bar">
+          <div class="session-stat-item">
+            <span class="text-secondary">Total Sessions:</span>
+            <span class="font-mono font-bold text-primary" id="stat-mng-total">0</span>
+          </div>
+          <div class="session-stat-item">
+            <span class="text-secondary">Active:</span>
+            <span class="font-mono font-bold text-success" id="stat-mng-active">0</span>
+          </div>
+          <div class="session-stat-item">
+            <span class="text-secondary">Bound to Accounts:</span>
+            <span class="font-mono font-bold text-warning" id="stat-mng-bound">0</span>
+          </div>
+          <div class="session-stat-item">
+            <span class="text-secondary">Upstream Protocol:</span>
+            <span class="badge uppercase text-xs" id="stat-mng-scheme">HTTP</span>
+          </div>
+        </div>
+
+        <!-- Add Session & Search Toolbar -->
+        <div class="flex items-center justify-between gap-3 mb-3 flex-wrap">
+          <div class="flex items-center gap-2 flex-1" style="min-width: 280px;">
+            <input type="text" id="input-quick-add-session" class="text-input font-mono text-sm" placeholder="New session token or range e.g. 51-100">
+            <button type="button" class="btn btn-primary btn-sm flex-shrink-0" id="btn-quick-add-session" onclick="submitQuickAddSession()">
+              ➕ Add Session
+            </button>
+          </div>
+          <div class="flex items-center gap-2 flex-shrink-0">
+            <input type="text" id="search-pool-sessions-input" class="input-search-sm" placeholder="Filter session ID..." oninput="filterPoolSessionsList()">
+            <button type="button" class="btn btn-secondary btn-sm" onclick="openBulkSessionsModalFromManager()">
+              📥 Bulk Import
+            </button>
+          </div>
+        </div>
+
+        <!-- Sessions List Table -->
+        <div class="proxy-sessions-list-wrap">
+          <table class="proxy-sessions-table">
+            <thead>
+              <tr>
+                <th style="width: 50px;">#</th>
+                <th>Session Token / ID</th>
+                <th style="width: 110px;">Status</th>
+                <th>Attached Account</th>
+                <th style="width: 110px; text-align: right;">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="manage-sessions-tbody">
+              <tr>
+                <td colspan="5" class="text-center py-6 text-secondary">Loading sessions...</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-close="modal-manage-proxy-sessions">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Edit Proxy Provider -->
+  <div class="modal-backdrop" id="modal-edit-proxy-provider">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Edit Proxy Provider Pool</h3>
+        <button class="modal-close" data-close="modal-edit-proxy-provider">&times;</button>
+      </div>
+      <form id="form-edit-proxy-provider">
+        <input type="hidden" id="edit-proxy-provider-id">
+        <div class="modal-body">
+          <div class="form-group mb-3">
+            <label class="form-label">Provider Label</label>
+            <input type="text" id="edit-proxy-provider-label" class="text-input" required>
+          </div>
+          <div class="form-group mb-3">
+            <label class="form-label">Proxy Template Format</label>
+            <input type="text" id="edit-proxy-provider-template" class="text-input font-mono" placeholder="http://user-{country}-{session}:pass@host:port">
+            <span class="text-xs text-secondary mt-1">Must contain {country} and {session}. Leave unchanged to keep current template.</span>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-edit-proxy-provider">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-save-proxy-provider">Save Changes</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Test Any Proxy -->
+  <div class="modal-backdrop" id="modal-test-proxy">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">🔍 Check Proxy & Egress Diagnostics</h3>
+        <button class="modal-close" data-close="modal-test-proxy">&times;</button>
+      </div>
+      <form id="form-quick-test-proxy">
+        <div class="modal-body">
+          <div class="form-group mb-3">
+            <label class="form-label">Quick-Select Account Route</label>
+            <select id="test-proxy-account-select" class="select-input" onchange="onSelectTestProxyAccount(this.value)">
+              <option value="">— Enter Custom Proxy Below —</option>
+            </select>
+          </div>
+          <div class="form-group mb-3">
+            <label class="form-label">Proxy Protocol / Scheme</label>
+            <div class="proxy-type-pill-group" id="test-proxy-type-group">
+              <button type="button" class="proxy-type-pill active" data-scheme="auto" onclick="setTestProxyScheme('auto')">Auto</button>
+              <button type="button" class="proxy-type-pill" data-scheme="http" onclick="setTestProxyScheme('http')">HTTP</button>
+              <button type="button" class="proxy-type-pill" data-scheme="https" onclick="setTestProxyScheme('https')">HTTPS</button>
+              <button type="button" class="proxy-type-pill" data-scheme="socks5" onclick="setTestProxyScheme('socks5')">SOCKS5</button>
+              <button type="button" class="proxy-type-pill" data-scheme="socks4" onclick="setTestProxyScheme('socks4')">SOCKS4</button>
+            </div>
+            <input type="hidden" id="test-proxy-scheme" value="auto">
+          </div>
+          <div class="form-group">
+            <label class="form-label">Proxy String (URL or host:port:user:pass)</label>
+            <input type="text" id="test-proxy-string-input" class="text-input font-mono" placeholder="e.g. socks5://user:pass@host:port or host:port:user:pass" required>
+            <span class="text-xs text-secondary mt-1">Supports HTTP, HTTPS, SOCKS4, and SOCKS5 proxies.</span>
+          </div>
+          <div class="p-4 bg-surface rounded-md border border-subtle mt-4">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs font-bold text-secondary">Diagnostic Results</span>
+              <span class="badge" id="test-proxy-status-badge">Ready</span>
+            </div>
+            <div class="text-sm font-mono text-secondary" id="test-proxy-details">Click "Check Proxy" to test egress IP and latency.</div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-test-proxy">Close</button>
+          <button type="submit" class="btn btn-primary" id="btn-run-proxy-test">🔍 Check Proxy</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Server Details & Management (Telegram Bot Experience) -->
+  <div class="modal-backdrop" id="modal-server-details">
+    <div class="modal-box modal-xl server-detail-modal-box">
+      <!-- Modal Header -->
+      <div class="modal-header items-center justify-between pb-3 border-b border-subtle">
+        <div class="flex items-center gap-3">
+          <div class="server-detail-provider-icon" id="srvmodal-provider-icon">☁️</div>
+          <div>
+            <div class="flex items-center gap-2">
+              <h3 class="modal-title font-bold text-lg" id="srvmodal-label">Server Details</h3>
+              <span class="badge" id="srvmodal-status-badge">● Loading</span>
+            </div>
+            <div class="flex items-center gap-2 text-xs text-secondary mt-0.5">
+              <span id="srvmodal-account-pill" class="badge badge-secondary cursor-pointer hover:underline" onclick="navigateFromModalToAccount()" title="Click to view account">Account</span>
+              <span>•</span>
+              <span id="srvmodal-id-text" class="font-mono text-muted">ID: —</span>
+            </div>
+          </div>
+        </div>
+        <div class="flex items-center gap-2">
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-srvmodal-refresh" onclick="refreshCurrentServerDetailsModal()" title="Live Refresh">
+            🔄 Refresh
+          </button>
+          <button class="modal-close" data-close="modal-server-details">&times;</button>
+        </div>
+      </div>
+
+      <div class="modal-body py-4">
+        <!-- Quick Stats Grid -->
+        <div class="server-stats-grid mb-4">
+          <!-- Primary IP -->
+          <div class="server-stat-card">
+            <div class="flex items-center justify-between">
+              <span class="text-xs text-secondary font-medium">Primary IP</span>
+              <button type="button" class="btn btn-xs btn-secondary" id="btn-copy-srvmodal-ip" onclick="copyModalField('srvmodal-primary-ip')" title="Copy IP">📋</button>
+            </div>
+            <div class="mt-1">
+              <code class="font-mono font-bold text-sm text-primary" id="srvmodal-primary-ip">—</code>
+            </div>
+            <div class="text-xs text-muted truncate mt-0.5 font-mono" id="srvmodal-ipv6-sub">IPv6: —</div>
+          </div>
+
+          <!-- Region / Location -->
+          <div class="server-stat-card">
+            <div class="text-xs text-secondary font-medium">Datacenter / Region</div>
+            <div class="flex items-center gap-2 mt-1">
+              <span id="srvmodal-region-flag" class="text-xl">🌐</span>
+              <div class="font-bold text-sm text-primary truncate" id="srvmodal-region-name">—</div>
+            </div>
+            <div class="text-xs text-muted mt-0.5 truncate" id="srvmodal-country-name">—</div>
+          </div>
+
+          <!-- Plan / Specs -->
+          <div class="server-stat-card">
+            <div class="text-xs text-secondary font-medium">Plan & Specs</div>
+            <div class="font-bold text-sm text-primary truncate mt-1" id="srvmodal-plan">—</div>
+            <div class="text-xs text-muted mt-0.5 truncate" id="srvmodal-specs">—</div>
+          </div>
+
+          <!-- Provider Feature / Auto Backup -->
+          <div class="server-stat-card">
+            <div class="flex items-center justify-between">
+              <span class="text-xs text-secondary font-medium">Provider Feature</span>
+              <button type="button" class="btn btn-xs btn-secondary hidden" id="btn-toggle-vultr-backup" onclick="toggleVultrBackupFromModal()" style="font-size: 11px; padding: 2px 6px; white-space: nowrap;">
+                💾 Enable
+              </button>
+            </div>
+            <div class="mt-1">
+              <span id="srvmodal-feature-status" class="badge text-xs">Standard</span>
+            </div>
+            <div class="text-xs text-muted mt-0.5 truncate" id="srvmodal-feature-note">—</div>
+          </div>
+        </div>
+
+        <!-- Section Navigation Tabs -->
+        <div class="pill-filter-group mb-4" id="srvmodal-tabs">
+          <button type="button" class="pill-filter active" id="srvmodal-tab-btn-overview" onclick="switchSrvModalTab('overview')">
+            🖥️ Overview & SSH
+          </button>
+          <button type="button" class="pill-filter" id="srvmodal-tab-btn-ips" onclick="switchSrvModalTab('ips')">
+            🌐 IP Management <span class="badge badge-secondary ml-1" id="srvmodal-ips-badge">0</span>
+          </button>
+          <button type="button" class="pill-filter" id="srvmodal-tab-btn-security" onclick="switchSrvModalTab('security')">
+            🔐 Root Password & Vault
+          </button>
+        </div>
+
+        <!-- TAB 1: Overview & SSH -->
+        <div id="srvmodal-pane-overview" class="srvmodal-pane">
+          <!-- SSH Commands Box (like Telegram srvssh:) -->
+          <div class="card p-3 mb-4 bg-surface border border-subtle">
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-xs font-bold text-primary flex items-center gap-1.5">
+                <span>📋</span> One-Click SSH Connect Lines
+              </span>
+              <span class="text-xs text-muted">Click copy icon to clipboard</span>
+            </div>
+
+            <!-- Standard SSH -->
+            <div class="form-group mb-2">
+              <label class="text-xs text-secondary mb-1 block">Standard SSH Terminal Command:</label>
+              <div class="code-copy-box">
+                <code class="font-mono text-xs text-primary" id="srvmodal-ssh-box">ssh root@...</code>
+                <button type="button" class="btn btn-sm btn-secondary" onclick="copyModalField('srvmodal-ssh-box')">Copy</button>
+              </div>
+            </div>
+
+            <!-- Automated SSHPass -->
+            <div class="form-group mb-0">
+              <label class="text-xs text-secondary mb-1 block">Non-Interactive SSHPass (with Root Password):</label>
+              <div class="code-copy-box">
+                <code class="font-mono text-xs text-primary" id="srvmodal-sshpass-box">sshpass -p '...' ssh -o StrictHostKeyChecking=no root@...</code>
+                <button type="button" class="btn btn-sm btn-secondary" onclick="copyModalField('srvmodal-sshpass-box')">Copy</button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Stored Credentials Preview Banner -->
+          <div class="card p-3 bg-surface border border-subtle flex items-center justify-between flex-wrap gap-2">
+            <div>
+              <div class="text-xs text-secondary">Encrypted Root Password Vault:</div>
+              <div class="flex items-center gap-2 mt-1">
+                <code class="font-mono font-bold text-sm text-success" id="srvmodal-preview-password">••••••••••••••••</code>
+                <button type="button" class="btn btn-xs btn-secondary" id="btn-srvmodal-reveal-pw" onclick="revealPasswordInServerModal()">
+                  👁️ Reveal
+                </button>
+                <button type="button" class="btn btn-xs btn-secondary" id="btn-srvmodal-copy-pw" onclick="copyModalField('srvmodal-preview-password')">
+                  📋 Copy
+                </button>
+              </div>
+            </div>
+            <div class="flex items-center gap-2">
+              <button type="button" class="btn btn-secondary btn-sm" onclick="switchSrvModalTab('security')">
+                🔑 Manage Password
+              </button>
+              <button type="button" class="btn btn-secondary btn-sm" onclick="switchSrvModalTab('ips')">
+                🌐 Manage IPs
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 2: IP Management (Telegram hetzipman / ipman experience) -->
+        <div id="srvmodal-pane-ips" class="srvmodal-pane" style="display: none;">
+          <!-- Hetzner Primary IP Notice / Reassignment if Hetzner -->
+          <div id="srvmodal-hetzner-primary-box" class="card p-3 mb-4 bg-surface border border-subtle hidden">
+            <div class="flex items-center justify-between flex-wrap gap-2">
+              <div>
+                <span class="badge badge-primary text-xs uppercase mr-2">Hetzner Primary IP</span>
+                <span class="font-mono font-bold text-sm text-primary" id="srvmodal-hetzner-pip-val">—</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="openHetznerPrimarySwitchFromModal()">
+                  🔄 Change / Reassign Primary IP
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Attached Floating IPs Section (Hetzner / Vultr) -->
+          <div id="srvmodal-fips-section" class="card p-3 mb-4 bg-surface border border-subtle">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div>
+                <h4 class="font-bold text-sm text-primary">Attached Floating / Reserved IPs</h4>
+                <div class="text-xs text-secondary">IP addresses routed directly to this server instance</div>
+              </div>
+              <div class="flex items-center gap-2" id="srvmodal-fip-actions">
+                <button type="button" class="btn btn-primary btn-sm" id="btn-srvmodal-add-fip" onclick="openAllocateFipForServerModal()">
+                  ➕ Allocate & Attach IP
+                </button>
+                <button type="button" class="btn btn-secondary btn-sm" id="btn-srvmodal-attach-existing-fip" onclick="openAttachExistingFipForServerModal()">
+                  🔗 Attach Existing IP
+                </button>
+              </div>
+            </div>
+
+            <!-- Attached IPs List Container -->
+            <div id="srvmodal-fips-list" class="space-y-2">
+              <!-- Rendered dynamically -->
+            </div>
+          </div>
+
+          <!-- Linode Dedicated Networking & IP Swap Section (Linode only) -->
+          <div id="srvmodal-linode-section" class="card p-3 mb-4 bg-surface border border-subtle hidden">
+            <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+              <div>
+                <h4 class="font-bold text-sm text-primary">Linode Network Interfaces & Regional IP Swap</h4>
+                <div class="text-xs text-secondary">Direct IPv4/IPv6 assignments and regional failover/swap</div>
+              </div>
+              <div id="srvmodal-linode-swap-btn-container">
+                <button type="button" class="btn btn-secondary btn-sm" id="btn-srvmodal-swap-linode-ip" onclick="openLinodeSwapModal()">
+                  🔄 Swap IP with Regional Peer
+                </button>
+              </div>
+            </div>
+            <div id="srvmodal-linode-ips-list" class="space-y-2">
+              <!-- Rendered dynamically -->
+            </div>
+          </div>
+
+          <!-- Quick OS Network Config Helper Banner -->
+          <div class="card p-3 bg-surface border border-subtle" id="srvmodal-os-guide-banner">
+            <div class="flex items-start gap-2">
+              <span class="text-lg" id="srvmodal-os-guide-icon">💡</span>
+              <div class="flex-1">
+                <div class="text-xs font-bold text-primary" id="srvmodal-os-guide-title">Guest OS Network Activation</div>
+                <div class="text-xs text-secondary mt-0.5" id="srvmodal-os-guide-text">
+                  Floating IPs route packets to your server, but Linux must recognize the address on interface <code>eth0</code>.
+                  Use the quick activation command next to each IP, or click <b>OS Config Guide</b> for persistent Netplan rules.
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- TAB 3: Root Password & Vault -->
+        <div id="srvmodal-pane-security" class="srvmodal-pane" style="display: none;">
+          <div class="card p-4 mb-4 bg-surface border border-subtle">
+            <h4 class="font-bold text-sm text-primary mb-1">Encrypted Root Credentials</h4>
+            <p class="text-xs text-secondary mb-3">
+              Passwords saved here are encrypted and stored in the Cloudbot local secrets vault. You can update or record the password for servers predating the bot.
+            </p>
+
+            <div class="form-group mb-3">
+              <label class="form-label text-xs">Current Root Password:</label>
+              <div class="code-copy-box">
+                <code class="font-mono text-sm font-bold text-success" id="srvmodal-full-password">••••••••••••••••</code>
+                <button type="button" class="btn btn-sm btn-secondary" id="btn-srvmodal-full-reveal" onclick="revealPasswordInServerModal()">
+                  👁️ Reveal
+                </button>
+                <button type="button" class="btn btn-sm btn-secondary" onclick="copyModalField('srvmodal-full-password')">
+                  Copy
+                </button>
+              </div>
+            </div>
+
+            <form id="form-srvmodal-save-pw" class="mt-4 pt-3 border-t border-subtle" onsubmit="savePasswordFromModal(event)">
+              <label class="form-label text-xs font-bold">Update / Save Password in Vault:</label>
+              <div class="flex items-center gap-2">
+                <input type="password" id="srvmodal-new-pw-input" class="text-input font-mono text-sm flex-1" placeholder="Enter new or existing root password" required>
+                <button type="submit" class="btn btn-primary btn-sm flex-shrink-0" id="btn-srvmodal-save-pw">
+                  💾 Save to Vault
+                </button>
+              </div>
+            </form>
+          </div>
+
+          <!-- Hetzner Reset Root Password Box (if Hetzner) -->
+          <div id="srvmodal-hetzner-reset-box" class="card p-4 bg-surface border border-danger-subtle hidden">
+            <div class="flex items-center justify-between flex-wrap gap-3">
+              <div class="flex-1" style="min-width: 240px;">
+                <h4 class="font-bold text-sm text-danger flex items-center gap-1.5">
+                  <span>🔄</span> Reset Root Password (Hetzner Cloud)
+                </h4>
+                <p class="text-xs text-secondary mt-1">
+                  Requests Hetzner to generate a brand-new random root password and automatically reboot this instance to apply it. The new password will be displayed and saved immediately.
+                </p>
+              </div>
+              <button type="button" class="btn btn-danger btn-sm flex-shrink-0" id="btn-srvmodal-reset-pw" onclick="resetRootPasswordForServer()">
+                🔄 Reset & Reboot
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Modal Footer with Lifecycle Controls -->
+      <div class="modal-footer items-center justify-between pt-3 border-t border-subtle">
+        <div class="flex items-center gap-2">
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-srvmodal-reboot" onclick="rebootServerFromModal()">
+            🔄 Soft Reboot
+          </button>
+          <button type="button" class="btn btn-secondary btn-sm" id="btn-srvmodal-power" onclick="togglePowerServerFromModal()">
+            ⏹ Halt / Shutdown
+          </button>
+        </div>
+
+        <div class="flex items-center gap-2">
+          <button type="button" class="btn btn-danger btn-sm" id="btn-srvmodal-delete" onclick="deleteServerFromModal()">
+            🗑️ Delete Server
+          </button>
+          <button type="button" class="btn btn-secondary btn-sm" data-close="modal-server-details">
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Modal: Allocate & Attach Floating IP Directly to Server -->
+  <div class="modal-backdrop" id="modal-server-alloc-ip">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Allocate & Attach Floating IP</h3>
+        <button class="modal-close" data-close="modal-server-alloc-ip">&times;</button>
+      </div>
+      <form id="form-server-alloc-ip" onsubmit="submitAllocateFipForServer(event)">
+        <div class="modal-body">
+          <div id="server-alloc-form-fields">
+            <p class="text-sm text-secondary mb-3">
+              Create a new floating IP in this region and attach it directly to <code id="server-alloc-srv-name" class="text-primary font-bold"></code>:
+            </p>
+            <div class="form-group mb-3">
+              <label class="form-label">IP Protocol / Type</label>
+              <select id="server-alloc-ip-type" class="select-input" required>
+                <option value="ipv4">IPv4 Address (Standard /32)</option>
+                <option value="ipv6" id="server-alloc-opt-ipv6">IPv6 Address (/64 Subnet - Hetzner only)</option>
+              </select>
+            </div>
+            <div class="p-3 bg-surface rounded-md border border-subtle text-xs text-secondary">
+              ⚠️ <b>Notice:</b> Providers charge a monthly fee for floating IPs. After attachment, configure the guest Linux OS with the provided activation command.
+            </div>
+          </div>
+          <div id="server-alloc-progress" style="display: none;" class="fip-modal-state py-6 text-center">
+            <div class="btn-spinner mb-3" style="width: 2.2rem; height: 2.2rem; border-width: 3px; display: inline-block;"></div>
+            <div id="server-alloc-progress-msg" class="text-base font-semibold text-primary">🌐 Contacting cloud provider...</div>
+            <div class="text-xs text-muted mt-1">Allocating dedicated IP and configuring routing tables...</div>
+          </div>
+          <div id="server-alloc-success" style="display: none;" class="fip-modal-state py-2 text-center">
+          </div>
+        </div>
+        <div class="modal-footer" id="server-alloc-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-server-alloc-ip" id="btn-cancel-server-alloc">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-server-alloc">⚡ Allocate & Attach</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Attach Existing IP to Server -->
+  <div class="modal-backdrop" id="modal-server-attach-existing-ip">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Attach Floating IP to Instance</h3>
+        <button class="modal-close" data-close="modal-server-attach-existing-ip">&times;</button>
+      </div>
+      <form id="form-server-attach-existing-ip" onsubmit="submitAttachExistingFipForServer(event)">
+        <div class="modal-body">
+          <p class="text-sm text-secondary mb-3">
+            Select an unassigned floating IP from this account to attach to <code id="server-attach-existing-srv-name" class="text-primary font-bold"></code>:
+          </p>
+          <div class="form-group">
+            <label class="form-label">Available Floating IP</label>
+            <select id="server-attach-existing-select" class="select-input" required>
+              <option value="">Loading unassigned IPs...</option>
+            </select>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-server-attach-existing-ip">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-server-attach-existing">Attach IP</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Linode Regional IP Swap -->
+  <div class="modal-backdrop" id="modal-linode-swap-ip">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title">Swap Linode IP with Regional Peer</h3>
+        <button class="modal-close" data-close="modal-linode-swap-ip">&times;</button>
+      </div>
+      <form id="form-linode-swap-ip" onsubmit="submitLinodeSwap(event)">
+        <div class="modal-body">
+          <p class="text-xs text-secondary mb-3">
+            Linode allows instant IPv4 address swapping between two instances located in the same datacenter via <code>POST /networking/ips/assign</code>. No instance reboot is required.
+          </p>
+          <div class="form-group">
+            <label class="form-label text-xs">Current Instance</label>
+            <div class="p-2 bg-surface border border-subtle rounded text-xs font-mono" id="linode-swap-current-srv">—</div>
+          </div>
+          <div class="form-group">
+            <label class="form-label text-xs">Target Peer Instance (Same Datacenter)</label>
+            <select id="linode-swap-target-select" class="select-input" required>
+              <option value="">Select regional peer Linode...</option>
+            </select>
+          </div>
+          <div class="card p-3 bg-surface border border-warning text-xs text-warning">
+            ⚠️ <b>Notice:</b> The public IPv4 of both instances will be exchanged immediately. In-flight connections and domain DNS pointing to these IPs will follow the swap.
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-linode-swap-ip">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-submit-linode-swap">🔄 Confirm IP Swap</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Confirmation Dialog -->
+  <div class="modal-backdrop" id="modal-confirm-dialog">
+    <div class="modal-box">
+      <div class="modal-header">
+        <h3 class="modal-title" id="confirm-dialog-title">Confirm Action</h3>
+        <button class="modal-close" data-close="modal-confirm-dialog">&times;</button>
+      </div>
+      <div class="modal-body">
+        <p class="text-sm text-secondary" id="confirm-dialog-desc">Are you sure you want to proceed?</p>
+        <div class="form-group mt-4" id="confirm-typed-container">
+          <label class="form-label" id="confirm-typed-label">Type confirmation word to verify:</label>
+          <input type="text" id="confirm-typed-input" class="text-input font-mono">
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary" data-close="modal-confirm-dialog">Cancel</button>
+        <button type="button" class="btn btn-danger" id="confirm-dialog-submit-btn">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Notifications Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <!-- JavaScript Application Bundle -->
+  <script src="/ui/app.js"></script>
+</body>
+</html>

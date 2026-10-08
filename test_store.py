@@ -18,11 +18,11 @@ class AccountStoreTests(unittest.TestCase):
                 account = st.account(acc_id)
                 self.assertEqual(account["label"], "new")
                 self.assertEqual(account["proxy"], "proxy:80:u:p")
-                self.assertEqual(account["proxy_family"], "ipv4")
+                self.assertEqual(account["proxy_family"], "default")
                 st.set_proxy(acc_id, "newproxy:80:u:p", "ipv6")
                 account = st.account(acc_id)
                 self.assertEqual(account["proxy"], "newproxy:80:u:p")
-                self.assertEqual(account["proxy_family"], "ipv6")
+                self.assertEqual(account["proxy_family"], "default")
             finally:
                 if old_db is None:
                     os.environ.pop("CLOUDBOT_DB", None)

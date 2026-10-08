@@ -13,12 +13,15 @@ keeps its own short-lived server/IP snapshot for chat lookups.
 import asyncio
 import ipaddress
 import logging
+import secrets
+import re
 import socket
 import time
 from datetime import date
 
 import aiohttp
 from yarl import URL
+from proxy_pool import resolve_country, ProxyPoolError, components as parse_proxy, proxy_string
 
 try:
     from aiohttp_socks import ProxyConnector
@@ -86,9 +89,10 @@ def country_code(value):
     if value is None:
         return None
     value = str(value).strip().upper()
-    if len(value) == 2 and value.isalpha():
-        return value
-    return _COUNTRY_ALIASES.get(value)
+    try:
+        return resolve_country(_COUNTRY_ALIASES.get(value, value))
+    except ProxyPoolError:
+        return None
 
 
 def country_flag(country):
@@ -122,6 +126,8 @@ def location_text(provider, region, country=None):
 # -- in-memory cache for regions and plans ----------------------------------
 CACHE_TTL_REGIONS = 3600  # 1 hour
 CACHE_TTL_PLANS = 3600    # 1 hour
+CACHE_TTL_LINODE_REGIONS = 7 * 86400  # 7 days (Linode regions do not change)
+CACHE_TTL_LINODE_PLANS = 7 * 86400    # 7 days
 
 _CACHE: dict[tuple, tuple[float, any]] = {}
 
@@ -152,7 +158,11 @@ def _set_cached(key: tuple, data: any, ttl: int = 3600):
 def get_cached_regions(provider: str, account_id=None) -> list | None:
     """Return cached region choices for a provider if available."""
     if provider == "linode":
-        return _get_cached((provider, "regions", str(account_id or "")))
+        if account_id:
+            res = _get_cached((provider, "regions", str(account_id)))
+            if res is not None:
+                return res
+        return _get_cached((provider, "regions", "")) or _get_cached((provider, "regions"))
     return _get_cached((provider, "regions"))
 
 
@@ -177,34 +187,7 @@ def proxy_url(proxy: str | None) -> str | None:
     """
     if not proxy:
         return None
-    proxy = proxy.strip()
-    scheme = "http"
-    if "://" in proxy:
-        scheme, proxy = proxy.split("://", 1)
-    # already in url auth form?
-    if "@" in proxy:
-        return f"{scheme}://{proxy}"
-    if proxy.startswith("["):
-        end = proxy.find("]")
-        if end < 0 or len(proxy) <= end + 2 or proxy[end + 1] != ":":
-            raise ValueError("IPv6 proxy hosts must look like [2001:db8::1]:port")
-        host = proxy[:end + 1]
-        rest = proxy[end + 2:].split(":", 2)
-        if len(rest) == 3:
-            port, user, pw = rest
-            return f"{scheme}://{user}:{pw}@{host}:{port}"
-        if len(rest) == 1:
-            return f"{scheme}://{host}:{rest[0]}"
-    else:
-        parts = proxy.split(":", 3)
-        if len(parts) == 4:
-            host, port, user, pw = parts
-            return f"{scheme}://{user}:{pw}@{host}:{port}"
-        if len(parts) == 2:
-            host, port = parts
-            return f"{scheme}://{host}:{port}"
-    raise ValueError("proxy must be host:port or host:port:user:pass "
-                     "(optionally prefixed with socks5://; bracket IPv6 hosts)")
+    return proxy_string(parse_proxy(proxy))
 
 
 async def proxy_for_family(proxy: str | None, family: str = "default") -> str | None:
@@ -243,6 +226,20 @@ async def proxy_for_family(proxy: str | None, family: str = "default") -> str | 
 
 class ProviderError(Exception):
     pass
+
+
+def sanitize_linode_label(label: str) -> str:
+    """Linode labels must begin and end with an alphanumeric character and be 3-64 chars."""
+    clean = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(label).strip()).strip("-._")
+    if not clean:
+        clean = "linode-srv"
+    if not clean[0].isalnum():
+        clean = "s" + clean
+    if not clean[-1].isalnum():
+        clean = clean.rstrip("-._") + "1"
+    if len(clean) < 3:
+        clean = f"{clean}srv"
+    return clean[:64]
 
 
 class Provider:
@@ -349,6 +346,43 @@ class Provider:
                 "pending_charges": uninvoiced,
                 "net": promo_credit - uninvoiced if promo_credit > 0 else -uninvoiced,
             }
+        if self.provider == "hetzner":
+            try:
+                d = await self._req("GET", "/servers")
+                servers = d.get("servers", [])
+                monthly_total = 0.0
+                hourly_total = 0.0
+                for s in servers:
+                    st = s.get("server_type", {})
+                    prices = st.get("prices", [])
+                    if prices:
+                        p_mo = prices[0].get("price_monthly", {}).get("gross") or prices[0].get("price_monthly", {}).get("net") or 0.0
+                        p_hr = prices[0].get("price_hourly", {}).get("gross") or prices[0].get("price_hourly", {}).get("net") or 0.0
+                        monthly_total += float(p_mo)
+                        hourly_total += float(p_hr)
+                return {
+                    "name": "Hetzner Cloud Project",
+                    "currency": "EUR",
+                    "balance": round(monthly_total, 2),
+                    "credit": 0.0,
+                    "owed": 0.0,
+                    "pending_charges": round(monthly_total, 2),
+                    "net": -round(monthly_total, 2),
+                    "monthly_runrate": round(monthly_total, 2),
+                    "hourly_runrate": round(hourly_total, 4),
+                    "servers_count": len(servers),
+                }
+            except Exception as e:
+                log.warning("Hetzner account_info calculation failed: %s", e)
+                return {
+                    "name": "Hetzner Cloud Project",
+                    "currency": "EUR",
+                    "balance": 0.0,
+                    "credit": 0.0,
+                    "owed": 0.0,
+                    "pending_charges": 0.0,
+                    "net": 0.0,
+                }
         return None
 
     # -- list servers ----------------------------------------------------
@@ -366,13 +400,19 @@ class Provider:
             out = []
             for i in rows:
                 ips = [ip for ip in (i.get("ipv4") or []) if ip]
+                specs = i.get("specs") or {}
                 out.append({
                     "id": i["id"], "label": i.get("label"),
                     "region": i.get("region"),
                     "country": region_country(self.provider, i.get("region")),
                     "ip": ips[0] if ips else None, "ips": ips,
+                    "ipv4": ips, "ipv6": i.get("ipv6"),
                     "status": i.get("status"),
                     "plan": i.get("type"),
+                    "specs": specs,
+                    "ram": specs.get("memory"),
+                    "disk": round(specs.get("disk", 0) / 1024) if specs.get("disk") else None,
+                    "cores": specs.get("vcpus"),
                 })
             return out
         if self.provider == "vultr":
@@ -437,10 +477,18 @@ class Provider:
     async def server(self, server_id):
         if self.provider == "linode":
             i = await self._req("GET", f"/linode/instances/{server_id}")
+            ips = [ip for ip in (i.get("ipv4") or []) if ip]
+            specs = i.get("specs") or {}
             return {"id": i["id"], "label": i.get("label"), "region": i.get("region"),
                     "country": region_country(self.provider, i.get("region")),
-                    "ip": (i.get("ipv4") or [None])[0], "status": i.get("status"),
-                    "plan": i.get("type")}
+                    "ip": ips[0] if ips else None, "ips": ips,
+                    "ipv4": ips, "ipv6": i.get("ipv6"),
+                    "status": i.get("status"),
+                    "plan": i.get("type"),
+                    "specs": specs,
+                    "ram": specs.get("memory"),
+                    "disk": round(specs.get("disk", 0) / 1024) if specs.get("disk") else None,
+                    "cores": specs.get("vcpus")}
         if self.provider == "vultr":
             d = await self._req("GET", f"/instances/{server_id}")
             i = d.get("instance", d)
@@ -476,6 +524,7 @@ class Provider:
                 return cached
 
         if self.provider == "linode":
+            eff_ttl = ttl if ttl != CACHE_TTL_REGIONS else CACHE_TTL_LINODE_REGIONS
             d = await self._req("GET", "/regions?page_size=200")
             types = await self._linode_types(force=force)
             try:
@@ -503,13 +552,18 @@ class Provider:
                 label += (f" · {count} plans listed" if linodes_allowed
                           else " · 0 plans (Linodes unavailable)")
                 res.append((region_id, label))
+            _set_cached(cache_key, res, eff_ttl)
+            if account_id:
+                _set_cached((self.provider, "regions", ""), res, eff_ttl)
+            self._precache_linode_plans_sync(types, res)
+            return res
         elif self.provider == "vultr":
             d = await self._req("GET", "/regions?per_page=200")
             res = [(r["id"], location_text(
                         self.provider,
                         f"{r.get('city','')} {r.get('country','')}".strip() or r["id"],
                         r.get("country")))
-                   for r in d.get("regions", [])]
+                    for r in d.get("regions", [])]
         else:
             # Hetzner exposes per-location support and current availability on
             # each Server Type. Locations alone includes places where none of
@@ -546,6 +600,38 @@ class Provider:
         _set_cached(cache_key, res, ttl)
         return res
 
+    @staticmethod
+    def _format_linode_plans(types, region=None):
+        out = []
+        for t in types:
+            region_prices = t.get("region_prices") or []
+            price = (t.get("price") or {}).get("monthly")
+            if region:
+                price = next((p.get("monthly") for p in region_prices
+                              if p.get("id") == region), price)
+            transfer = t.get("transfer")
+            traffic = f" · 📡 {transfer} GB traffic" if transfer is not None else ""
+            out.append((t["id"],
+                        f"{t.get('label', t['id'])}{traffic} - ${price}/mo"))
+        return out
+
+    def _precache_linode_plans_sync(self, types, regions):
+        default_plans = self._format_linode_plans(types, None)
+        _set_cached((self.provider, "plans", ""), default_plans, CACHE_TTL_LINODE_PLANS)
+        for r in regions:
+            r_id = r[0] if isinstance(r, (list, tuple)) else str(r)
+            plans_for_r = self._format_linode_plans(types, r_id)
+            _set_cached((self.provider, "plans", r_id), plans_for_r, CACHE_TTL_LINODE_PLANS)
+
+    async def precache_linode_plans(self, regions=None):
+        if self.provider != "linode":
+            return
+        types = await self._linode_types(force=False)
+        reg_list = regions
+        if not reg_list:
+            reg_list = get_cached_regions(self.provider, self.account.get("id")) or []
+        self._precache_linode_plans_sync(types, reg_list)
+
     async def _linode_types(self, force: bool = False):
         """Load the Linode type catalog once for region and plan choices."""
         cache_key = (self.provider, "linode-types")
@@ -555,7 +641,7 @@ class Provider:
                 return cached
         d = await self._req("GET", "/linode/types?page_size=500")
         types = d.get("data", [])
-        _set_cached(cache_key, types, CACHE_TTL_PLANS)
+        _set_cached(cache_key, types, CACHE_TTL_LINODE_PLANS)
         return types
 
     async def _hetzner_server_types(self, force: bool = False,
@@ -606,19 +692,11 @@ class Provider:
                 return cached
 
         if self.provider == "linode":
+            eff_ttl = ttl if ttl != CACHE_TTL_PLANS else CACHE_TTL_LINODE_PLANS
             types = await self._linode_types(force=force)
-            out = []
-            for t in types:
-                region_prices = t.get("region_prices") or []
-                price = (t.get("price") or {}).get("monthly")
-                if region:
-                    price = next((p.get("monthly") for p in region_prices
-                                  if p.get("id") == region), price)
-                transfer = t.get("transfer")
-                traffic = f" · 📡 {transfer} GB traffic" if transfer is not None else ""
-                out.append((t["id"],
-                            f"{t.get('label', t['id'])}{traffic} - ${price}/mo"))
-            res = out
+            res = self._format_linode_plans(types, region)
+            _set_cached(cache_key, res, eff_ttl)
+            return res
         elif self.provider == "vultr":
             d = await self._req("GET", "/plans?per_page=500")
             avail_set = None
@@ -664,7 +742,12 @@ class Provider:
         _set_cached(cache_key, res, ttl)
         return res
 
-    async def images(self):
+    async def images(self, force: bool = False, ttl: int = 86400):
+        cache_key = (self.provider, "images")
+        if not force:
+            cached = _get_cached(cache_key)
+            if cached is not None:
+                return cached
         if self.provider == "linode":
             d = await self._req("GET", "/images?page_size=500")
             imgs = [i for i in d.get("data", []) if i.get("is_public")]
@@ -672,14 +755,18 @@ class Provider:
             pref = [i for i in imgs if any(x in i["id"] for x in
                     ("ubuntu22.04", "ubuntu24.04", "debian12", "debian11"))]
             chosen = pref or imgs
-            return [(i["id"], i.get("label") or i["id"]) for i in chosen[:40]]
+            res = [(i["id"], i.get("label") or i["id"]) for i in chosen[:40]]
+            _set_cached(cache_key, res, ttl)
+            return res
         if self.provider == "vultr":
             d = await self._req("GET", "/os?per_page=500")
             oss = d.get("os", [])
             pref = [o for o in oss if any(x in o.get("name", "").lower()
                     for x in ("ubuntu 22", "ubuntu 24", "debian 12", "debian 11"))]
             chosen = pref or oss
-            return [(str(o["id"]), o.get("name")) for o in chosen[:40]]
+            res = [(str(o["id"]), o.get("name")) for o in chosen[:40]]
+            _set_cached(cache_key, res, ttl)
+            return res
         # hetzner system images; the image "name" (e.g. ubuntu-22.04) is what
         # create expects.
         d = await self._req("GET", "/images?type=system&per_page=100")
@@ -687,18 +774,23 @@ class Provider:
         pref = [i for i in imgs if any(x in (i.get("name") or "")
                 for x in ("ubuntu-22.04", "ubuntu-24.04", "debian-12", "debian-11"))]
         chosen = pref or imgs
-        return [(i.get("name") or str(i["id"]),
+        res = [(i.get("name") or str(i["id"]),
                  i.get("description") or i.get("name")) for i in chosen[:40]]
+        _set_cached(cache_key, res, ttl)
+        return res
 
     # -- create ----------------------------------------------------------
-    async def create_server(self, label, region, plan, image, root_password, auto_backup=None):
+    async def create_server(self, label, region, plan, image, root_password, auto_backup=None, ssh_keys=None, enable_ipv6=False):
         """Returns {id, ip, label, root_password, default_password?}."""
         if self.provider == "linode":
+            clean_label = sanitize_linode_label(label)
             body = {
-                "label": label, "region": region, "type": plan, "image": image,
+                "label": clean_label, "region": region, "type": plan, "image": image,
                 "root_pass": root_password,
                 "booted": True,
             }
+            if ssh_keys:
+                body["authorized_keys"] = [str(k) for k in ssh_keys if k]
             i = await self._req("POST", "/linode/instances", json=body)
             return {"id": i["id"], "label": i.get("label"),
                     "ip": (i.get("ipv4") or [None])[0], "region": i.get("region"),
@@ -711,6 +803,8 @@ class Provider:
                 "hostname": label,
                 "backups": backup_val,
             }
+            if ssh_keys:
+                body["ssh_key_id"] = [str(k) for k in ssh_keys if k]
             d = await self._req("POST", "/instances", json=body)
             i = d.get("instance", d)
             # Vultr sets the root password itself and returns it once, on creation.
@@ -724,7 +818,13 @@ class Provider:
         body = {
             "name": label, "server_type": plan, "image": image,
             "location": region, "start_after_create": True,
+            "public_net": {
+                "enable_ipv4": True,
+                "enable_ipv6": bool(enable_ipv6),
+            },
         }
+        if ssh_keys:
+            body["ssh_keys"] = [k for k in ssh_keys if k]
         d = await self._req("POST", "/servers", json=body)
         i = d.get("server", d)
         location = (i.get("datacenter") or {}).get("location") or {}
@@ -847,6 +947,28 @@ class Provider:
             raise ProviderError("floating IP is only available for Vultr")
         await self._req("DELETE", f"/reserved-ips/{reserved_ip_id}")
 
+    async def create_vultr_reserved_ip(self, region, ip_type="v4", label=""):
+        """Create a Vultr Reserved IP without attaching it."""
+        if self.provider != "vultr":
+            raise ProviderError("floating IP is only available for Vultr")
+        created = await self._req("POST", "/reserved-ips", json={
+            "region": region, "ip_type": ip_type, "label": (label or "floating-ip")[:128],
+        })
+        return created.get("reserved_ip", created)
+
+    async def attach_vultr_reserved_ip(self, reserved_ip_id, server_id):
+        """Attach an existing Reserved IP to a Vultr instance."""
+        if self.provider != "vultr":
+            raise ProviderError("floating IP is only available for Vultr")
+        return await self._req("POST", f"/reserved-ips/{reserved_ip_id}/attach",
+                               json={"instance_id": str(server_id)})
+
+    async def detach_vultr_reserved_ip(self, reserved_ip_id):
+        """Detach a Reserved IP from its instance."""
+        if self.provider != "vultr":
+            raise ProviderError("floating IP is only available for Vultr")
+        return await self._req("POST", f"/reserved-ips/{reserved_ip_id}/detach")
+
     async def vultr_power(self, server_id, action):
         """Start, halt, or reboot a Vultr instance."""
         if self.provider != "vultr":
@@ -854,6 +976,53 @@ class Provider:
         if action not in ("start", "halt", "reboot"):
             raise ProviderError("unsupported Vultr power action")
         await self._req("POST", f"/instances/{server_id}/{action}")
+
+    async def linode_power(self, server_id, action):
+        """Boot, shutdown, or reboot a Linode instance."""
+        if self.provider != "linode":
+            raise ProviderError("Linode power controls are only available for Linode")
+        act = "boot" if action in ("start", "poweron", "boot") else action
+        act = "shutdown" if act in ("shutdown", "poweroff", "halt") else act
+        act = "reboot" if act == "reboot" else act
+        if act not in ("boot", "shutdown", "reboot"):
+            raise ProviderError(f"unsupported Linode power action: {action}")
+        await self._req("POST", f"/linode/instances/{server_id}/{act}")
+
+    async def linode_instance_ips(self, server_id):
+        """Get full networking IP layout for a Linode instance."""
+        if self.provider != "linode":
+            raise ProviderError("Linode networking is only available for Linode accounts")
+        return await self._req("GET", f"/linode/instances/{server_id}/ips")
+
+    async def linode_swap_ips(self, linode_a_id, linode_b_id):
+        """Swap IPv4 addresses between two Linodes in the same region."""
+        if self.provider != "linode":
+            raise ProviderError("Linode IP swap is only available for Linode")
+        a = await self.server(linode_a_id)
+        b = await self.server(linode_b_id)
+        if a.get("region") != b.get("region"):
+            raise ProviderError(f"Linodes must be in the same region to swap IPs ({a.get('region')} != {b.get('region')})")
+        ip_a = a.get("ip")
+        ip_b = b.get("ip")
+        if not ip_a or not ip_b:
+            raise ProviderError("Both Linodes must have an active IPv4 address to swap")
+        payload = {
+            "region": a["region"],
+            "assignments": [
+                {"address": ip_a, "linode_id": int(linode_b_id)},
+                {"address": ip_b, "linode_id": int(linode_a_id)}
+            ]
+        }
+        return await self._req("POST", "/networking/ips/assign", json=payload)
+
+    async def apply_linode_promo_code(self, promo_code):
+        """Apply a promotional credit code to the Linode account."""
+        if self.provider != "linode":
+            raise ProviderError("Promo codes are only supported for Linode accounts")
+        promo_code = str(promo_code or "").strip()
+        if not promo_code:
+            raise ProviderError("Promo code is required")
+        return await self._req("POST", "/account/promo-codes", json={"promo_code": promo_code})
 
     async def set_vultr_backups(self, server_id, status="disabled"):
         """Enable or disable auto-backups on an existing Vultr instance."""
@@ -976,10 +1145,27 @@ class Provider:
 
     async def hetzner_power(self, server_id, action):
         self._primary_provider()
-        if action not in ("shutdown", "poweron"):
-            raise ProviderError("Unsupported power action")
+        if action not in ("shutdown", "poweron", "reboot", "poweroff"):
+            raise ProviderError(f"Unsupported power action: {action}")
         await self._wait_hetzner_action(await self._req(
             "POST", f"/servers/{int(server_id)}/actions/{action}"))
+
+    async def power_server(self, server_id, action):
+        """Unified power action across all supported providers (start, halt/shutdown, reboot)."""
+        action = str(action).strip().lower()
+        if self.provider == "vultr":
+            v_action = "start" if action in ("start", "poweron", "boot") else action
+            v_action = "halt" if v_action in ("halt", "poweroff", "shutdown") else v_action
+            return await self.vultr_power(server_id, v_action)
+        elif self.provider == "hetzner":
+            h_action = "poweron" if action in ("start", "poweron", "boot") else action
+            h_action = "shutdown" if h_action in ("shutdown", "halt") else h_action
+            h_action = "poweroff" if h_action == "poweroff" else h_action
+            h_action = "reboot" if h_action == "reboot" else h_action
+            return await self.hetzner_power(server_id, h_action)
+        elif self.provider == "linode":
+            return await self.linode_power(server_id, action)
+        raise ProviderError(f"power controls not supported for provider: {self.provider}")
 
     # -- Hetzner Floating IPs -------------------------------------------
     async def hetzner_floating_ips(self, server_id=None):
@@ -1026,19 +1212,50 @@ class Provider:
             action = data.get("action", data)
         raise ProviderError(f"Hetzner action {action_id} did not finish within 60 seconds")
 
-    async def create_hetzner_floating_ip(self, server_id, ip_type, name):
-        """Create and assign a Hetzner IPv4 or IPv6 Floating IP."""
+    async def create_hetzner_floating_ip(self, server_id=None, ip_type="ipv4", name="", home_location=None):
+        """Create and optionally assign a Hetzner IPv4 or IPv6 Floating IP."""
         if self.provider != "hetzner":
             raise ProviderError("Hetzner Floating IPs are only available for Hetzner")
         if ip_type not in ("ipv4", "ipv6"):
             raise ProviderError("Floating IP type must be ipv4 or ipv6")
-        result = await self._req("POST", "/floating_ips", json={
-            "type": ip_type, "server": int(server_id), "name": str(name)[:63],
-        })
+        body = {
+            "type": ip_type,
+            "name": str(name)[:63] if name else f"fip-{secrets.token_hex(4)}",
+        }
+        if server_id is not None:
+            body["server"] = int(server_id)
+        if home_location is not None:
+            body["home_location"] = str(home_location)
+        result = await self._req("POST", "/floating_ips", json=body)
         floating = result.get("floating_ip", result)
         if result.get("action"):
             await self._wait_hetzner_action(result)
         return floating
+
+    async def assign_hetzner_floating_ip(self, floating_ip_id, server_id):
+        """Assign an existing Hetzner Floating IP to a server."""
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner Floating IPs are only available for Hetzner")
+        result = await self._req(
+            "POST", f"/floating_ips/{floating_ip_id}/actions/assign",
+            json={"server": int(server_id)})
+        return await self._wait_hetzner_action(result)
+
+    async def unassign_hetzner_floating_ip(self, floating_ip_id):
+        """Unassign an existing Hetzner Floating IP."""
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner Floating IPs are only available for Hetzner")
+        result = await self._req("POST", f"/floating_ips/{floating_ip_id}/actions/unassign")
+        return await self._wait_hetzner_action(result)
+
+    async def change_hetzner_floating_ip_ptr(self, floating_ip_id, ip, dns_ptr):
+        """Change PTR reverse DNS for a Hetzner Floating IP."""
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner Floating IPs are only available for Hetzner")
+        result = await self._req(
+            "POST", f"/floating_ips/{floating_ip_id}/actions/change_dns_ptr",
+            json={"ip": ip, "dns_ptr": dns_ptr})
+        return await self._wait_hetzner_action(result)
 
     async def delete_hetzner_floating_ip(self, floating_ip_id):
         """Unassign and delete a Hetzner Floating IP after the caller confirms."""
@@ -1056,3 +1273,144 @@ class Provider:
             await self._wait_hetzner_action(result)
         await self._req("DELETE", f"/floating_ips/{floating_ip_id}")
         return True
+
+    # -- SSH Keys --------------------------------------------------------
+    async def hetzner_ssh_keys(self):
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner SSH keys are only available for Hetzner")
+        rows, page = [], 1
+        while True:
+            data = await self._req("GET", f"/ssh_keys?per_page=50&page={page}")
+            current = data.get("ssh_keys", [])
+            rows.extend(current)
+            pagination = (data.get("meta") or {}).get("pagination") or {}
+            last_page = pagination.get("last_page")
+            if last_page is not None and page >= int(last_page):
+                break
+            if not current or (last_page is None and len(current) < 50):
+                break
+            page += 1
+        return rows
+
+    async def create_hetzner_ssh_key(self, name, public_key):
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner SSH keys are only available for Hetzner")
+        data = await self._req("POST", "/ssh_keys", json={"name": str(name), "public_key": str(public_key).strip()})
+        return data.get("ssh_key", data)
+
+    async def delete_hetzner_ssh_key(self, ssh_key_id):
+        if self.provider != "hetzner":
+            raise ProviderError("Hetzner SSH keys are only available for Hetzner")
+        await self._req("DELETE", f"/ssh_keys/{ssh_key_id}")
+        return True
+
+    async def linode_ssh_keys(self):
+        if self.provider != "linode":
+            raise ProviderError("Linode SSH keys are only available for Linode")
+        data = await self._req("GET", "/profile/sshkeys")
+        return data.get("data", [])
+
+    async def create_linode_ssh_key(self, label, ssh_key):
+        if self.provider != "linode":
+            raise ProviderError("Linode SSH keys are only available for Linode")
+        return await self._req("POST", "/profile/sshkeys", json={"label": str(label), "ssh_key": str(ssh_key).strip()})
+
+    async def delete_linode_ssh_key(self, ssh_key_id):
+        if self.provider != "linode":
+            raise ProviderError("Linode SSH keys are only available for Linode")
+        await self._req("DELETE", f"/profile/sshkeys/{ssh_key_id}")
+        return True
+
+    async def vultr_ssh_keys(self):
+        if self.provider != "vultr":
+            raise ProviderError("Vultr SSH keys are only available for Vultr")
+        rows, page = [], 1
+        while True:
+            data = await self._req("GET", f"/ssh-keys?per_page=500&page={page}")
+            current = data.get("ssh_keys", [])
+            rows.extend(current)
+            meta = data.get("meta") or {}
+            pages = meta.get("total_pages") or meta.get("last_page")
+            if not current or (pages is not None and page >= int(pages)):
+                break
+            if pages is None and len(current) < 500:
+                break
+            page += 1
+        return rows
+
+    async def create_vultr_ssh_key(self, name, ssh_key):
+        if self.provider != "vultr":
+            raise ProviderError("Vultr SSH keys are only available for Vultr")
+        data = await self._req("POST", "/ssh-keys", json={"name": str(name), "ssh_key": str(ssh_key).strip()})
+        return data.get("ssh_key", data)
+
+    async def delete_vultr_ssh_key(self, ssh_key_id):
+        if self.provider != "vultr":
+            raise ProviderError("Vultr SSH keys are only available for Vultr")
+        await self._req("DELETE", f"/ssh-keys/{ssh_key_id}")
+        return True
+
+    async def list_ssh_keys(self):
+        """Unified SSH keys retrieval across accounts."""
+        if self.provider == "hetzner":
+            return await self.hetzner_ssh_keys()
+        elif self.provider == "vultr":
+            return await self.vultr_ssh_keys()
+        elif self.provider == "linode":
+            return await self.linode_ssh_keys()
+        return []
+
+    async def create_ssh_key(self, name, public_key):
+        """Unified SSH key creation across accounts."""
+        if self.provider == "hetzner":
+            return await self.create_hetzner_ssh_key(name, public_key)
+        elif self.provider == "vultr":
+            return await self.create_vultr_ssh_key(name, public_key)
+        elif self.provider == "linode":
+            return await self.create_linode_ssh_key(name, public_key)
+        raise ProviderError(f"SSH keys not supported for {self.provider}")
+
+    async def delete_ssh_key(self, key_id):
+        """Unified SSH key deletion across accounts."""
+        if self.provider == "hetzner":
+            return await self.delete_hetzner_ssh_key(key_id)
+        elif self.provider == "vultr":
+            return await self.delete_vultr_ssh_key(key_id)
+        elif self.provider == "linode":
+            return await self.delete_linode_ssh_key(key_id)
+        raise ProviderError(f"SSH keys not supported for {self.provider}")
+
+    async def resolve_ssh_keys_for_instance(self, stored_keys):
+        """Prepare SSH keys representation suited for create_server given stored keys dicts."""
+        if not stored_keys:
+            return None
+        keys = []
+        if self.provider == "hetzner":
+            for k in stored_keys:
+                try:
+                    hk = await self.create_hetzner_ssh_key(k["name"], k["public_key"])
+                    keys.append(hk.get("id") or k["name"])
+                except Exception:
+                    keys.append(k["name"])
+        elif self.provider == "vultr":
+            existing = []
+            try:
+                existing = await self.vultr_ssh_keys()
+            except Exception:
+                pass
+            existing_map = {item.get("name"): item.get("id") for item in existing if item.get("id")}
+            for k in stored_keys:
+                if k["name"] in existing_map:
+                    keys.append(existing_map[k["name"]])
+                else:
+                    try:
+                        vk = await self.create_vultr_ssh_key(k["name"], k["public_key"])
+                        if vk.get("id"):
+                            keys.append(vk["id"])
+                    except Exception:
+                        pass
+        elif self.provider == "linode":
+            for k in stored_keys:
+                keys.append(k["public_key"])
+        return keys if keys else None
+

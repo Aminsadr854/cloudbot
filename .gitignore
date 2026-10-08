@@ -7,3 +7,5 @@ __pycache__/
 *.bak-*
 .DS_Store
 .analysis/
+verify_*.py
+comprehensive_test.py

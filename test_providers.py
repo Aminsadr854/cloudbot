@@ -175,6 +175,32 @@ class VultrBackupsAndAvailabilityTests(unittest.IsolatedAsyncioTestCase):
         await p.set_vultr_backups("inst-1", "disabled")
         p._req.assert_called_once_with("PATCH", "/instances/inst-1", json={"backups": "disabled"})
 
+    async def test_hetzner_create_server_disables_ipv6_by_default(self):
+        p = providers.Provider({"provider": "hetzner", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"server": {
+            "id": 12345, "name": "node-01", "datacenter": {"location": {"name": "fsn1", "country": "DE"}},
+            "public_net": {"ipv4": {"ip": "1.2.3.4"}, "ipv6": None},
+            "server_type": {"name": "cpx11"}
+        }, "root_password": "pass"})
+        res = await p.create_server("node-01", "fsn1", "cpx11", "ubuntu-22.04", "pwd")
+        call_args = p._req.call_args
+        self.assertEqual(call_args[0][0], "POST")
+        self.assertEqual(call_args[0][1], "/servers")
+        body = call_args[1]["json"]
+        self.assertEqual(body["public_net"], {"enable_ipv4": True, "enable_ipv6": False})
+        self.assertEqual(res["id"], 12345)
+
+    async def test_hetzner_create_server_enables_ipv6_when_specified(self):
+        p = providers.Provider({"provider": "hetzner", "token": "test", "proxy": None})
+        p._req = AsyncMock(return_value={"server": {
+            "id": 12345, "name": "node-01", "datacenter": {"location": {"name": "fsn1", "country": "DE"}},
+            "public_net": {"ipv4": {"ip": "1.2.3.4"}, "ipv6": {"ip": "2a01::1"}},
+            "server_type": {"name": "cpx11"}
+        }, "root_password": "pass"})
+        await p.create_server("node-01", "fsn1", "cpx11", "ubuntu-22.04", "pwd", enable_ipv6=True)
+        body = p._req.call_args[1]["json"]
+        self.assertEqual(body["public_net"], {"enable_ipv4": True, "enable_ipv6": True})
+
 
 class ProxyFamilyTests(unittest.IsolatedAsyncioTestCase):
     async def test_ipv4_replaces_dual_stack_proxy_hostname(self):

@@ -82,14 +82,40 @@ Then open the bot, send `/start`, and fill in **⚙️ Settings**:
 | 🇮🇷 Iran relay | `host:port:user:password` of a box inside Iran. Everything that has to be measured from Iran runs there. |
 | 🌐 Cloudflare token | an API token that can edit DNS in your zones. |
 
-Cloud provider accounts are added from **➕ Add account**, each with its own
-proxy if it needs one. After entering a proxy, choose whether Cloudbot reaches
-that proxy using its default DNS behavior, IPv4 only, or IPv6 only. The latter
-two resolve the proxy hostname to the requested family before provider calls.
-Each account appears on one row. Open it and choose **⚙️ Manage account** to
-rename it or manage its proxy, including editing individual fields. The family
-choice affects Cloudbot's connection to the proxy; the proxy's own outbound
-address is what a provider API access allowlist sees.
+Open **🌐 ارائه‌دهندگان پراکسی (Proxy providers)** to save a provider name,
+format and session IDs. Paste NiceProxy or SwiftProxy lines for automatic
+extraction, or use `host:port:login-{country}-sid-{session_id}:password` followed by
+IDs, one per line. HTTP is the default; prefix SOCKS formats with `socks5://`.
+Only country and session change; duration settings such as `sst-15` and
+`time_10` stay in the format. Numeric IDs retain leading zeros. Standalone
+numbering is ignored only when importing full proxy lines. Set a default
+provider if desired. Connections always use the default address selection;
+there is no IPv4/IPv6 prompt. `{session}` remains supported as an alias.
+
+Cloud accounts are added from **➕ Add account**. Choose **🌍 کشور و ارائه‌دهنده**
+to use a pool, enter a manual proxy, or choose no proxy. Existing accounts have
+**⚙️ Manage account → 🌐 مدیریت پراکسی**. Custom proxy and provider/country
+choices are also available on replacement, country and retry screens, even
+with no saved providers; add any provider from the picker without restarting
+account import. Enter a
+country name, common Persian name or code (`Germany`, `آلمان`, `DE`, `USA`,
+`SG`, `SK`). The account uses its saved provider or your default; switch it
+explicitly when needed. Country changes retain the session if that pair is
+free. **🔄 سشن دیگر** requests a different supplied session; IDs are never
+generated. Availability is counted per country, not across the entire pool.
+
+One provider/country/session pair belongs to one account at a time, including
+manual edits and concurrent requests. Password, protocol and session-duration
+changes cannot bypass this rule. Another country or provider can use the same
+ID. Removing/replacing a proxy or deleting its account releases its binding.
+Connection testing reserves candidates for ten minutes; failures and cancelled
+wizards release them. Old responses cannot overwrite newer account changes.
+The provider menu flags legacy duplicate account bindings until you resolve
+them. Disable IDs/providers to stop new assignments while retaining current
+bindings; delete IDs/providers and edit formats only when unused.
+
+A cloud API allowlist sees the proxy's outbound address; a country/session identity does
+not guarantee a permanently fixed or distinct public IP from the provider.
 
 Cloudbot warms local account, server, Floating IP, and Hetzner Primary IP
 snapshots at startup. Account/server menus, primary IP pages, and location
@@ -152,20 +178,23 @@ separately when deleting the IP.
   worthless measured from anywhere else
 * `paytun` in `assets/` if you want tunnels (see the paytun project)
 
-## API and MCP for AI clients
+## Web Hosting Console & API for automation
 
-The owner automation API listens on `127.0.0.1:9601` with its own bearer token.
-An MCP stdio server exposes named tools through SSH and calls that API. They can
-inspect accounts, servers, watchdog status, tunnels, and DNS, as well as create
-servers, manage Floating IPs, control Vultr power, and update DNS with explicit
-confirmation values. See [AI_API_MCP.md](AI_API_MCP.md) for installation,
-authentication, the full operation table, examples, and MCP client setup.
+Cloudbot includes a modern web-based hosting console and owner automation API listening on `127.0.0.1:9601`:
+* **Web Hosting Dashboard (`http://127.0.0.1:9601`)**: A responsive single-page console providing full hosting capabilities:
+  - Multi-cloud server inventory (Hetzner, Vultr, Linode) with live power controls, root password reveals from the encrypted vault, and instance teardown.
+  - Interactive deployment wizard with dynamic region/plan inventory and SSH key injection.
+  - Floating IP & Reserved IP management: allocation, attachment to instances, reverse DNS PTR records, and copyable guest OS network configuration commands.
+  - SSH Key Vault: in-browser Ed25519 keypair generation, public key storage, and auto-syncing to cloud providers.
+  - Cloud accounts, proxy pool routing, and Cloudflare DNS management.
+  - Local access via loopback or SSH tunnel: `ssh -L 9601:127.0.0.1:9601 root@YOUR_CLOUDBOT_HOST`.
+* **Automation API & MCP**: JSON operations protected by bearer token for AI clients (Claude, Cursor, Antigravity) and custom tooling. See [AI_API_MCP.md](AI_API_MCP.md) for endpoints, confirmation guardrails, and MCP setup.
 
 ## Notes
 
 * Only the owner id can use the bot. Every message and button from anyone else
   is refused.
-* Provider tokens, proxies, panel credentials, relay logins and the subscription
-  link are encrypted. Host names, ports and measurements are not — they are
+* Panel credentials, relay logins and the subscription link are encrypted like
+  the cloud credentials and proxy formats. Measurements are not — they are
   operational data, and being able to read them is worth more than hiding them.
 * Automatic server replacement is off until you switch it on. It spends money.

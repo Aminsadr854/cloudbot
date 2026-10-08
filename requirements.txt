@@ -3,4 +3,5 @@ aiohttp
 aiohttp-socks
 asyncssh
 cryptography
+pycountry>=24.6.1,<27
 mcp>=2.0,<3

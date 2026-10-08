@@ -54,29 +54,53 @@ For access from your workstation, open an SSH tunnel with `ssh -L 9601:127.0.0.1
 |---|---|---|
 | `accounts` | `{}` | Account IDs, labels, and providers; no tokens or proxy secrets |
 | `account_info` | `account_id` | Provider identity, balance, and credit details |
-| `servers` | `account_id` | Servers in the account |
+| `add_account` | `label`, `provider`, `token`, `proxy?`, `proxy_family?`, `auto_backup?` | Encrypts and adds new cloud account |
+| `delete_account` | `account_id`, `confirm: "DELETE_ACCOUNT"` | Removes cloud account |
+| `check_all_accounts` | `refresh?` | Status and balance check across all accounts (instant SQLite cache; `refresh: true` polls cloud) |
+| `servers` | `account_id` | Servers in one account |
+| `all_servers` | `refresh?` | Multi-cloud server inventory (instant SQLite cache; `refresh: true` polls cloud) |
 | `server` | `account_id`, `server_id` | One server and attached Floating IPs |
+| `create_server` | `account_id`, `name`, `region`, `plan`, `image`, `ssh_keys?`, `ssh_key_ids?`, `confirm: "CREATE_SERVER"` | Creates one billable server; root password is encrypted and stored |
+| `delete_server` | `account_id`, `server_id`, `confirm: "DELETE_SERVER"` | Permanently terminates instance |
+| `server_password` | `account_id`, `server_id`, `confirm: "SHOW_PASSWORD"` | Decrypts root password from secure vault |
+| `power_server` | `account_id`, `server_id`, `action`, `confirm` | Power control (Hetzner, Vultr, Linode); actions: `start`, `reboot`, `halt` |
 | `regions` | `account_id` | Available locations |
 | `plans` | `account_id`, `region` | Available plans and price labels |
 | `images` | `account_id` | OS images |
-| `floating_ips` | `account_id`, `server_id` | Attached Reserved/Floating IPs |
+| `ssh_keys` | `{}` | List stored SSH public keys in vault |
+| `add_ssh_key` | `name`, `public_key`, `sync_accounts?` | Adds key to vault, optionally syncing to cloud accounts |
+| `delete_ssh_key` | `key_id`, `confirm: "DELETE_SSH_KEY"` | Deletes SSH key from vault |
+| `all_floating_ips` | `account_id?`, `refresh?` | Multi-cloud Floating / Reserved IPs (instant SQLite cache; `refresh: true` polls cloud) |
+| `floating_ips` | `account_id`, `server_id` | Attached Reserved/Floating IPs for server |
+| `create_floating_ip` | `account_id`, `server_id?`, `home_location?`, `ip_type`, `confirm: "CREATE_FLOATING_IP"` | Billable Hetzner/Vultr floating/reserved IP |
+| `delete_floating_ip` | `account_id`, `floating_id`, `server_id?`, `confirm: "DELETE_FLOATING_IP"` | Permanently deletes floating IP |
+| `assign_floating_ip` | `account_id`, `floating_id`, `server_id` | Attaches floating IP to server |
+| `unassign_floating_ip` | `account_id`, `floating_id` | Detaches floating IP from server |
+| `update_floating_ip` | `account_id`, `floating_id`, `description?`, `dns_ptr?` | Updates label or reverse DNS PTR |
+| `hetzner_primary_ips` | `account_id`, `refresh?` | Project-wide Hetzner Primary IPs (instant SQLite cache; `refresh: true` polls cloud) |
+| `create_hetzner_primary_ip` | `account_id`, `location`, `ip_type`, `name`, `confirm: "CREATE_PRIMARY_IP"` | Allocates Hetzner Primary IP |
+| `assign_hetzner_primary_ip` | `account_id`, `ip_id`, `server_id` | Assigns Hetzner Primary IP |
+| `unassign_hetzner_primary_ip` | `account_id`, `ip_id` | Unassigns Hetzner Primary IP |
+| `delete_hetzner_primary_ip` | `account_id`, `ip_id`, `confirm: "DELETE_PRIMARY_IP"` | Deletes Hetzner Primary IP |
+| `proxy_pool` | `{}` | Active proxy pools and session configuration |
 | `watch_status` | `{}` | Watchdog settings and latest results |
 | `tunnels` | `{}` | Registered tunnel IDs and endpoints without encrypted details |
 | `dns_zones` | `{}` | Cloudflare zones |
+| `dns_records` | `zone_id` | Cloudflare DNS records in zone |
 | `dns_record` | `name` | A record or `null` |
-| `create_server` | `account_id`, `name`, `region`, `plan`, `image`, `confirm: "CREATE_SERVER"` | Creates one billable server; root password is encrypted and stored |
-| `power_server` | `account_id`, `server_id`, `action`, `confirm` | Vultr start, halt, reboot; confirmation is `START`, `HALT`, `REBOOT` |
-| `create_floating_ip` | `account_id`, `server_id`, `ip_type`, `confirm: "CREATE_FLOATING_IP"` | Billable Vultr IPv4 or Hetzner IPv4/IPv6 |
-| `delete_floating_ip` | `account_id`, `server_id`, `floating_id`, `confirm: "DELETE_FLOATING_IP"` | Permanently deletes an attached IP |
 | `upsert_dns` | `name`, `ip`, `confirm: "UPSERT_DNS"` | Creates or repoints a Cloudflare A record |
+| `delete_dns_record` | `zone_id`, `record_id`, `confirm: "DELETE_DNS"` | Deletes Cloudflare DNS record |
 
-Example creation body after calling `regions`, `plans`, and `images`:
+## Web Hosting Console
 
-```json
-{"account_id":1,"name":"node-01","region":"fsn1","plan":"cx23","image":"ubuntu-24.04","confirm":"CREATE_SERVER"}
-```
-
-Server root passwords are never returned by the API or MCP. The owner can retrieve one from its SSH details in Telegram. Hetzner Floating IP allocation does not configure the guest OS. Server deletion, panel node provisioning, provider credential management, and tunnel repair remain Telegram workflows.
+In addition to programmatic API calls, `control_api.py` serves a modern, full-featured hosting console web interface at `http://127.0.0.1:9601/`:
+- **Compute Dashboard**: Multi-cloud server inventory, live power controls, root password reveal with confirmation, and one-click deletion.
+- **Deployment Wizard**: Visual cloud instance launch wizard with live plan availability, OS selection, and SSH key injection.
+- **IP Management**: Allocate and assign Floating/Reserved IPs, configure Reverse PTR, inspect Hetzner Primary IPs, and copy guest OS configuration commands (`ip addr add...` and Netplan).
+- **SSH Key Vault**: Generate Ed25519 key pairs directly in browser, add public keys, and sync to cloud providers.
+- **Cloud Accounts & Proxies**: Manage credentials and proxy routing.
+- **DNS Management**: View and modify Cloudflare DNS records.
+- Access locally via browser or via SSH tunnel: `ssh -L 9601:127.0.0.1:9601 root@YOUR_CLOUDBOT_HOST`.
 
 ## MCP connection
 

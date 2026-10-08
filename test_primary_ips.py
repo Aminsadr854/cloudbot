@@ -195,3 +195,30 @@ class PrimaryBotTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             await task
         self.assertEqual(len(calls), 2)
+
+    async def test_populate_server_ip_cache_from_store(self):
+        fake_servers_data = {
+            "servers": [
+                {
+                    "id": "101",
+                    "account_id": 1,
+                    "account_label": "Hetzner-1",
+                    "provider": "hetzner",
+                    "label": "web-prod-1",
+                    "ips": ["95.217.1.1", "2a01:4f8:1c1c:1::1"],
+                    "floating_ips": [{"ip": "159.69.1.1", "server": "101"}]
+                }
+            ]
+        }
+        with patch.object(self.b.st, 'get_cache', side_effect=lambda k: fake_servers_data if k == 'all_servers' else {}):
+            loaded = await self.b.populate_server_ip_cache_from_store()
+            self.assertEqual(loaded, 1)
+            self.assertIn((1, "101"), self.b.server_cache)
+            self.assertIn("95.217.1.1", self.b.server_ip_cache)
+            self.assertIn((1, "101"), self.b.server_ip_cache["95.217.1.1"])
+
+    async def test_menu_cache_scheduler_is_dormant(self):
+        with patch.object(self.b, 'schedule_all_server_ip_cache_refresh') as mock_sched:
+            await self.b.menu_cache_scheduler()
+            mock_sched.assert_not_called()
+

@@ -8,11 +8,17 @@ A single file holding plaintext tokens for every cloud account would be a
 worse leak than the servers themselves, so the key sits in its own root-only
 file and the database on its own is useless.
 """
+import json
+import logging
 import os
+import secrets
 import sqlite3
 import time
 
+log = logging.getLogger(__name__)
+
 from cryptography.fernet import Fernet
+from proxy_pool import POOL_SCHEMA, ProxyPoolStore, ProxyPoolError
 
 DB_PATH = os.environ.get("CLOUDBOT_DB", "/opt/cloudbot/data/cloudbot.db")
 KEY_PATH = os.environ.get("CLOUDBOT_KEY", "/opt/cloudbot/data/secret.key")
@@ -30,6 +36,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     proxy     BLOB,                   -- encrypted host:port:user:pass, or NULL
     proxy_family TEXT NOT NULL DEFAULT 'default', -- default | ipv4 | ipv6
     auto_backup  TEXT NOT NULL DEFAULT 'disabled', -- disabled | enabled
+    region       TEXT NOT NULL DEFAULT '',        -- ISO country code e.g. 'DE', 'US'
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tunnels (
@@ -64,6 +71,24 @@ CREATE TABLE IF NOT EXISTS cf_prefix_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_prefix_stats_last_sampled
     ON cf_prefix_stats (last_sampled);
+CREATE TABLE IF NOT EXISTS ssh_keys (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT NOT NULL,
+    public_key  TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    created_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS data_cache (
+    k          TEXT PRIMARY KEY,
+    v          TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS login_otps (
+    otp         TEXT PRIMARY KEY,
+    user_id     INTEGER NOT NULL,
+    expires_at  REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_login_otps_exp ON login_otps(expires_at);
 """
 
 
@@ -78,14 +103,14 @@ def _fernet(key_path=None):
         return Fernet(f.read())
 
 
-class Store:
+class Store(ProxyPoolStore):
     def __init__(self, db_path=None, key_path=None):
         self.db_path = db_path or os.environ.get("CLOUDBOT_DB", DB_PATH)
         self.key_path = key_path or os.environ.get("CLOUDBOT_KEY", KEY_PATH)
         os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         self.con = sqlite3.connect(self.db_path, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
-        self.con.executescript(SCHEMA)
+        self.con.executescript(SCHEMA + POOL_SCHEMA)
         # Existing installations predate the per-proxy IP-family preference.
         # SQLite's CREATE TABLE IF NOT EXISTS does not add columns, so migrate
         # them in place without touching their encrypted credentials.
@@ -97,6 +122,18 @@ class Store:
             self.con.execute("ALTER TABLE accounts ADD COLUMN auto_backup TEXT NOT NULL DEFAULT 'disabled'")
             self.con.commit()
         self.f = _fernet(self.key_path)
+        if "proxy_revision" not in columns:
+            self.con.execute("ALTER TABLE accounts ADD COLUMN proxy_revision INTEGER NOT NULL DEFAULT 0")
+            self.con.commit()
+        if "region" not in columns:
+            self.con.execute("ALTER TABLE accounts ADD COLUMN region TEXT NOT NULL DEFAULT ''")
+            self.con.commit()
+        self.con.execute("CREATE TABLE IF NOT EXISTS data_cache (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at REAL NOT NULL)")
+        self.con.commit()
+        with self.proxy_transaction():
+            self.con.execute("UPDATE accounts SET proxy_family='default', proxy_revision=proxy_revision+1 WHERE proxy_family<>'default'")
+            self.con.execute("UPDATE proxy_providers SET family='default' WHERE family<>'default'")
+            self._sync_proxy_claims()
 
     def close(self):
         try:
@@ -105,18 +142,30 @@ class Store:
             pass
 
     # ---- accounts ------------------------------------------------------
-    def add_account(self, label, provider, token, proxy=None, proxy_family="default", auto_backup="disabled"):
-        self.con.execute(
-            "INSERT INTO accounts (label, provider, token, proxy, proxy_family, auto_backup, created_at)"
-            " VALUES (?,?,?,?,?,?,?)",
-            (label, provider, self.f.encrypt(token.encode()),
-             self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, auto_backup, int(time.time())))
-        self.con.commit()
-        return self.con.execute("SELECT last_insert_rowid()").fetchone()[0]
+    def add_account(self, label, provider, token, proxy=None, proxy_family="default", auto_backup="disabled", proxy_request=None, region=""):
+        proxy_family = "default"
+        with self.proxy_transaction():
+            if proxy_request:
+                self._check_proxy_reservation(proxy_request, None, proxy)
+            else:
+                self._guard_proxy(proxy)
+            cur = self.con.execute(
+                "INSERT INTO accounts (label, provider, token, proxy, proxy_family, auto_backup, region, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?)",
+                (label, provider, self.f.encrypt(token.encode()),
+                 self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, auto_backup,
+                 str(region or "").strip().upper(), int(time.time())))
+            acc_id = cur.lastrowid
+            if proxy_request:
+                self.con.execute('DELETE FROM proxy_claims WHERE request_token=?', (proxy_request,))
+            self._sync_proxy_claims()
+        return acc_id
 
     def delete_account(self, acc_id):
-        n = self.con.execute("DELETE FROM accounts WHERE id = ?", (acc_id,)).rowcount
-        self.con.commit()
+        with self.proxy_transaction():
+            n = self.con.execute("DELETE FROM accounts WHERE id = ?", (acc_id,)).rowcount
+            self.con.execute('DELETE FROM proxy_claims WHERE account_id=?', (acc_id,))
+            self._sync_proxy_claims()
         return n
 
     def set_account_label(self, acc_id, label):
@@ -124,17 +173,31 @@ class Store:
         self.con.execute("UPDATE accounts SET label = ? WHERE id = ?", (label, acc_id))
         self.con.commit()
 
-    def set_proxy(self, acc_id, proxy, proxy_family="default"):
+    def set_proxy(self, acc_id, proxy, proxy_family="default", proxy_request=None):
         """Set, change, or clear (proxy=None) an account's proxy preference."""
-        self.con.execute(
-            "UPDATE accounts SET proxy = ?, proxy_family = ? WHERE id = ?",
-            (self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, acc_id))
-        self.con.commit()
+        proxy_family = "default"
+        with self.proxy_transaction():
+            if not self.account(acc_id):
+                raise ProxyPoolError('اکانت یافت نشد.')
+            if proxy_request:
+                self._check_proxy_reservation(proxy_request, acc_id, proxy)
+            else:
+                self._guard_proxy(proxy, acc_id)
+            self.con.execute(
+                "UPDATE accounts SET proxy = ?, proxy_family = ?, proxy_revision=proxy_revision+1 WHERE id = ?",
+                (self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, acc_id))
+            self.con.execute('DELETE FROM proxy_claims WHERE account_id=? AND request_token IS NOT NULL', (acc_id,))
+            self._sync_proxy_claims()
 
     def set_auto_backup(self, acc_id, auto_backup="disabled"):
         """Enable or disable auto-backups on newly created servers for this account."""
         self.con.execute("UPDATE accounts SET auto_backup = ? WHERE id = ?", (auto_backup, acc_id))
         self.con.commit()
+
+    def set_account_region(self, acc_id, region):
+        """Set or update an account's ISO country / region code for Playwright & proxy routing."""
+        with self.proxy_transaction():
+            self.con.execute("UPDATE accounts SET region = ? WHERE id = ?", (str(region or "").strip().upper(), acc_id))
 
     def _row(self, r):
         return {
@@ -143,7 +206,9 @@ class Store:
             "proxy": self.f.decrypt(r["proxy"]).decode() if r["proxy"] else None,
             "proxy_family": r["proxy_family"] if "proxy_family" in r.keys() else "default",
             "auto_backup": r["auto_backup"] if "auto_backup" in r.keys() else "disabled",
+            "region": (r["region"] if "region" in r.keys() and r["region"] else ""),
             "created_at": r["created_at"],
+            "proxy_revision": r["proxy_revision"],
         }
 
     def accounts(self):
@@ -175,6 +240,8 @@ class Store:
             "DELETE FROM server_secrets WHERE account_id = ? AND server_id = ?",
             (account_id, str(server_id)))
         self.con.commit()
+
+    delete_server_pass = forget_server
 
     # ---- tunnels -------------------------------------------------------
     def add_tunnel(self, kind, iran_host, foreign_host, ports, detail: dict):
@@ -1038,3 +1105,104 @@ class Store:
     def set(self, k, v):
         self.con.execute("INSERT OR REPLACE INTO settings (k, v) VALUES (?,?)", (k, str(v)))
         self.con.commit()
+
+    # ---- SSH keys ------------------------------------------------------
+    def add_ssh_key(self, name: str, public_key: str) -> int:
+        name = (name or "").strip()
+        public_key = (public_key or "").strip()
+        if not name:
+            raise ValueError("SSH key name cannot be empty")
+        if not public_key:
+            raise ValueError("SSH public key cannot be empty")
+        fp = compute_ssh_fingerprint(public_key)
+        cur = self.con.execute(
+            "INSERT INTO ssh_keys (name, public_key, fingerprint, created_at) VALUES (?, ?, ?, ?)",
+            (name, public_key, fp, int(time.time()))
+        )
+        self.con.commit()
+        return cur.lastrowid
+
+    def ssh_keys(self) -> list[dict]:
+        return [dict(r) for r in self.con.execute(
+            "SELECT id, name, public_key, fingerprint, created_at FROM ssh_keys ORDER BY created_at DESC"
+        )]
+
+    def ssh_key(self, key_id: int) -> dict | None:
+        r = self.con.execute(
+            "SELECT id, name, public_key, fingerprint, created_at FROM ssh_keys WHERE id = ?",
+            (key_id,)
+        ).fetchone()
+        return dict(r) if r else None
+
+    def delete_ssh_key(self, key_id: int) -> bool:
+        cur = self.con.execute("DELETE FROM ssh_keys WHERE id = ?", (key_id,))
+        self.con.commit()
+        return cur.rowcount > 0
+
+    def create_login_otp(self, user_id: int, ttl: int = 600) -> str:
+        otp = secrets.token_urlsafe(32)
+        exp = time.time() + ttl
+        with self.con:
+            self.con.execute("DELETE FROM login_otps WHERE expires_at < ?", (time.time(),))
+            self.con.execute("INSERT INTO login_otps (otp, user_id, expires_at) VALUES (?, ?, ?)",
+                             (otp, int(user_id), exp))
+        return otp
+
+    def verify_and_consume_login_otp(self, otp: str) -> Optional[int]:
+        if not otp:
+            return None
+        now = time.time()
+        with self.con:
+            row = self.con.execute("SELECT user_id, expires_at FROM login_otps WHERE otp = ?", (otp,)).fetchone()
+            if not row:
+                return None
+            self.con.execute("DELETE FROM login_otps WHERE otp = ?", (otp,))
+            user_id = row["user_id"] if isinstance(row, sqlite3.Row) else row[0]
+            expires_at = row["expires_at"] if isinstance(row, sqlite3.Row) else row[1]
+            if now > expires_at:
+                return None
+            return int(user_id)
+
+    # ---- data cache ----------------------------------------------------
+    def get_cache(self, k: str, default=None):
+        try:
+            row = self.con.execute("SELECT v FROM data_cache WHERE k = ?", (k,)).fetchone()
+            if not row:
+                return default
+            return json.loads(row["v"] if isinstance(row, sqlite3.Row) else row[0])
+        except Exception as e:
+            log.warning("Failed getting cache for %s: %s", k, e)
+            return default
+
+    def set_cache(self, k: str, val):
+        try:
+            payload = json.dumps(val)
+            self.con.execute(
+                "INSERT OR REPLACE INTO data_cache (k, v, updated_at) VALUES (?, ?, ?)",
+                (k, payload, time.time())
+            )
+            self.con.commit()
+        except Exception as e:
+            log.warning("Failed setting cache for %s: %s", k, e)
+
+    def delete_cache(self, k: str):
+        try:
+            self.con.execute("DELETE FROM data_cache WHERE k = ? OR k LIKE ?", (k, f"{k}:%"))
+            self.con.commit()
+        except Exception as e:
+            log.warning("Failed deleting cache for %s: %s", k, e)
+
+
+def compute_ssh_fingerprint(public_key: str) -> str:
+    import base64
+    import hashlib
+    parts = (public_key or "").strip().split()
+    if len(parts) >= 2:
+        try:
+            raw = base64.b64decode(parts[1])
+            fp = base64.b64encode(hashlib.sha256(raw).digest()).decode('ascii').rstrip('=')
+            return f"SHA256:{fp}"
+        except Exception:
+            pass
+    return "UNKNOWN"
+

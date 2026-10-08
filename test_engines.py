@@ -8,30 +8,12 @@ import json
 import os
 import shlex
 import signal
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
-
-sys.modules.setdefault("asyncssh", MagicMock())
-sys.modules.setdefault("aiohttp", MagicMock())
-sys.modules.setdefault("aiogram", MagicMock())
-sys.modules.setdefault("aiogram.client.default", MagicMock())
-sys.modules.setdefault("aiogram.enums", MagicMock())
-sys.modules.setdefault("aiogram.filters", MagicMock())
-sys.modules.setdefault("aiogram.fsm.context", MagicMock())
-class _DummyStatesGroup:
-    pass
-class _DummyState:
-    pass
-_fsm_state = MagicMock()
-_fsm_state.StatesGroup = _DummyStatesGroup
-_fsm_state.State = _DummyState
-sys.modules.setdefault("aiogram.fsm.state", _fsm_state)
-sys.modules.setdefault("aiogram.fsm.storage.memory", MagicMock())
-sys.modules.setdefault("aiogram.types", MagicMock())
-sys.modules.setdefault("aiogram.utils.keyboard", MagicMock())
 
 import store
 import cfscanner
@@ -584,7 +566,7 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         """
         env = {
             "CLOUDBOT_PROBE": "https://legacy.probe.example.com",
-            "CLOUDBOT_TOKEN": "mock:token",
+            "CLOUDBOT_TOKEN": "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
             "CLOUDBOT_OWNER": "123456",
             "CLOUDBOT_PANEL_URL": "https://panel.example.com",
             "CLOUDBOT_PANEL_USER": "admin",
@@ -595,11 +577,16 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, env, clear=True):
             engine_val = scanner_engine.get_probe_base()
             self.assertEqual(engine_val, "https://legacy.probe.example.com")
-            import bot
-            import importlib
-            importlib.reload(bot)
-            self.assertEqual(bot.PROBE_BASE, "https://legacy.probe.example.com")
-            self.assertEqual(bot.PROBE_BASE, engine_val)
+            # Isolate the bot's module-level clients, SQLite connection and FSM
+            # from the Telegram and account tests that run in this process.
+            result = subprocess.run(
+                [sys.executable, '-c',
+                 'import bot, scanner_engine; '
+                 'assert bot.PROBE_BASE == "https://legacy.probe.example.com"; '
+                 'assert bot.PROBE_BASE == scanner_engine.get_probe_base(); bot.st.close()'],
+                env=env, cwd=os.path.dirname(os.path.abspath(__file__)),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
 
     # Test 12 — _report_trusted() rejects Wi-Fi or empty measurements
     def test_regression_12_report_trusted_behavior_unchanged(self):
@@ -1918,6 +1905,5 @@ class ThreeEngineScannerTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
 
 

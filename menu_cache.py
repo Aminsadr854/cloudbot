@@ -8,7 +8,7 @@ log = logging.getLogger(__name__)
 
 
 class MenuCache:
-    def __init__(self, ttl=60, retry=15):
+    def __init__(self, ttl=1800, retry=30):
         self.ttl, self.retry = ttl, retry
         self.entries, self.tasks = {}, {}
         self.identities, self.revisions = {}, {}
