@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cloudbot | Multi-Cloud Hosting Console</title>
-  <link rel="stylesheet" href="/ui/style.css">
+  <link rel="stylesheet" href="/ui/style.css?v=20261010-sync2">
   <link rel="icon" type="image/svg+xml" href="/ui/assets/cloud.svg">
 </head>
 <body>
@@ -38,13 +38,13 @@
           </button>
         </div>
 
-        <!-- Cloud Providers & Accounts -->
+        <!-- Resources -->
         <div class="nav-section">
-          <div class="nav-section-title">Cloud Infrastructure</div>
+          <div class="nav-section-title">Resources</div>
           <button class="nav-item" data-tab="tab-accounts">
             <div class="nav-item-left">
               <span class="nav-icon">👥</span>
-              <span>Account Management</span>
+              <span>Accounts</span>
             </div>
             <span class="nav-count-badge" id="badge-accounts-count">0</span>
           </button>
@@ -71,34 +71,34 @@
           </button>
         </div>
 
-        <!-- Networking & Security -->
+        <!-- Connectivity -->
         <div class="nav-section">
-          <div class="nav-section-title">Networking & Security</div>
+          <div class="nav-section-title">Connectivity</div>
           <button class="nav-item" data-tab="tab-proxies">
             <div class="nav-item-left">
               <span class="nav-icon">🛡️</span>
-              <span>Proxy Management</span>
+              <span>Proxies</span>
             </div>
             <span class="nav-count-badge" id="badge-proxies-count">0</span>
           </button>
           <button class="nav-item" data-tab="tab-compute">
             <div class="nav-item-left">
               <span class="nav-icon">🖥️</span>
-              <span>All Instances</span>
+              <span>Instances</span>
             </div>
             <span class="nav-count-badge" id="badge-total-servers">0</span>
           </button>
           <button class="nav-item" data-tab="tab-ips">
             <div class="nav-item-left">
               <span class="nav-icon">🌐</span>
-              <span>IP Management</span>
+              <span>IPs</span>
             </div>
             <span class="nav-count-badge" id="badge-fips-count">0</span>
           </button>
           <button class="nav-item" data-tab="tab-ssh">
             <div class="nav-item-left">
               <span class="nav-icon">🔑</span>
-              <span>SSH Key Vault</span>
+              <span>SSH Keys</span>
             </div>
             <span class="nav-count-badge" id="badge-ssh-count">0</span>
           </button>
@@ -180,6 +180,18 @@
           </button>
         </div>
       </header>
+
+      <div class="sync-status-strip" id="sync-status-strip" data-state="idle" role="status" aria-live="polite">
+        <div class="sync-status-main">
+          <span class="sync-status-dot" id="sync-status-dot"></span>
+          <span class="sync-status-label" id="sync-status-label">Waiting for first sync</span>
+          <span class="sync-status-detail" id="sync-status-detail">Your cached data will appear here.</span>
+        </div>
+        <div class="sync-status-actions">
+          <span class="sync-attention-badge hidden" id="sync-attention-badge">0 need attention</span>
+          <button class="btn btn-secondary btn-sm" id="btn-sync-strip-refresh" type="button">Refresh now</button>
+        </div>
+      </div>
 
       <!-- App Body Content -->
       <div class="content-body">
@@ -1999,6 +2011,32 @@ eu.swiftproxy.net:7878:user_country_MY_sid_27369619_time_10:mypassword"></textar
               </div>
             </div>
 
+            <!-- Bulk Actions Toolbar for Server Attached Floating IPs -->
+            <div id="srvmodal-fip-bulk-bar" class="bulk-actions-toolbar mb-3" style="display: none;">
+              <div class="flex items-center gap-2">
+                <span class="bulk-count-badge" id="srvmodal-fip-bulk-count">0</span>
+                <span class="text-sm font-medium">IPs selected</span>
+              </div>
+              <div class="flex items-center gap-2 flex-wrap">
+                <button type="button" class="btn btn-secondary btn-sm" onclick="clearServerModalFipSelection()">Deselect All</button>
+                <button type="button" class="btn btn-warning btn-sm" id="btn-srvmodal-bulk-detach" onclick="detachSelectedFipsFromModal(this)">
+                  🔓 Detach Selected (<span id="srvmodal-bulk-detach-count">0</span>)
+                </button>
+                <button type="button" class="btn btn-danger btn-sm" id="btn-srvmodal-bulk-delete" onclick="detachAndDeleteSelectedFipsFromModal(this)">
+                  🗑️ Detach & Delete Selected (<span id="srvmodal-bulk-delete-count">0</span>)
+                </button>
+              </div>
+            </div>
+
+            <!-- Select All Row -->
+            <div id="srvmodal-fips-select-row" class="flex items-center justify-between py-2 px-3 mb-2.5 bg-surface-hover rounded-md border border-subtle" style="display: none;">
+              <label class="flex items-center gap-2.5 cursor-pointer text-xs font-semibold text-primary select-none">
+                <input type="checkbox" id="srvmodal-select-all-fips" class="checkbox-input" onchange="toggleSelectAllServerModalFips(this)">
+                <span>Select All (<span id="srvmodal-fips-total-count">0</span>)</span>
+              </label>
+              <div class="text-xs text-secondary font-medium">Select multiple IPs to batch detach or delete</div>
+            </div>
+
             <!-- Attached IPs List Container -->
             <div id="srvmodal-fips-list" class="space-y-2">
               <!-- Rendered dynamically -->
@@ -2238,6 +2276,8 @@ eu.swiftproxy.net:7878:user_country_MY_sid_27369619_time_10:mypassword"></textar
   <div class="toast-container" id="toast-container"></div>
 
   <!-- JavaScript Application Bundle -->
-  <script src="/ui/app.js"></script>
+  <script src="/ui/api-client.js?v=20261010-sync2"></script>
+  <script src="/ui/sync-manager.js?v=20261010-sync2"></script>
+  <script src="/ui/app.js?v=20261010-sync2"></script>
 </body>
 </html>

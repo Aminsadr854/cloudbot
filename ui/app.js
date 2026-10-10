@@ -30,8 +30,17 @@ const state = {
   providerIpFilter: "all",
   selectedServers: new Map(),
   selectedIps: new Map(),
-  ipsAccountFilter: "all"
+  ipsAccountFilter: "all",
+  selectedServerModalFips: new Map(),
+  accountErrors: {},
+  liveAccountFailures: {},
+  recoveryStatus: {},
+  syncSnapshot: null
 };
+
+let syncManager = null;
+let authInvalidated = false;
+const proxyRecoveryInFlight = new Map();
 
 function isServerRunning(status) {
   if (!status) return true;
@@ -56,6 +65,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   initModals();
   initForms();
   initAuth();
+  initSyncManager();
 
   const authed = await checkSessionAuth();
   if (authed) {
@@ -79,6 +89,7 @@ async function checkSessionAuth() {
       const data = await res.json();
       if (data.authenticated) {
         state.authenticated = true;
+        authInvalidated = false;
         const userLabel = document.getElementById("auth-user-label");
         if (userLabel && data.bot_username) {
           userLabel.textContent = `@${data.bot_username}`;
@@ -125,6 +136,7 @@ window.onTelegramAuth = async function(user) {
     if (res.ok && data.token) {
       state.token = data.token;
       state.authenticated = true;
+      authInvalidated = false;
       localStorage.setItem("cloudbot_token", data.token);
       closeModal("modal-auth-login");
       showToast("Telegram authentication successful!", "success");
@@ -170,6 +182,7 @@ function initAuth() {
 
         state.token = token;
         state.authenticated = true;
+        authInvalidated = false;
         if (rememberCheckbox.checked) {
           localStorage.setItem("cloudbot_token", token);
           sessionStorage.removeItem("cloudbot_token");
@@ -189,33 +202,22 @@ function initAuth() {
 }
 
 // ==================== API CLIENT ====================
-async function api(operation, args = {}) {
-  const headers = { "Content-Type": "application/json" };
-  if (state.token) {
-    headers["Authorization"] = `Bearer ${state.token}`;
-  }
-
-  const res = await fetch(`/v1/operations/${operation}`, {
-    method: "POST",
-    headers,
-    body: JSON.stringify(args)
-  });
-
-  if (res.status === 401) {
+const apiClient = window.CloudbotApiClient.create({
+  getToken: () => state.token,
+  onUnauthorized: () => {
+    if (authInvalidated) return;
+    authInvalidated = true;
     state.token = "";
     state.authenticated = false;
     localStorage.removeItem("cloudbot_token");
     sessionStorage.removeItem("cloudbot_token");
     openModal("modal-auth-login");
     initTelegramWidget();
-    throw new Error("Authentication session expired; please sign in again.");
   }
+});
 
-  const data = await res.json();
-  if (!res.ok) {
-    throw new Error(data.error || `Operation ${operation} failed`);
-  }
-  return data;
+async function api(operation, args = {}, options = {}) {
+  return apiClient.request(operation, args, options);
 }
 
 // ==================== REGION HELPERS ====================
@@ -465,6 +467,33 @@ async function runAutoHealProxies() {
   }
 }
 
+async function replaceAccountProxy(accId, btnEl = null) {
+  const account = state.accounts.find(item => String(item.id) === String(accId));
+  if (!account || !account.has_proxy) {
+    showToast("This account does not have a proxy route to replace.", "info");
+    return;
+  }
+  const btn = btnEl || document.getElementById(`btn-replace-proxy-${accId}`);
+  await runWithButtonLoading(btn, async () => {
+    state.recoveryStatus[accId] = { status: "retrying" };
+    renderAccountsManagement();
+    try {
+      const result = await api("auto_heal_proxies", { account_id: account.id, force: true }, { retryMode: "never" });
+      const healed = result && Array.isArray(result.healed) && result.healed.some(item => String(item.id) === String(account.id));
+      state.recoveryStatus[accId] = healed
+        ? { status: "recovered", result, proxyReplaced: true }
+        : { status: "unresolved", result, error: "No working replacement proxy was found" };
+      showToast(healed ? `Proxy replaced for ${account.label}.` : `No working replacement was found for ${account.label}.`, healed ? "success" : "warning");
+      await loadAll(true);
+    } catch (err) {
+      state.recoveryStatus[accId] = { status: "unresolved", error: err.message };
+      renderAccountsManagement();
+      showToast(`Proxy replacement failed: ${err.message}`, "error");
+    }
+  }, "Replacing...");
+}
+window.replaceAccountProxy = replaceAccountProxy;
+
 function parseSessionIdsFromText(text, templateUsername = null) {
   if (!text) return [];
   const lines = text.split("\n").map(l => l.trim()).filter(Boolean);
@@ -599,7 +628,7 @@ function getAccountFailureStatus(accId) {
               (state.accountBilling && state.accountBilling[accId] && state.accountBilling[accId].status === "error" && state.accountBilling[accId].error);
   if (!err) return null;
   const str = String(err);
-  const isProxy = /proxy|socks|forbidden|403|refused|reset|timeout|ClientHttpProxyError/i.test(str);
+  const isProxy = window.CloudbotSync.proxyFailure(str);
   return {
     isProxy: isProxy,
     error: str,
@@ -608,86 +637,338 @@ function getAccountFailureStatus(accId) {
   };
 }
 
+function initSyncManager() {
+  if (syncManager) return syncManager;
+  syncManager = window.CloudbotSync.createManager({
+    resourceNames: ["accounts", "billing", "proxyProviders", "servers", "floatingIps", "primaryIps", "sshKeys", "dnsZones", "watchdog", "tunnels"],
+    freshForMs: 300000,
+    onState: (snapshot) => {
+      state.syncSnapshot = snapshot;
+      renderSyncStatus(snapshot);
+    }
+  });
+  renderSyncStatus(syncManager.snapshot());
+  const stripRefresh = document.getElementById("btn-sync-strip-refresh");
+  if (stripRefresh) stripRefresh.addEventListener("click", () => loadAll(true));
+  document.addEventListener("visibilitychange", () => {
+    const isSyncing = state.syncSnapshot && Object.values(state.syncSnapshot.resources || {}).some(item => item.status === "syncing");
+    if (!document.hidden && syncManager && state.syncSnapshot && !state.syncSnapshot.fresh && !isSyncing) {
+      loadAll(true);
+    }
+  });
+  return syncManager;
+}
+
+function renderSyncStatus(snapshot) {
+  const strip = document.getElementById("sync-status-strip");
+  const label = document.getElementById("sync-status-label");
+  const detail = document.getElementById("sync-status-detail");
+  const badge = document.getElementById("sync-attention-badge");
+  const refresh = document.getElementById("btn-sync-strip-refresh");
+  const sidebarConnection = document.getElementById("connection-status-text");
+  const sidebarDot = document.querySelector(".sidebar-footer .status-dot");
+  if (!strip || !snapshot) return;
+
+  const statuses = Object.values(snapshot.resources || {});
+  const hasStarted = snapshot.generation > 0;
+  const syncing = statuses.some(item => item.status === "syncing");
+  const attention = snapshot.attentionCount || 0;
+  const failedResources = Object.entries(snapshot.resources || {})
+    .filter(([, item]) => item.status === "stale" || item.status === "error")
+    .map(([name]) => name.replace(/([A-Z])/g, " $1").replace(/^./, ch => ch.toUpperCase()));
+  const stateName = !hasStarted ? "idle" : syncing ? "syncing" : attention ? "attention" : snapshot.fresh ? "synced" : "stale";
+  strip.dataset.state = stateName;
+  if (sidebarConnection) sidebarConnection.textContent = !hasStarted ? "Waiting" : syncing ? "Syncing" : attention ? "Needs attention" : snapshot.fresh ? "Connected" : "Cached data";
+  if (sidebarDot) sidebarDot.className = `status-dot ${!hasStarted ? "idle" : attention ? "offline" : syncing ? "idle" : "online"}`;
+  if (label) label.textContent = !hasStarted ? "Waiting for first sync" : syncing ? "Syncing cloud data" : attention ? "Needs attention" : snapshot.fresh ? "All data is up to date" : "Data may be stale";
+  if (detail) {
+    const when = snapshot.lastSuccessAt ? formatRelativeTime(snapshot.lastSuccessAt) : "No successful sync yet";
+    detail.textContent = !hasStarted ? "Your cached data will appear here." : syncing ? "Keeping the last known values visible while live data arrives." : attention ? `${failedResources.join(", ")} need attention · Last successful sync ${when}.` : `Last successful sync ${when}.`;
+  }
+  if (badge) {
+    badge.textContent = `${attention} need attention`;
+    badge.classList.toggle("hidden", attention === 0);
+  }
+  if (refresh) {
+    refresh.disabled = syncing;
+    refresh.textContent = syncing ? "Refreshing…" : "Refresh now";
+  }
+}
+
+function formatRelativeTime(timestamp) {
+  const age = Math.max(0, Date.now() - Number(timestamp));
+  if (age < 10000) return "just now";
+  if (age < 60000) return `${Math.floor(age / 1000)}s ago`;
+  if (age < 3600000) return `${Math.floor(age / 60000)}m ago`;
+  return `${Math.floor(age / 3600000)}h ago`;
+}
+
+async function retryResource(resourceName) {
+  const label = String(resourceName || "cloud data").replace(/([A-Z])/g, " $1").toLowerCase();
+  showToast(`Refreshing ${label}…`, "info");
+  return loadAll(true);
+}
+
+async function recoverFailedProxy(generation, account, error) {
+  const key = `${generation}:${account && account.id}`;
+  if (proxyRecoveryInFlight.has(key)) return proxyRecoveryInFlight.get(key);
+  const operation = performFailedProxyRecovery(generation, account, error);
+  proxyRecoveryInFlight.set(key, operation);
+  try {
+    return await operation;
+  } finally {
+    if (proxyRecoveryInFlight.get(key) === operation) proxyRecoveryInFlight.delete(key);
+  }
+}
+
+async function performFailedProxyRecovery(generation, account, error) {
+  if (!syncManager || !syncManager.current(generation)) return { status: "not-applicable" };
+  state.recoveryStatus[account.id] = { status: "retrying", error: String(error || "") };
+  renderAccountsManagement();
+  try {
+    const retry = await api("test_account", { account_id: account.id }, { retryMode: "read" });
+    if (!syncManager.current(generation)) return { status: "not-applicable" };
+    if (retry && retry.status !== "error") {
+      const result = { status: "recovered", result: retry, proxyReplaced: false, error: null };
+      state.recoveryStatus[account.id] = result;
+      return result;
+    }
+    if (!window.CloudbotSync.proxyFailure(retry && retry.error)) {
+      const result = { status: "unresolved", result: retry, error: retry && retry.error || "The account retry failed" };
+      state.recoveryStatus[account.id] = result;
+      return result;
+    }
+    error = retry.error;
+  } catch (retryError) {
+    if (!syncManager.current(generation)) return { status: "not-applicable" };
+    if (!window.CloudbotSync.proxyFailure(retryError)) {
+      const result = { status: "unresolved", result: null, error: retryError.message || String(retryError) };
+      state.recoveryStatus[account.id] = result;
+      return result;
+    }
+    error = retryError;
+  }
+  const result = await syncManager.recoverProxy({
+    generation,
+    account,
+    error,
+    healProxy: (acc) => api("auto_heal_proxies", { account_id: acc.id, force: true }, { retryMode: "never" }),
+    retryRead: () => api("test_account", { account_id: account.id }, { retryMode: "read" })
+  });
+  if (!syncManager.current(generation)) return { status: "not-applicable" };
+  state.recoveryStatus[account.id] = result;
+  return result;
+}
+
 // ==================== DATA LOADER ====================
 async function loadAll(forceRefresh = false) {
+  const manager = initSyncManager();
+  state.recoveryStatus = {};
+  state.liveAccountFailures = {};
+  const generation = manager.begin();
   const refreshBtn = document.getElementById("btn-refresh-all");
-  if (refreshBtn) refreshBtn.classList.add("loading");
+  if (refreshBtn) {
+    refreshBtn.classList.add("loading");
+    refreshBtn.disabled = true;
+    refreshBtn.setAttribute("aria-busy", "true");
+  }
 
   try {
-    const refreshArg = forceRefresh ? { refresh: true } : {};
-
-    // Phase 1: DB-FIRST INSTANT RENDER (< 25ms)
-    // Accounts, Proxy Pools, SSH Keys, Watchdog, Tunnels, Servers, Floating IPs, and Billing are cached in SQLite!
-    const [accData, proxyData, sshData, watchData, tunData, srvData, fipData, dnsData, billingData] = await Promise.allSettled([
-      api("accounts"),
-      api("proxy_providers"),
-      api("ssh_keys"),
-      api("watch_status"),
-      api("tunnels"),
-      api("all_servers", refreshArg),
-      api("all_floating_ips", refreshArg),
-      api("dns_zones"),
-      api("check_all_accounts", refreshArg)
-    ]);
-
-    if (accData.status === "fulfilled") state.accounts = accData.value.accounts || [];
-    if (proxyData.status === "fulfilled") state.proxyProviders = proxyData.value.providers || [];
-    if (sshData.status === "fulfilled") state.sshKeys = sshData.value.ssh_keys || [];
-    if (watchData.status === "fulfilled") state.watchdog = watchData.value;
-    if (tunData.status === "fulfilled") state.tunnels = tunData.value.tunnels || [];
-
-    if (srvData.status === "fulfilled") {
-      state.servers = srvData.value.servers || [];
-      state.accountErrors = srvData.value.account_errors || {};
-    }
-    if (fipData.status === "fulfilled") state.floatingIps = fipData.value.floating_ips || [];
-    if (dnsData.status === "fulfilled") state.dnsZones = dnsData.value.zones || [];
-
-    if (billingData.status === "fulfilled" && billingData.value && billingData.value.accounts) {
-      for (const item of billingData.value.accounts) {
-        if (item.account && item.account.id) {
-          state.accountBilling[item.account.id] = {
-            status: item.status,
-            info: item.info,
-            identity: item.identity,
-            error: item.error,
-            lastChecked: new Date()
-          };
-        }
-      }
-    }
-
-    // Render immediately from local SQLite database - zero lag!
+    await loadAllPhase(generation, false);
+    if (!manager.current(generation) || !state.authenticated) return;
     renderAllViews();
     updateBadges();
 
-    // Hetzner primary IPs (cached in SQLite)
-    const hetznerAccs = state.accounts.filter(a => a.provider === "hetzner");
-    if (hetznerAccs.length > 0) {
-      const pIps = [];
-      const primaryResults = await Promise.allSettled(
-        hetznerAccs.map(h => api("hetzner_primary_ips", { account_id: h.id, ...refreshArg }).then(res => ({ h, res })))
-      );
-      for (const pr of primaryResults) {
-        if (pr.status === "fulfilled" && pr.value && pr.value.res && pr.value.res.primary_ips) {
-          const { h, res } = pr.value;
-          res.primary_ips.forEach(p => { p.provider = "hetzner"; p.account_id = h.id; p.account_label = h.label; pIps.push(p); });
-        }
-      }
-      state.primaryIps = pIps;
-      renderOverview();
-      renderIPManagement();
-      renderHetznerHub();
+    manager.startPhase(generation);
+    await loadAllPhase(generation, true);
+    if (!manager.current(generation) || !state.authenticated) return;
+
+    await autoRecoverFailedAccounts(generation);
+    if (!manager.current(generation)) return;
+    renderAllViews();
+    updateBadges();
+    if (forceRefresh) showToast("Live cloud data and balances refreshed successfully!", "success");
+  } catch (err) {
+    if (manager.current(generation)) showToast("Error loading data: " + err.message, "error");
+  } finally {
+    if (manager.current(generation) && refreshBtn) {
+      refreshBtn.classList.remove("loading");
+      refreshBtn.disabled = false;
+      refreshBtn.removeAttribute("aria-busy");
+    }
+  }
+}
+
+async function loadAllPhase(generation, forceRefresh) {
+  if (!syncManager.current(generation) || !state.authenticated) return;
+  const refreshArg = forceRefresh ? { refresh: true } : {};
+  const recordLiveFailure = (accountId, error) => {
+    if (!forceRefresh || accountId === undefined || accountId === null || !error) return;
+    const key = String(accountId);
+    const existing = state.liveAccountFailures[key];
+    if (!existing || window.CloudbotSync.proxyFailure(error)) state.liveAccountFailures[key] = error;
+  };
+  const apply = (resource, value, handler) => {
+    if (!syncManager.current(generation) || !state.authenticated) return false;
+    const accepted = forceRefresh
+      ? syncManager.apply(generation, resource, value)
+      : syncManager.hydrate(generation, resource, value);
+    if (!accepted) return false;
+    handler(value);
+    renderAllViews();
+    updateBadges();
+    return true;
+  };
+
+  const observe = (resource, request, handler) => request.then(value => {
+    apply(resource, value, handler);
+  }).catch(error => {
+    if (syncManager.current(generation) && state.authenticated) {
+      syncManager.fail(generation, resource, error);
+      renderAllViews();
       updateBadges();
     }
+  });
 
+  await Promise.all([
+    observe("accounts", api("accounts", {}, { retryMode: "read" }), data => { state.accounts = data.accounts || []; }),
+    observe("proxyProviders", api("proxy_providers", {}, { retryMode: "read" }), data => { state.proxyProviders = data.providers || []; }),
+    observe("sshKeys", api("ssh_keys", {}, { retryMode: "read" }), data => { state.sshKeys = data.ssh_keys || []; }),
+    observe("watchdog", api("watch_status", {}, { retryMode: "read" }), data => { state.watchdog = data; }),
+    observe("tunnels", api("tunnels", {}, { retryMode: "read" }), data => { state.tunnels = data.tunnels || []; }),
+    observe("servers", api("all_servers", refreshArg, { retryMode: "read" }), data => {
+    state.servers = data.servers || [];
+    state.accountErrors = data.account_errors || {};
     if (forceRefresh) {
-      showToast("Live cloud data and balances refreshed successfully!", "success");
+      Object.entries(state.accountErrors).forEach(([id, error]) => recordLiveFailure(id, error));
     }
-  } catch (err) {
-    showToast("Error loading data: " + err.message, "error");
-  } finally {
-    if (refreshBtn) refreshBtn.classList.remove("loading");
+    if (Object.keys(state.accountErrors).length > 0) {
+      syncManager.fail(generation, "servers", "One or more account server lists could not be refreshed", true);
+    }
+    }),
+    observe("floatingIps", api("all_floating_ips", refreshArg, { retryMode: "read" }), data => { state.floatingIps = data.floating_ips || []; }),
+    observe("dnsZones", api("dns_zones", {}, { retryMode: "read" }), data => { state.dnsZones = data.zones || []; }),
+    observe("billing", api("check_all_accounts", refreshArg, { retryMode: "read" }), data => {
+    if (!data || !data.accounts) return;
+    for (const item of data.accounts) {
+      if (item.account && item.account.id) {
+        state.accountBilling[item.account.id] = {
+          status: item.status,
+          info: item.info,
+          identity: item.identity,
+          error: item.error,
+          lastChecked: new Date()
+        };
+        if (forceRefresh) {
+          const id = String(item.account.id);
+          if (item.status === "error") recordLiveFailure(id, item.error || "Account check failed");
+        }
+      }
+    }
+    if (data.accounts.some(item => item.status === "error")) {
+      syncManager.fail(generation, "billing", "One or more account checks failed", true);
+    }
+    })
+  ]);
+  if (!syncManager.current(generation) || !state.authenticated) return;
+
+  const hetznerAccs = state.accounts.filter(a => a.provider === "hetzner");
+  if (hetznerAccs.length === 0) {
+    if (forceRefresh) syncManager.apply(generation, "primaryIps", []);
+    else syncManager.hydrate(generation, "primaryIps", []);
+    state.primaryIps = [];
+    renderAllViews();
+    updateBadges();
+    return;
+  }
+
+  const primaryResults = await Promise.allSettled(
+    hetznerAccs.map(h => api("hetzner_primary_ips", { account_id: h.id, ...refreshArg }, { retryMode: "read" }).then(res => ({ h, res })))
+  );
+  if (!syncManager.current(generation) || !state.authenticated) return;
+
+  const pIps = [];
+  let primarySuccess = false;
+  for (const pr of primaryResults) {
+    if (pr.status === "fulfilled" && pr.value && pr.value.res && pr.value.res.primary_ips) {
+      primarySuccess = true;
+      const { h, res } = pr.value;
+      res.primary_ips.forEach(p => {
+        p.provider = "hetzner";
+        p.account_id = h.id;
+        p.account_label = h.label;
+        pIps.push(p);
+      });
+    }
+  }
+  if (primarySuccess) {
+    if (forceRefresh) syncManager.apply(generation, "primaryIps", pIps);
+    else syncManager.hydrate(generation, "primaryIps", pIps);
+    state.primaryIps = pIps;
+  } else {
+    syncManager.fail(generation, "primaryIps", "Hetzner Primary IP data could not be refreshed", true);
+  }
+  renderOverview();
+  renderIPManagement();
+  renderHetznerHub();
+  updateBadges();
+}
+
+async function autoRecoverFailedAccounts(generation) {
+  const failures = new Map(Object.entries(state.liveAccountFailures || {}));
+
+  let recoveredCount = 0;
+  let replacedCount = 0;
+  let serverRetryNeeded = false;
+  for (const account of state.accounts) {
+    if (!syncManager.current(generation)) return;
+    const error = failures.get(String(account.id));
+    if (!error || !account.has_proxy || !window.CloudbotSync.proxyFailure(error)) continue;
+    const result = await recoverFailedProxy(generation, account, error);
+    if (!syncManager.current(generation)) return;
+    if (result.status !== "recovered") continue;
+    recoveredCount += 1;
+    if (result.proxyReplaced) replacedCount += 1;
+    if (state.accountErrors && state.accountErrors[account.id]) serverRetryNeeded = true;
+    const data = result.result;
+    if (data && data.status === "ok") {
+      state.accountBilling[account.id] = {
+        status: data.status,
+        info: data.info,
+        identity: data.identity,
+        latency_ms: data.latency_ms,
+        error: null,
+        lastChecked: new Date()
+      };
+      delete state.accountErrors[account.id];
+      delete state.accountErrors[String(account.id)];
+      delete state.liveAccountFailures[String(account.id)];
+    }
+  }
+  if (serverRetryNeeded && syncManager.current(generation)) {
+    try {
+      const serverResult = await api("all_servers", { refresh: true }, { retryMode: "read" });
+      if (serverResult && syncManager.current(generation)) {
+        state.servers = serverResult.servers || state.servers;
+        state.accountErrors = serverResult.account_errors || {};
+        syncManager.apply(generation, "servers", serverResult);
+      }
+    } catch (error) {
+      syncManager.fail(generation, "servers", error, true);
+    }
+  }
+  const billingStillFailed = Object.values(state.accountBilling || {}).some(item => item && item.status === "error");
+  const syncState = syncManager.snapshot();
+  if (syncState.resources.billing && syncState.resources.billing.hasValue && !billingStillFailed) {
+    syncManager.succeed(generation, "billing");
+  }
+  if (serverRetryNeeded && syncState.resources.servers && syncState.resources.servers.hasValue && Object.keys(state.accountErrors || {}).length === 0) {
+    syncManager.succeed(generation, "servers");
+  }
+  if (recoveredCount > 0) {
+    renderAllViews();
+    const replacementText = replacedCount > 0 ? ` Replaced ${replacedCount} proxy route${replacedCount === 1 ? "" : "s"}.` : "";
+    showToast(`Connection recovered for ${recoveredCount} account${recoveredCount === 1 ? "" : "s"}.${replacementText}`, "success");
   }
 }
 
@@ -796,15 +1077,34 @@ async function refreshAllBillingDetails(silent = false) {
       if (!silent) showToast("Querying real-time billing and account balances...", "info");
       const res = await api("check_all_accounts", { refresh: true });
       if (res && res.accounts) {
-        for (const item of res.accounts) {
+        const generation = syncManager ? syncManager.snapshot().generation : 0;
+        for (let itemIndex = 0; itemIndex < res.accounts.length; itemIndex += 1) {
+          let item = res.accounts[itemIndex];
+          const account = item.account && state.accounts.find(acc => String(acc.id) === String(item.account.id));
+          if (item.status === "error" && account && account.has_proxy && window.CloudbotSync.proxyFailure(item.error)) {
+            const recovery = await recoverFailedProxy(generation, account, item.error);
+            if (recovery.status === "recovered" && recovery.result && recovery.result.status === "ok") {
+              item = Object.assign({}, item, recovery.result, { status: "ok", error: null });
+              res.accounts[itemIndex] = item;
+            }
+          }
           if (item.account && item.account.id) {
             state.accountBilling[item.account.id] = {
               status: item.status,
               info: item.info,
               identity: item.identity,
+              latency_ms: item.latency_ms,
               error: item.error,
               lastChecked: new Date()
             };
+            state.accountErrors = state.accountErrors || {};
+            if (item.status === "error") {
+              state.accountErrors[item.account.id] = item.error;
+              state.accountErrors[String(item.account.id)] = item.error;
+            } else {
+              delete state.accountErrors[item.account.id];
+              delete state.accountErrors[String(item.account.id)];
+            }
           }
         }
         renderAccountsManagement();
@@ -825,7 +1125,12 @@ async function refreshSingleAccountBilling(accId, btnEl = null) {
   const btn = btnEl || document.getElementById(`btn-refresh-billing-${accId}`) || document.getElementById(`btn-check-status-${accId}`) || document.getElementById(`btn-check-status-drilldown-${accId}`);
   await runWithButtonLoading(btn, async () => {
     try {
-      const res = await api("test_account", { account_id: accId });
+      let res = await api("test_account", { account_id: accId }, { retryMode: "read" });
+      const account = state.accounts.find(item => String(item.id) === String(accId));
+      if (res.status === "error" && account && account.has_proxy && window.CloudbotSync.proxyFailure(res.error)) {
+        const recovery = await recoverFailedProxy(syncManager.snapshot().generation, account, res.error);
+        if (recovery.status === "recovered" && recovery.result) res = recovery.result;
+      }
       state.accountBilling[accId] = {
         status: res.status,
         info: res.info,
@@ -838,7 +1143,7 @@ async function refreshSingleAccountBilling(accId, btnEl = null) {
       if (res.status === "error") {
         state.accountErrors[accId] = res.error;
         state.accountErrors[String(accId)] = res.error;
-        const isProxy = /proxy|socks|forbidden|403|refused|reset|timeout|ClientHttpProxyError/i.test(res.error || "");
+        const isProxy = window.CloudbotSync.proxyFailure(res.error || "");
         showToast(isProxy ? `⚠️ Proxy failed for account #${accId}: ${res.error}` : `Connection error for account #${accId}: ${res.error}`, "error");
       } else {
         delete state.accountErrors[accId];
@@ -1059,6 +1364,7 @@ function renderAccountsManagement() {
         const p = PROVIDERS[acc.provider] || { name: acc.provider, logo: "/ui/assets/cloud.svg" };
         const b = state.accountBilling[acc.id];
         const fail = getAccountFailureStatus(acc.id);
+        const recovery = state.recoveryStatus[acc.id];
         const hasChecked = !!b || !!fail;
         const isOk = !fail && b && b.status === "ok";
         const reg = formatRegion(acc.region);
@@ -1079,6 +1385,14 @@ function renderAccountsManagement() {
         let subBillingText = latPill || 'Live status ready';
         if (fail) {
           subBillingText = `<span class="text-danger font-mono text-xs" title="${escapeHtml(fail.error)}">${escapeHtml(fail.error.length > 40 ? fail.error.substring(0, 38) + '…' : fail.error)}</span>`;
+        }
+        if (recovery && recovery.status === "retrying") {
+          subBillingText = `<span class="text-warning text-xs">↻ Retrying proxy route…</span>`;
+        } else if (recovery && recovery.status === "recovered") {
+          const recoveryLabel = recovery.proxyReplaced ? "Proxy replaced" : "Connection recovered";
+          subBillingText = `<span class="text-success text-xs">✓ ${recoveryLabel} ${formatRelativeTime(Date.now())}</span>`;
+        } else if (recovery && recovery.status === "unresolved") {
+          subBillingText = `<span class="text-warning text-xs" title="${escapeHtml(recovery.error || 'No working replacement proxy was found')}">⚠ Replacement needed</span>`;
         }
 
         // Proxy Route pill
@@ -1124,7 +1438,7 @@ function renderAccountsManagement() {
             <!-- Col 3: Proxy -->
             <div class="account-clean-proxy">
               ${proxyPill}
-              <button class="btn btn-secondary btn-sm flex-shrink-0" onclick="openEditProxyModal(${acc.id})" title="Configure proxy">⚙️ Proxy</button>
+              <button class="btn btn-secondary btn-sm flex-shrink-0" onclick="openEditProxyModal(${acc.id})" title="Manage proxy route and pool">Manage pool</button>
             </div>
 
             <!-- Col 4: Live Billing & Latency -->
@@ -1139,7 +1453,8 @@ function renderAccountsManagement() {
             <!-- Col 5: Actions -->
             <div class="account-clean-actions">
               ${acc.provider === "linode" ? `<button class="btn btn-secondary btn-sm" onclick="openLinodePromoModal(${acc.id})" title="Apply Linode Promo Code">🎟 Promo</button>` : ''}
-              <button class="btn btn-secondary btn-sm" id="btn-test-proxy-${acc.id}" onclick="testSingleAccountProxy(${acc.id}, this)" title="Test connection latency">⚡ Test</button>
+              <button class="btn btn-secondary btn-sm" id="btn-test-proxy-${acc.id}" onclick="testSingleAccountProxy(${acc.id}, this)" title="Retry connection">↻ Retry connection</button>
+              ${acc.has_proxy ? `<button class="btn btn-warning btn-sm" id="btn-replace-proxy-${acc.id}" onclick="replaceAccountProxy(${acc.id}, this)" title="Replace the proxy session">Replace proxy</button>` : ''}
               <button class="btn btn-secondary btn-sm" onclick="openDeployModalForProvider('${acc.provider}', ${acc.id})">🚀 Deploy</button>
               <button class="btn btn-danger btn-sm" onclick="deleteAccount(${acc.id}, '${escapeHtml(acc.label)}')">🗑️</button>
             </div>
@@ -1417,7 +1732,12 @@ async function testSingleAccountProxy(accId, btnEl = null) {
   showToast(`Testing proxy for account #${accId}...`, "info");
   await runWithButtonLoading(btn, async () => {
     try {
-      const res = await api("test_account", { account_id: accId });
+      let res = await api("test_account", { account_id: accId }, { retryMode: "read" });
+      const account = state.accounts.find(item => String(item.id) === String(accId));
+      if (res.status === "error" && account && account.has_proxy && window.CloudbotSync.proxyFailure(res.error)) {
+        const recovery = await recoverFailedProxy(syncManager.snapshot().generation, account, res.error);
+        if (recovery.status === "recovered" && recovery.result) res = recovery.result;
+      }
       state.accountBilling[accId] = {
         status: res.status,
         info: res.info,
@@ -1430,7 +1750,7 @@ async function testSingleAccountProxy(accId, btnEl = null) {
       if (res.status === "error") {
         state.accountErrors[accId] = res.error;
         state.accountErrors[String(accId)] = res.error;
-        const isProxy = /proxy|socks|forbidden|403|refused|reset|timeout|ClientHttpProxyError/i.test(res.error || "");
+        const isProxy = window.CloudbotSync.proxyFailure(res.error || "");
         showToast(isProxy ? `⚠️ Proxy failed for account #${accId}: ${res.error}` : `Connection error for account #${accId}: ${res.error}`, "error");
       } else {
         delete state.accountErrors[accId];
@@ -1462,7 +1782,11 @@ async function checkAllAccountProxies(btnEl = null) {
     for (let i = 0; i < accsWithProxy.length; i++) {
       const acc = accsWithProxy[i];
       try {
-        const res = await api("test_account", { account_id: acc.id });
+        let res = await api("test_account", { account_id: acc.id }, { retryMode: "read" });
+        if (res.status === "error" && acc.has_proxy && window.CloudbotSync.proxyFailure(res.error)) {
+          const recovery = await recoverFailedProxy(syncManager.snapshot().generation, acc, res.error);
+          if (recovery.status === "recovered" && recovery.result) res = recovery.result;
+        }
         state.accountBilling[acc.id] = {
           status: res.status,
           info: res.info,
@@ -3751,6 +4075,9 @@ function openModal(id) {
 function closeModal(id) {
   const el = document.getElementById(id);
   if (el) el.classList.remove("open");
+  if (id === "modal-server-details") {
+    clearServerModalFipSelection();
+  }
 }
 
 function openAddAccountModal(prov) {
@@ -4114,7 +4441,14 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
 
     document.getElementById("srvmodal-ips-badge").textContent = `${fips.length}`;
     const fipsListContainer = document.getElementById("srvmodal-fips-list");
+    const fipsSelectRow = document.getElementById("srvmodal-fips-select-row");
+    const totalCountBadge = document.getElementById("srvmodal-fips-total-count");
+    if (totalCountBadge) totalCountBadge.textContent = `${fips.length}`;
+
     if (fips.length === 0) {
+      if (fipsSelectRow) fipsSelectRow.style.display = "none";
+      const bulkBar = document.getElementById("srvmodal-fip-bulk-bar");
+      if (bulkBar) bulkBar.style.display = "none";
       fipsListContainer.innerHTML = `
         <div class="p-6 text-center text-secondary text-sm bg-surface rounded-md border border-subtle">
           No floating or reserved IPs currently attached to this server.
@@ -4122,12 +4456,15 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
         </div>
       `;
     } else {
+      if (fipsSelectRow) fipsSelectRow.style.display = "flex";
       const accIdForFip = s.account_id || currentServerModalAccId;
       fipsListContainer.innerHTML = fips.map(f => {
         const fipVal = f.ip || f.ip_address || f.subnet || f.network || f.id;
+        const isSelected = state.selectedServerModalFips && state.selectedServerModalFips.has(String(f.id));
         return `
-          <div class="attached-fip-card">
-            <div class="flex items-center gap-2">
+          <div class="attached-fip-card ${isSelected ? 'selected' : ''}" id="srvmodal-fip-card-${f.id}">
+            <div class="flex items-center gap-3">
+              <input type="checkbox" class="cb-srvmodal-fip checkbox-input" data-fip-id="${f.id}" data-fip-ip="${escapeHtml(fipVal)}" ${isSelected ? 'checked' : ''} onchange="toggleServerModalFipSelection('${f.id}', '${escapeHtml(fipVal)}', this)" title="Select this IP for batch action">
               <span class="text-lg">🌐</span>
               <div>
                 <div class="flex items-center gap-2 flex-wrap">
@@ -4146,6 +4483,7 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
           </div>
         `;
       }).join("");
+      updateServerModalFipBulkBar();
     }
 
     if (osGuideIcon) osGuideIcon.textContent = "💡";
@@ -4173,6 +4511,7 @@ async function openServerDetailsModal(accId, srvId) {
   currentServerModalAccId = accId;
   currentServerModalSrvId = srvId;
   currentServerModalPw = null;
+  clearServerModalFipSelection();
 
   // 1. Instant render from local cache if present
   const cachedSrv = state.servers.find(x => String(x.id) === String(srvId));
@@ -4527,6 +4866,10 @@ async function unassignFloatingIpFromModal(accId, fipId, fipIp) {
     try {
       await api("unassign_floating_ip", { account_id: accId, floating_id: fipId });
       showToast("Floating IP detached.", "success");
+      if (state.selectedServerModalFips) {
+        state.selectedServerModalFips.delete(String(fipId));
+        updateServerModalFipBulkBar();
+      }
       refreshCurrentServerDetailsModal();
       loadAll();
     } catch (err) {
@@ -4540,6 +4883,10 @@ async function detachAndDeleteFloatingIpFromModal(accId, fipId, fipIp) {
     try {
       await api("delete_floating_ip", { account_id: accId, floating_id: fipId, confirm: "DELETE_FLOATING_IP" });
       showToast("Floating IP detached and deleted.", "success");
+      if (state.selectedServerModalFips) {
+        state.selectedServerModalFips.delete(String(fipId));
+        updateServerModalFipBulkBar();
+      }
       refreshCurrentServerDetailsModal();
       loadAll();
     } catch (err) {
@@ -4547,6 +4894,202 @@ async function detachAndDeleteFloatingIpFromModal(accId, fipId, fipIp) {
     }
   });
 }
+
+// ---- SERVER MODAL FLOATING IP MULTI-SELECT & BULK ACTIONS ----
+function toggleServerModalFipSelection(fipId, fipIp, cb) {
+  if (!state.selectedServerModalFips) state.selectedServerModalFips = new Map();
+  const accId = currentServerModal?.server?.account_id || currentServerModalAccId;
+  const key = String(fipId);
+  if (cb.checked) {
+    state.selectedServerModalFips.set(key, { id: fipId, ip: fipIp, accId: accId });
+    const card = document.getElementById(`srvmodal-fip-card-${fipId}`);
+    if (card) card.classList.add("selected");
+  } else {
+    state.selectedServerModalFips.delete(key);
+    const card = document.getElementById(`srvmodal-fip-card-${fipId}`);
+    if (card) card.classList.remove("selected");
+  }
+  updateServerModalFipBulkBar();
+}
+window.toggleServerModalFipSelection = toggleServerModalFipSelection;
+
+function toggleSelectAllServerModalFips(masterCb) {
+  if (!state.selectedServerModalFips) state.selectedServerModalFips = new Map();
+  const fips = currentServerModal?.floating_ips || [];
+  const accId = currentServerModal?.server?.account_id || currentServerModalAccId;
+
+  if (masterCb.checked) {
+    fips.forEach(f => {
+      const fipVal = f.ip || f.ip_address || f.subnet || f.network || f.id;
+      state.selectedServerModalFips.set(String(f.id), { id: f.id, ip: fipVal, accId: accId });
+    });
+  } else {
+    state.selectedServerModalFips.clear();
+  }
+
+  const cbs = document.querySelectorAll("#srvmodal-fips-list .cb-srvmodal-fip");
+  cbs.forEach(cb => {
+    cb.checked = masterCb.checked;
+    const fipId = cb.getAttribute("data-fip-id");
+    const card = document.getElementById(`srvmodal-fip-card-${fipId}`);
+    if (card) card.classList.toggle("selected", masterCb.checked);
+  });
+
+  updateServerModalFipBulkBar();
+}
+window.toggleSelectAllServerModalFips = toggleSelectAllServerModalFips;
+
+function clearServerModalFipSelection() {
+  if (state.selectedServerModalFips) {
+    state.selectedServerModalFips.clear();
+  }
+  const masterCb = document.getElementById("srvmodal-select-all-fips");
+  if (masterCb) {
+    masterCb.checked = false;
+    masterCb.indeterminate = false;
+  }
+  document.querySelectorAll("#srvmodal-fips-list .cb-srvmodal-fip").forEach(cb => {
+    cb.checked = false;
+  });
+  document.querySelectorAll("#srvmodal-fips-list .attached-fip-card").forEach(card => {
+    card.classList.remove("selected");
+  });
+  updateServerModalFipBulkBar();
+}
+window.clearServerModalFipSelection = clearServerModalFipSelection;
+
+function updateServerModalFipBulkBar() {
+  const count = state.selectedServerModalFips ? state.selectedServerModalFips.size : 0;
+  const bar = document.getElementById("srvmodal-fip-bulk-bar");
+  const countEl = document.getElementById("srvmodal-fip-bulk-count");
+  const detachCountEl = document.getElementById("srvmodal-bulk-detach-count");
+  const deleteCountEl = document.getElementById("srvmodal-bulk-delete-count");
+
+  if (bar) bar.style.display = count > 0 ? "flex" : "none";
+  if (countEl) countEl.textContent = count;
+  if (detachCountEl) detachCountEl.textContent = count;
+  if (deleteCountEl) deleteCountEl.textContent = count;
+
+  const totalFips = currentServerModal?.floating_ips?.length || 0;
+  const masterCb = document.getElementById("srvmodal-select-all-fips");
+  if (masterCb) {
+    if (totalFips === 0 || count === 0) {
+      masterCb.checked = false;
+      masterCb.indeterminate = false;
+    } else if (count === totalFips) {
+      masterCb.checked = true;
+      masterCb.indeterminate = false;
+    } else {
+      masterCb.checked = false;
+      masterCb.indeterminate = true;
+    }
+  }
+}
+window.updateServerModalFipBulkBar = updateServerModalFipBulkBar;
+
+async function detachSelectedFipsFromModal(btn) {
+  if (!state.selectedServerModalFips || state.selectedServerModalFips.size === 0) {
+    showToast("No IPs selected", "warning");
+    return;
+  }
+  const items = Array.from(state.selectedServerModalFips.values());
+  const count = items.length;
+  const ipList = items.slice(0, 5).map(x => x.ip).join(", ") + (count > 5 ? ` and ${count - 5} more` : "");
+
+  const confirmed = await confirmAction({
+    title: `Detach ${count} Floating IPs?`,
+    message: `Detach ${count} floating IP${count > 1 ? 's' : ''} (${escapeHtml(ipList)}) from this server? They will remain available in your cloud account pool.`,
+    expectedWord: "DETACH",
+    confirmText: "Detach IPs",
+    isDanger: false
+  });
+  if (!confirmed) return;
+
+  await runWithButtonLoading(btn, async () => {
+    let successCount = 0;
+    let failCount = 0;
+    const errors = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      try {
+        await api("unassign_floating_ip", { account_id: item.accId, floating_id: item.id });
+        successCount++;
+        state.selectedServerModalFips.delete(String(item.id));
+      } catch (err) {
+        failCount++;
+        errors.push(`${item.ip}: ${err.message}`);
+      }
+    }
+
+    if (failCount === 0) {
+      showToast(`Successfully detached all ${successCount} selected IPs.`, "success");
+    } else if (successCount > 0) {
+      showToast(`Detached ${successCount} IPs, but ${failCount} failed: ${errors.slice(0, 2).join("; ")}`, "warning");
+    } else {
+      showToast(`Failed to detach IPs: ${errors.slice(0, 2).join("; ")}`, "error");
+    }
+
+    clearServerModalFipSelection();
+    refreshCurrentServerDetailsModal();
+    loadAll();
+  });
+}
+window.detachSelectedFipsFromModal = detachSelectedFipsFromModal;
+
+async function detachAndDeleteSelectedFipsFromModal(btn) {
+  if (!state.selectedServerModalFips || state.selectedServerModalFips.size === 0) {
+    showToast("No IPs selected", "warning");
+    return;
+  }
+  const items = Array.from(state.selectedServerModalFips.values());
+  const count = items.length;
+  const ipList = items.slice(0, 5).map(x => x.ip).join(", ") + (count > 5 ? ` and ${count - 5} more` : "");
+
+  const confirmed = await confirmAction({
+    title: `Detach & Delete ${count} Floating IPs?`,
+    message: `Permanently delete ${count} floating IP${count > 1 ? 's' : ''} (${escapeHtml(ipList)})? This will detach and delete them from your cloud account immediately. This action cannot be undone!`,
+    expectedWord: "DELETE_FLOATING_IP",
+    confirmText: "Detach & Delete IPs",
+    isDanger: true
+  });
+  if (!confirmed) return;
+
+  await runWithButtonLoading(btn, async () => {
+    let successCount = 0;
+    let failCount = 0;
+    const errors = [];
+
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      try {
+        await api("delete_floating_ip", {
+          account_id: item.accId,
+          floating_id: item.id,
+          confirm: "DELETE_FLOATING_IP"
+        });
+        successCount++;
+        state.selectedServerModalFips.delete(String(item.id));
+      } catch (err) {
+        failCount++;
+        errors.push(`${item.ip}: ${err.message}`);
+      }
+    }
+
+    if (failCount === 0) {
+      showToast(`Successfully deleted all ${successCount} selected IPs.`, "success");
+    } else if (successCount > 0) {
+      showToast(`Deleted ${successCount} IPs, but ${failCount} failed: ${errors.slice(0, 2).join("; ")}`, "warning");
+    } else {
+      showToast(`Failed to delete IPs: ${errors.slice(0, 2).join("; ")}`, "error");
+    }
+
+    clearServerModalFipSelection();
+    refreshCurrentServerDetailsModal();
+    loadAll();
+  });
+}
+window.detachAndDeleteSelectedFipsFromModal = detachAndDeleteSelectedFipsFromModal;
 
 function openHetznerPrimarySwitchFromModal() {
   closeModal("modal-server-details");

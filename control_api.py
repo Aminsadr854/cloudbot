@@ -173,7 +173,11 @@ async def handle_logout(_request):
 async def ui_index(_request):
     index_file = UI_DIR / "index.html"
     if index_file.is_file():
-        return web.FileResponse(index_file)
+        resp = web.FileResponse(index_file)
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
     return web.Response(text="Cloudbot UI not found", status=404)
 
 
@@ -181,7 +185,11 @@ async def ui_static(request):
     filename = request.match_info["filename"]
     file_path = (UI_DIR / filename).resolve()
     if file_path.is_file() and file_path.is_relative_to(UI_DIR):
-        return web.FileResponse(file_path)
+        resp = web.FileResponse(file_path)
+        resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
     return web.Response(text="File not found", status=404)
 
 

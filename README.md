@@ -187,6 +187,8 @@ Cloudbot includes a modern web-based hosting console and owner automation API li
   - Floating IP & Reserved IP management: allocation, attachment to instances, reverse DNS PTR records, and copyable guest OS network configuration commands.
   - SSH Key Vault: in-browser Ed25519 keypair generation, public key storage, and auto-syncing to cloud providers.
   - Cloud accounts, proxy pool routing, and Cloudflare DNS management.
+  - The dashboard hydrates the last known local snapshot immediately, then performs a live sync. A status strip shows whether data is syncing, current, stale, or needs attention; failed resource loads retain their last known values and expose a retry action.
+  - Read requests retry bounded network and transient server failures. When a proxied account reports a route failure, the console repeats the account check once, then attempts one verified replacement session only if the route still fails, followed by one final account check. Destructive actions are never retried automatically.
   - Local access via loopback or SSH tunnel: `ssh -L 9601:127.0.0.1:9601 root@YOUR_CLOUDBOT_HOST`.
 * **Automation API & MCP**: JSON operations protected by bearer token for AI clients (Claude, Cursor, Antigravity) and custom tooling. See [AI_API_MCP.md](AI_API_MCP.md) for endpoints, confirmation guardrails, and MCP setup.
 

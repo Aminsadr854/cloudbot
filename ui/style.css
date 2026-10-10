@@ -408,6 +408,68 @@ code, .font-mono {
   z-index: 30;
 }
 
+.sync-status-strip {
+  min-height: 42px;
+  padding: 0.55rem 2rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(16, 19, 29, 0.88);
+  color: var(--text-secondary);
+  font-size: 0.78rem;
+}
+
+.sync-status-main,
+.sync-status-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  min-width: 0;
+}
+
+.sync-status-label {
+  color: var(--text-primary);
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.sync-status-detail {
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sync-status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: var(--text-tertiary);
+}
+
+.sync-status-strip[data-state="syncing"] .sync-status-dot {
+  background: var(--accent-primary);
+  box-shadow: 0 0 8px rgba(99, 102, 241, 0.8);
+  animation: sync-pulse 1.2s ease-in-out infinite;
+}
+
+.sync-status-strip[data-state="synced"] .sync-status-dot { background: var(--color-success); }
+.sync-status-strip[data-state="attention"] .sync-status-dot,
+.sync-status-strip[data-state="stale"] .sync-status-dot { background: var(--color-warning); }
+
+.sync-attention-badge {
+  color: #fbbf24;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+@keyframes sync-pulse {
+  50% { opacity: 0.45; }
+}
+
 .header-left {
   display: flex;
   align-items: center;
@@ -749,6 +811,16 @@ code, .font-mono {
 }
 .btn-danger:hover {
   background: var(--color-danger);
+  color: #ffffff;
+}
+
+.btn-warning {
+  background: rgba(245, 158, 11, 0.15);
+  color: #f59e0b;
+  border: 1px solid rgba(245, 158, 11, 0.3);
+}
+.btn-warning:hover {
+  background: #f59e0b;
   color: #ffffff;
 }
 
@@ -2535,6 +2607,13 @@ code, .font-mono {
     flex-wrap: wrap;
     gap: 0.5rem;
   }
+  .sync-status-strip {
+    padding: 0.6rem 1rem;
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .sync-status-detail { max-width: 62vw; }
   .header-search {
     display: none;
   }
@@ -2687,6 +2766,20 @@ code, .font-mono {
 
 .attached-fip-card:hover {
   border-color: var(--border-medium);
+}
+
+.attached-fip-card.selected {
+  background: rgba(99, 102, 241, 0.08);
+  border-color: rgba(99, 102, 241, 0.5);
+}
+
+.checkbox-input {
+  accent-color: var(--primary, #6366f1);
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  border-radius: 4px;
+  flex-shrink: 0;
 }
 
 #srvmodal-account-pill {

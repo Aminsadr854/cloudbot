@@ -955,10 +955,22 @@ niceproxy.io:17521:accounts1_k5ub-country-AF-ssid-JcVtnUPMVN:accpas2
         self.assertIn("Hetzner Primary IPs", js)
         self.assertIn("Hetzner Floating IPs", js)
 
+    def test_ui_contains_server_modal_fip_multi_select_and_bulk_actions(self):
+        with open("projects/cloudbot/ui/index.html") as f:
+            html = f.read()
+        with open("projects/cloudbot/ui/app.js") as f:
+            js = f.read()
 
+        # Check server modal bulk bar and select-all elements in html
+        self.assertIn("srvmodal-fip-bulk-bar", html)
+        self.assertIn("srvmodal-select-all-fips", html)
+        self.assertIn("btn-srvmodal-bulk-detach", html)
+        self.assertIn("btn-srvmodal-bulk-delete", html)
 
-
-
-
-
-
+        # Check JavaScript multi-selection and bulk action handlers
+        self.assertIn("toggleServerModalFipSelection", js)
+        self.assertIn("toggleSelectAllServerModalFips", js)
+        self.assertIn("clearServerModalFipSelection", js)
+        self.assertIn("detachSelectedFipsFromModal", js)
+        self.assertIn("detachAndDeleteSelectedFipsFromModal", js)
+        self.assertIn("selectedServerModalFips", js)

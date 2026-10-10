@@ -804,6 +804,13 @@ async def execute(operation, args, store):
                     "error": f"Failed allocating working proxy: {error_reason or 'No capacity'}",
                 })
 
+        if healed:
+            # Proxy changes invalidate cached account checks and the account
+            # error fields embedded in server and Floating IP snapshots.
+            _delete_cache(store, "all_billing")
+            _delete_cache(store, "all_servers")
+            _delete_cache(store, "all_floating_ips")
+
         return {
             "healed": healed,
             "failed": failed,
