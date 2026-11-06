@@ -197,6 +197,27 @@ async def ui_static(request):
     return web.Response(text="File not found", status=404)
 
 
+MCP_TOKEN_PATH = Path(os.environ.get("CLOUDBOT_MCP_TOKEN_FILE",
+                                     "/opt/cloudbot/data/mcp_http.token"))
+MCP_PUBLIC_URL = os.environ.get("CLOUDBOT_MCP_URL", "https://cloudbot-mcp.vsl247.com/mcp")
+
+
+async def mcp_connect(request):
+    """Ready-to-paste connection details for the owner's API & MCP page."""
+    try:
+        mcp_token = MCP_TOKEN_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        mcp_token = ""
+    resp = web.json_response({
+        "mcp_url": MCP_PUBLIC_URL,
+        "mcp_token": mcp_token,
+        "api_url": f"{request.scheme}://{request.host}",
+        "api_token": request.app[TOKEN_KEY],
+    })
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
 async def health(_request):
     return web.json_response({"status": "ok"})
 
@@ -245,6 +266,7 @@ def build_app(token=None, store_factory=Store, webhook_token=None, webhook_send=
     app.router.add_post("/v1/auth/telegram", auth_telegram)
     app.router.add_post("/v1/auth/logout", handle_logout)
     app.router.add_get("/health", health)
+    app.router.add_get("/v1/mcp/connect", mcp_connect)
     app.router.add_get("/v1/operations", operations)
     app.router.add_post("/v1/operations/{name}", run_operation)
     webhook.install(app, token=webhook_token, send=webhook_send)

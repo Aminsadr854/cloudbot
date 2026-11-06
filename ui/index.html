@@ -643,42 +643,42 @@
         <section class="tab-pane" id="tab-api">
           <div class="section-heading-row mb-4"><div><h2 class="section-title">API &amp; MCP</h2>
             <p class="text-xs text-secondary">Drive Cloudbot from AI clients (Claude, Cursor) or scripts. Same operations as this console.</p></div></div>
+          <p class="api-status" id="api-connect-status">Loading your connection details…</p>
           <div class="api-card">
             <h3>1. Connect an AI client over MCP</h3>
             <div class="api-ai-tabs" role="tablist">
               <button type="button" class="api-ai-tab active" data-ai="claude">Claude Code</button>
               <button type="button" class="api-ai-tab" data-ai="codex">Codex</button>
             </div>
-            <p>Remote MCP (streamable HTTP). The bearer token is the contents of <code>/opt/cloudbot/data/mcp_http.token</code> on the host; keep it secret.</p>
+            <p>Your token is already filled in. Copy, paste in your terminal, done.</p>
             <div class="api-ai-pane" data-ai-pane="claude">
-              <p>Run once in your terminal:</p>
-              <pre class="api-code">claude mcp add --transport http cloudbot https://cloudbot-mcp.vsl247.com/mcp \
-  --header "Authorization: Bearer &lt;mcp_http.token&gt;"</pre>
-              <p>Check with <code>claude mcp list</code> or <code>/mcp</code> inside a session. Add <code>--scope user</code> to use it in every project.</p>
+              <div class="api-snip"><button type="button" class="api-copy">Copy</button><pre class="api-code" data-tpl="claude mcp add --transport http --scope user cloudbot {MCP_URL} --header &quot;Authorization: Bearer {MCP_TOKEN}&quot;"></pre></div>
+              <p>Verify: <code>claude mcp list</code> (or <code>/mcp</code> inside Claude Code).</p>
             </div>
             <div class="api-ai-pane" data-ai-pane="codex" hidden>
-              <p>Export the token, then register the server (keeps the token out of the config file):</p>
-              <pre class="api-code">export CLOUDBOT_MCP_TOKEN="&lt;mcp_http.token&gt;"
-codex mcp add cloudbot --url https://cloudbot-mcp.vsl247.com/mcp \
-  --bearer-token-env-var CLOUDBOT_MCP_TOKEN</pre>
-              <p>Or edit <code>~/.codex/config.toml</code>:</p>
-              <pre class="api-code">[mcp_servers.cloudbot]
-url = "https://cloudbot-mcp.vsl247.com/mcp"
-bearer_token_env_var = "CLOUDBOT_MCP_TOKEN"</pre>
-              <p>Check with <code>codex mcp list</code>. The variable must be set in the shell that launches Codex.</p>
+              <div class="api-snip"><button type="button" class="api-copy">Copy</button><pre class="api-code" data-tpl="echo 'export CLOUDBOT_MCP_TOKEN=&quot;{MCP_TOKEN}&quot;' >> ~/.zshrc && export CLOUDBOT_MCP_TOKEN=&quot;{MCP_TOKEN}&quot; && codex mcp add cloudbot --url {MCP_URL} --bearer-token-env-var CLOUDBOT_MCP_TOKEN"></pre></div>
+              <p>Saves the token to <code>~/.zshrc</code> (macOS/zsh) and registers the server. Open a new terminal afterwards. Verify: <code>codex mcp list</code>.</p>
             </div>
-            <p>Then ask: "list my cloud accounts", "show servers on account 3", "point a.example.com at 1.2.3.4". The AI starts with <code>list_accounts</code> to learn account IDs.</p>
+            <p>Then ask the AI: "list my cloud accounts", "show servers on account 3", "point a.example.com at 1.2.3.4".</p>
           </div>
           <div class="api-card">
-            <h3 class="font-bold">2. Call the HTTP API directly</h3>
-            <p class="text-sm">Loopback only (<code>127.0.0.1:9601</code>); reach it with <code>ssh -L 9601:127.0.0.1:9601 root@HOST</code>. Token: <code>/opt/cloudbot/data/control_api.token</code>. Never put it in URLs or prompts.</p>
-            <pre class="api-code">curl -sS -H "Authorization: Bearer $TOKEN" http://127.0.0.1:9601/v1/operations
-curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
-  -d '{"account_id":1}' http://127.0.0.1:9601/v1/operations/servers</pre>
-            <p class="text-sm">Errors: 400 bad input, 401 bad token, 502 provider failure (see service log). Body limit 16 KiB.</p>
+            <h3>2. Call the HTTP API directly</h3>
+            <p>Works from anywhere with the token below. List all operations:</p>
+            <div class="api-snip"><button type="button" class="api-copy">Copy</button><pre class="api-code" data-tpl="curl -sS -H &quot;Authorization: Bearer {API_TOKEN}&quot; {API_URL}/v1/operations"></pre></div>
+            <p>Example call (servers of account 1):</p>
+            <div class="api-snip"><button type="button" class="api-copy">Copy</button><pre class="api-code" data-tpl="curl -sS -X POST -H &quot;Authorization: Bearer {API_TOKEN}&quot; -H 'Content-Type: application/json' -d '{&quot;account_id&quot;:1}' {API_URL}/v1/operations/servers"></pre></div>
+            <p>Errors: 400 bad input, 401 bad token, 502 provider failure (see service log). Body limit 16 KiB.</p>
           </div>
           <div class="api-card">
-            <h3 class="font-bold">3. Safety rules</h3>
+            <h3>3. Safety rules</h3>
+            <ul class="text-sm" style="padding-left:1.2rem;list-style:disc">
+              <li>These tokens give full owner access. Never share or commit them.</li>
+              <li>Billable or destructive tools require an exact <code>confirm</code> string (e.g. <code>DELETE_SERVER</code>). It is a guard, not approval: get the owner's OK for the specific action first.</li>
+              <li>A timeout does not mean a paid action failed. List resources before retrying.</li>
+              <li>The notify webhook (<code>POST /v1/webhook/notify</code>) uses its own token and cannot call operations.</li>
+            </ul>
+          </div>
+          <h3 class="font-bold">3. Safety rules</h3>
             <ul class="text-sm" style="padding-left:1.2rem;list-style:disc">
               <li>Billable or destructive tools require an exact <code>confirm</code> string (e.g. <code>DELETE_SERVER</code>). It is a guard, not approval: get the owner's OK for the specific action first.</li>
               <li>A timeout does not mean a paid action failed. List resources before retrying.</li>

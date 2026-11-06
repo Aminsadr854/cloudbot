@@ -4118,6 +4118,7 @@ function switchTab(tabId, pushState = true) {
   if (tabId === "tab-ssh") renderSSHKeys();
   if (tabId === "tab-dns") renderDNS();
   if (tabId === "tab-watchdog") renderWatchdog();
+  if (tabId === "tab-api") loadApiConnect();
   if (tabId === "tab-logs") {
     if (typeof renderLogs === "function") renderLogs();
   } else if (state.logs && state.logs.pollTimer) {
@@ -7482,6 +7483,23 @@ window.runWithButtonLoading = runWithButtonLoading;
 
 
 // ==================== API & MCP PAGE ====================
+async function loadApiConnect() {
+  const status = document.getElementById("api-connect-status");
+  try {
+    const res = await fetch("/v1/mcp/connect", { credentials: "same-origin", cache: "no-store" });
+    if (!res.ok) throw new Error(res.status === 401 ? "log in first" : `HTTP ${res.status}`);
+    const d = await res.json();
+    if (!d.mcp_token) throw new Error("MCP token file missing on the host");
+    const vals = { MCP_URL: d.mcp_url, MCP_TOKEN: d.mcp_token, API_URL: d.api_url, API_TOKEN: d.api_token };
+    document.querySelectorAll("#tab-api [data-tpl]").forEach((el) => {
+      el.textContent = el.dataset.tpl.replace(/\{(\w+)\}/g, (m, k) => vals[k] ?? m);
+    });
+    if (status) status.hidden = true;
+  } catch (e) {
+    if (status) { status.hidden = false; status.textContent = `Could not load connection details (${e.message}).`; }
+  }
+}
+
 function initApiGuide() {
   const tabs = document.querySelectorAll(".api-ai-tab");
   const show = (ai) => {
@@ -7490,6 +7508,14 @@ function initApiGuide() {
     try { localStorage.setItem("cloudbot_api_ai", ai); } catch (e) {}
   };
   tabs.forEach((t) => t.addEventListener("click", () => show(t.dataset.ai)));
+  document.querySelectorAll("#tab-api .api-copy").forEach((btn) => {
+    btn.addEventListener("click", async () => {
+      const text = btn.parentElement.querySelector("pre").textContent;
+      try { await navigator.clipboard.writeText(text); btn.textContent = "Copied"; }
+      catch (e) { btn.textContent = "Select & copy"; }
+      setTimeout(() => { btn.textContent = "Copy"; }, 1500);
+    });
+  });
   let saved = "claude";
   try { saved = localStorage.getItem("cloudbot_api_ai") || "claude"; } catch (e) {}
   show(saved === "codex" ? "codex" : "claude");
