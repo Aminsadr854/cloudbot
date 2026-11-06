@@ -7490,7 +7490,7 @@ async function loadApiConnect() {
     if (!res.ok) throw new Error(res.status === 401 ? "log in first" : `HTTP ${res.status}`);
     const d = await res.json();
     if (!d.mcp_token) throw new Error("MCP token file missing on the host");
-    const vals = { MCP_URL: d.mcp_url, MCP_TOKEN: d.mcp_token, API_URL: d.api_url, API_TOKEN: d.api_token };
+    const vals = { MCP_URL: d.mcp_url, MCP_TOKEN: d.mcp_token, API_URL: window.location.origin, API_TOKEN: d.api_token };
     document.querySelectorAll("#tab-api [data-tpl]").forEach((el) => {
       el.textContent = el.dataset.tpl.replace(/\{(\w+)\}/g, (m, k) => vals[k] ?? m);
     });
