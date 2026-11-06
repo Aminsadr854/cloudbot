@@ -54,8 +54,10 @@ For access from your workstation, open an SSH tunnel with `ssh -L 9601:127.0.0.1
 |---|---|---|
 | `accounts` | `{}` | Account IDs, labels, and providers; no tokens or proxy secrets |
 | `account_info` | `account_id` | Provider identity, balance, and credit details |
-| `add_account` | `label`, `provider`, `token`, `proxy?`, `proxy_family?`, `auto_backup?` | Encrypts and adds new cloud account |
+| `add_account` | `label`, `provider`, `token`, `region?`, `proxy?`, `proxy_family?`, `auto_backup?`, `note?` | Encrypts and adds new cloud account with optional region and memo note |
 | `delete_account` | `account_id`, `confirm: "DELETE_ACCOUNT"` | Removes cloud account |
+| `set_account_note` | `account_id`, `note` | Sets or clears account memo note |
+| `update_account` | `account_id`, `label?`, `token?` | Renames an account; a nonempty replacement token is verified before saving, and an empty token preserves the existing credential (HTTP API) |
 | `check_all_accounts` | `refresh?` | Status and balance check across all accounts (instant SQLite cache; `refresh: true` polls cloud) |
 | `servers` | `account_id` | Servers in one account |
 | `all_servers` | `refresh?` | Multi-cloud server inventory (instant SQLite cache; `refresh: true` polls cloud) |
@@ -102,9 +104,24 @@ In addition to programmatic API calls, `control_api.py` serves a modern, full-fe
 - **DNS Management**: View and modify Cloudflare DNS records.
 - Access locally via browser or via SSH tunnel: `ssh -L 9601:127.0.0.1:9601 root@YOUR_CLOUDBOT_HOST`.
 
+## Owner notification webhook
+
+`POST /v1/webhook/notify` lets an external script (for example `projects/gemini-watchdog`) message the owner in Telegram. It is authenticated by its own token, `/opt/cloudbot/data/webhook.token` (mode `0600`, created by `install.sh`; for an existing install create it like `control_api.token`). That token cannot call `/v1/operations/*`, and the control API token is not accepted here.
+
+```sh
+curl -sS -X POST -H "Authorization: Bearer $(cat /opt/cloudbot/data/webhook.token)" \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Gemini exit failed","message":"switching to gemini-linode-lon3","level":"warning"}' \
+  http://127.0.0.1:9601/v1/webhook/notify
+```
+
+`level` is `info`, `warning`, `critical` or `ok` (default `info`); `message` is required (3500 characters max), `title` is optional. Text is HTML-escaped. At most 30 messages per 10 minutes are delivered (HTTP 429 beyond that); Telegram failures return 502; a missing token file disables the route (404).
+
 ## MCP connection
 
-The MCP server uses the [official Python MCP SDK](https://github.com/modelcontextprotocol/python-sdk) v2 and stdio. Launch it on the Cloudbot host through SSH: it reads the local token file and calls the local API. It opens no MCP network port. A command-based MCP client configuration is:
+The MCP server uses the [official Python MCP SDK](https://github.com/modelcontextprotocol/python-sdk) v2. It reads the local token file and calls the local API. The default transport is stdio; set `CLOUDBOT_MCP_TRANSPORT=streamable-http` for a loopback HTTP server on `127.0.0.1:9602` (`CLOUDBOT_MCP_HOST`/`CLOUDBOT_MCP_PORT`, `CLOUDBOT_MCP_ALLOWED_HOSTS` for the public hostname). It runs stateless, so a dropped connection or restart needs no reconnect.
+
+Production uses HTTP: `cloudbot-mcp.service` plus an nginx vhost on `cloudbot-mcp.vsl247.com` that terminates TLS and requires `Authorization: Bearer <contents of data/mcp_http.token>` on `/mcp`. Register it with `claude mcp add --transport http cloudbot https://cloudbot-mcp.vsl247.com/mcp --header "Authorization: Bearer <token>"`. Stdio over SSH still works if no HTTP front end exists:
 
 ```json
 {
@@ -117,9 +134,16 @@ The MCP server uses the [official Python MCP SDK](https://github.com/modelcontex
 }
 ```
 
-Set up SSH key access first. The remote account needs permission to read `/opt/cloudbot/data/control_api.token`. Make sure SSH login scripts do not print banners to stdout, which would corrupt stdio MCP. Restart the AI client's MCP connection after changing server code.
+SSH needs key access and no login banners on stdout. It has no keepalive, so a network blip ends the session.
 
-MCP tools are `list_accounts`, `account_info`, `list_servers`, `get_server`, `list_regions`, `list_plans`, `list_images`, `list_floating_ips`, `watchdog_status`, `list_tunnels`, `list_dns_zones`, `get_dns_record`, `create_server`, `power_server`, `create_floating_ip`, `delete_floating_ip`, and `upsert_dns`. Their typed parameters mirror the API arguments. Start with `list_accounts` to find account IDs, then use read tools to inspect current resources and choices.
+MCP tools cover inventory inspection, server provisioning and lifecycle management:
+- **Read & Inspection**: `list_accounts`, `account_info`, `resource_limits`, `list_servers`, `get_server`, `all_servers`, `list_regions`, `list_plans`, `list_images`, `list_floating_ips`, `all_floating_ips`, `hetzner_primary_ips`, `list_ssh_keys`, `list_dns_zones`, `list_dns_records`, `get_dns_record`, `check_all_accounts`, `test_account`, `watchdog_status`, `list_tunnels`, and `proxy_pool`.
+- **Server Lifecycle & Secrets**: `create_server` (supports `ssh_key_ids`, `ssh_keys`, and defaults to `use_vault_keys=True`), `delete_server`, `power_server`, `server_password`, and `set_server_password`.
+- **SSH Key Vault**: `add_ssh_key` (with automatic `sync_accounts`) and `delete_ssh_key`.
+- **Floating & Primary IPs**: `create_floating_ip`, `delete_floating_ip`, `assign_floating_ip`, `unassign_floating_ip`, `update_floating_ip`, `create_hetzner_primary_ip`, `assign_hetzner_primary_ip`, `unassign_hetzner_primary_ip`, and `delete_hetzner_primary_ip`.
+- **DNS**: `upsert_dns` and `delete_dns_record`.
+
+Their typed parameters mirror the API arguments. Start with `list_accounts` to find account IDs, then use read tools to inspect current resources and choices.
 
 For write tools, the AI should obtain the owner's approval for the specific action and target before supplying the confirmation string. The string is an input guard, not a substitute for approval. A timeout does not establish that a paid action failed; inspect the resource list before retrying.
 

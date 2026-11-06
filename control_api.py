@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import os
+from functools import partial
 from pathlib import Path
 import time
 
@@ -10,7 +11,10 @@ from aiohttp import web
 
 from control_service import InputError, OPERATIONS, execute
 from providers import ProviderError
+from proxy_pool import ProxyPoolError
+from proxy_usage import TrafficLimitExceeded
 from store import Store
+import webhook
 
 log = logging.getLogger("cloudbot.control_api")
 TOKEN_PATH = Path(os.environ.get("CLOUDBOT_CONTROL_TOKEN_FILE",
@@ -30,14 +34,14 @@ def read_token():
 
 PAGE_ROUTES = {
     "/", "/overview", "/accounts", "/proxies", "/hetzner", "/vultr",
-    "/linode", "/compute", "/ips", "/ssh", "/dns", "/watchdog", "/settings",
+    "/linode", "/upcloud", "/cloudferro", "/compute", "/ips", "/ssh", "/dns", "/watchdog", "/settings", "/logs",
     "/index.html", "/favicon.ico"
 }
 
 
 @web.middleware
 async def authenticate(request, handler):
-    if request.path in ("/health", "/login", "/v1/auth/telegram", "/v1/auth/me", "/v1/auth/logout"):
+    if request.path in (webhook.WEBHOOK_PATH, "/health", "/login", "/v1/auth/telegram", "/v1/auth/me", "/v1/auth/logout"):
         return await handler(request)
     # Allow serving UI frontend shell on all page routes without blocking (client prompts for token)
     if request.path in PAGE_ROUTES or request.path.startswith("/ui/"):
@@ -214,7 +218,7 @@ async def run_operation(request):
     try:
         result = await execute(request.match_info["name"], args, store)
         return web.json_response(result)
-    except (InputError, ProviderError) as exc:
+    except (InputError, ProviderError, ProxyPoolError, TrafficLimitExceeded) as exc:
         return web.json_response({"error": str(exc)}, status=400)
     except Exception as exc:
         log.exception("control API operation %s failed", request.match_info["name"])
@@ -224,10 +228,14 @@ async def run_operation(request):
         store.close()
 
 
-def build_app(token=None, store_factory=Store):
+def build_app(token=None, store_factory=Store, webhook_token=None, webhook_send=None,
+              auto_sync=False):
     app = web.Application(middlewares=[authenticate], client_max_size=MAX_BODY)
     app[TOKEN_KEY] = token or read_token()
     app[STORE_FACTORY_KEY] = store_factory
+    if auto_sync:
+        from account_sync import account_sync_context
+        app.cleanup_ctx.append(partial(account_sync_context, store_factory))
     for route in PAGE_ROUTES:
         if route != "/favicon.ico":
             app.router.add_get(route, ui_index)
@@ -239,6 +247,7 @@ def build_app(token=None, store_factory=Store):
     app.router.add_get("/health", health)
     app.router.add_get("/v1/operations", operations)
     app.router.add_post("/v1/operations/{name}", run_operation)
+    webhook.install(app, token=webhook_token, send=webhook_send)
     return app
 
 
@@ -247,4 +256,4 @@ if __name__ == "__main__":
     host = os.environ.get("CLOUDBOT_CONTROL_HOST", "0.0.0.0")
     port = int(os.environ.get("CLOUDBOT_CONTROL_PORT", "9601"))
     log.info("Starting Cloudbot Console on http://%s:%d", host, port)
-    web.run_app(build_app(), host=host, port=port)
+    web.run_app(build_app(auto_sync=True), host=host, port=port)

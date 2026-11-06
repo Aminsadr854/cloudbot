@@ -1,11 +1,41 @@
 (function (root) {
   "use strict";
 
-  function proxyFailure(error) {
+  function accountFailure(error) {
     const text = error && (error.error || error.message || error.detail || error);
     const value = String(text || "");
-    if (/invalid\s+(api\s+)?token|unauthori[sz]ed|authentication\s+failed|api\s+key/i.test(value)) return false;
-    return /proxy|socks|ClientHttpProxyError|proxyconnect|tunnel\s+connection|could\s+not\s+connect\s+to\s+proxy|(?:TimeoutError|ConnectionRefusedError|ClientConnectorError|ClientProxyConnectionError|ServerDisconnectedError)/i.test(value);
+    let kind = "connection", title = "Connection Error";
+    let guidance = "The connection could not be completed. Retry the account check and review the error details.";
+    if (/Account suspended|server\(s\) reported suspended/i.test(value)) {
+      kind = 'suspended'; title = 'Suspended';
+      guidance = 'The provider reports suspended servers on this account. Review account billing and suspension notices with the provider.';
+    } else if (/Provider traffic limit reached/i.test(value)) {
+      kind = 'quota'; title = 'Provider Traffic Limit Reached';
+      guidance = 'Raise this provider’s GB limit or reset its Cloudbot usage counter. The proxy route has not failed.';
+    } else if (/HTTP\s+407\b|Proxy authentication failed|ClientHttpProxyError|ClientProxyConnectionError|proxyconnect|tunnel\s+connection|could\s+not\s+connect\s+to\s+proxy|SOCKS proxy needs|Proxy(?:Connection|Timeout|Error)/i.test(value)) {
+      kind = "proxy"; title = "Proxy Failed";
+      guidance = "The configured proxy could not complete the connection. Check its address, credentials, or session.";
+    } else if (/Unauthorized IP address|IP.*(?:not allowed|not authorized|not whitelisted)/i.test(value)) {
+      kind = "access"; title = "API Access Denied";
+      guidance = "The cloud provider rejected the outbound IP address. Review the account API IP allowlist; this does not mean the proxy is offline.";
+    } else if (/HTTP\s+401\b|invalid\s+(api\s+)?token|unauthori[sz]ed|authentication\s+failed|invalid\s+api\s+key|expired\s+token/i.test(value)) {
+      kind = "auth"; title = "Invalid / Expired API Token";
+      guidance = "The cloud provider was reached but rejected this account's API token. Replace the invalid, expired, or revoked token in the account configuration.";
+    } else if (/HTTP\s+403\b|permission denied|insufficient.*(?:scope|permission)/i.test(value)) {
+      kind = "access"; title = "API Access Denied";
+      guidance = "The cloud provider denied API access. Review token permissions, account restrictions, and API access rules.";
+    } else if (/HTTP\s+\d{3}\b/i.test(value)) {
+      kind = "provider"; title = "Cloud Provider Error";
+      guidance = "The cloud provider returned an API error. Review the details below; changing the proxy is not the suggested fix.";
+    } else if (/proxy|socks/i.test(value)) {
+      kind = "proxy"; title = "Proxy Failed";
+      guidance = "The configured proxy could not complete the connection. Check its address, credentials, or session.";
+    }
+    return { kind, title, guidance, isProxy: kind === "proxy", error: value, shortMessage: title };
+  }
+
+  function proxyFailure(error) {
+    return accountFailure(error).isProxy;
   }
 
   function createManager(options) {
@@ -29,10 +59,10 @@
       return g === generation;
     }
 
-    function begin() {
+    function begin(live = true) {
       generation += 1;
       Object.keys(resources).forEach(name => {
-        resources[name].status = "syncing";
+        resources[name].status = live ? "syncing" : "cached";
         resources[name].error = null;
       });
       emit();
@@ -148,5 +178,5 @@
     return { begin, startPhase, current, hydrate, apply, succeed, fail, recoverProxy, snapshot };
   }
 
-  root.CloudbotSync = { createManager, proxyFailure };
+  root.CloudbotSync = { createManager, proxyFailure, accountFailure };
 })(window);

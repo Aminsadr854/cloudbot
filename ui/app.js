@@ -22,8 +22,8 @@ const state = {
   activeTab: "tab-overview",
   searchQuery: "",
   deploySelectedProvider: "hetzner",
-  providerSelectedAccount: { hetzner: null, vultr: null, linode: null },
-  providerAccountSubTab: { hetzner: "instances", vultr: "instances", linode: "instances" },
+  providerSelectedAccount: { hetzner: null, vultr: null, linode: null, upcloud: null, cloudferro: null },
+  providerAccountSubTab: { hetzner: "instances", vultr: "instances", linode: "instances", upcloud: "instances", cloudferro: "instances" },
   regionsCache: {},
   plansCache: {},
   imagesCache: {},
@@ -35,8 +35,30 @@ const state = {
   accountErrors: {},
   liveAccountFailures: {},
   recoveryStatus: {},
-  syncSnapshot: null
+  syncSnapshot: null,
+  logs: {
+    activeSubTab: "system",
+    systemLogs: [],
+    activityLogs: [],
+    service: "all",
+    level: "all",
+    lines: 200,
+    search: "",
+    activityAction: "all",
+    activityProvider: "all",
+    activityStatus: "all",
+    isStreaming: true,
+    autoScroll: true,
+    pollTimer: null,
+    isFetching: false,
+    lastUpdated: null
+  }
 };
+
+// Icons live in the SVG sprite at the top of index.html.
+function icon(name) {
+  return `<svg class="i" aria-hidden="true"><use href="#i-${name}"/></svg>`;
+}
 
 let syncManager = null;
 let authInvalidated = false;
@@ -45,27 +67,54 @@ const proxyRecoveryInFlight = new Map();
 function isServerRunning(status) {
   if (!status) return true;
   const s = String(status).toLowerCase();
-  if (s.includes("stop") || s.includes("suspend") || s.includes("halt") || s.includes("off") || s.includes("shut") || s.includes("error")) {
+  if (s.includes("stop") || s.includes("suspend") || s.includes("suspension") || s.includes("halt") || s.includes("off") || s.includes("shut") || s.includes("error")) {
     return false;
   }
   return s.includes("run") || s.includes("active") || s.includes("ok") || s.includes("online");
+}
+
+function isUpcloudStopped(server) {
+  return String((server && server.status) || "").toLowerCase() === "stopped";
 }
 
 // Provider Metadata
 const PROVIDERS = {
   hetzner: { name: "Hetzner Cloud", logo: "/ui/assets/hetzner.svg", badgeClass: "badge-hetzner", color: "#ef4444" },
   vultr: { name: "Vultr", logo: "/ui/assets/vultr.svg", badgeClass: "badge-vultr", color: "#0ea5e9" },
-  linode: { name: "Linode / Akamai", logo: "/ui/assets/linode.svg", badgeClass: "badge-linode", color: "#10b981" }
+  linode: { name: "Linode / Akamai", logo: "/ui/assets/linode.svg", badgeClass: "badge-linode", color: "#10b981" },
+  upcloud: { name: "UpCloud", logo: "/ui/assets/upcloud.svg", badgeClass: "badge-upcloud", color: "#f97316" },
+  cloudferro: { name: "CloudFerro", logo: "/ui/assets/cloudferro.webp", badgeClass: "badge-upcloud", color: "#2563eb" }
 };
+
+const PROVIDER_CAPABILITIES = {
+  hetzner: { server_lifecycle: true, floating_ip: true, networking: true, ssh_key_crud: true, standalone_floating_ip: true },
+  vultr: { server_lifecycle: true, floating_ip: true, networking: true, ssh_key_crud: true, standalone_floating_ip: true },
+  linode: { server_lifecycle: true, floating_ip: false, networking: true, ssh_key_crud: true, standalone_floating_ip: false },
+  upcloud: { server_lifecycle: true, floating_ip: true, networking: true, ssh_key_crud: false, standalone_floating_ip: false },
+  cloudferro: { server_lifecycle: true, floating_ip: true, networking: true, ssh_key_crud: false, standalone_floating_ip: true }
+};
+
+function providerSupports(provider, capability) {
+  return !!(PROVIDER_CAPABILITIES[provider] && PROVIDER_CAPABILITIES[provider][capability]);
+}
+
+function ipAddress(row) { return String(row.ip || row.address || row.ip_address || row.subnet || row.network || row.id || ""); }
+function ipId(row) { return String(row.id || row.address || row.ip || ""); }
 
 // UI Initialization on DOM ready
 document.addEventListener("DOMContentLoaded", async () => {
   initNavigation();
+  setProxyWorkspace("routes");
   initSearch();
   initModals();
   initForms();
   initAuth();
   initSyncManager();
+  // Read lightweight sync revisions so other clients' changes appear automatically.
+  setInterval(() => pollAutomaticSync(), 3000);
+  setInterval(() => {
+    if (state.authenticated && !document.hidden && !state.inventoryLoads) loadAll();
+  }, 60000);
 
   const authed = await checkSessionAuth();
   if (authed) {
@@ -202,8 +251,17 @@ function initAuth() {
 }
 
 // ==================== API CLIENT ====================
+let lastRetryNoticeAt = 0;
 const apiClient = window.CloudbotApiClient.create({
   getToken: () => state.token,
+  maxAttempts: 4,
+  onRetry: ({ operation, nextAttempt, maxAttempts, delayMs }) => {
+    const now = Date.now();
+    if (now - lastRetryNoticeAt < 1800) return;
+    lastRetryNoticeAt = now;
+    const label = String(operation || "cloud request").replaceAll("_", " ");
+    showToast(`Temporary failure. Retrying ${label} (${nextAttempt}/${maxAttempts})…`, "info");
+  },
   onUnauthorized: () => {
     if (authInvalidated) return;
     authInvalidated = true;
@@ -217,7 +275,30 @@ const apiClient = window.CloudbotApiClient.create({
 });
 
 async function api(operation, args = {}, options = {}) {
-  return apiClient.request(operation, args, options);
+  const result = await apiClient.request(operation, args, options);
+  if (!window.CloudbotApiClient.READ_OPERATIONS.has(operation)) {
+    state.autoSyncReload = true;
+  }
+  return result;
+}
+
+async function pollAutomaticSync() {
+  if (!state.authenticated || document.hidden || state.autoSyncPolling || state.inventoryLoads) return;
+  state.autoSyncPolling = true;
+  try {
+    const status = await api('sync_status');
+    if (!state.authenticated) return;
+    if (state.autoSyncReload || status.revision !== state.autoSyncRevision) {
+      await loadAll();
+      state.autoSyncRevision = status.revision;
+      state.autoSyncReload = false;
+    }
+  } catch (error) {
+    // The regular snapshot timer remains a fallback after a transient API failure.
+    console.debug('Automatic sync status unavailable', error);
+  } finally {
+    state.autoSyncPolling = false;
+  }
 }
 
 // ==================== REGION HELPERS ====================
@@ -280,19 +361,72 @@ function normalizeCountryCode(val) {
   return COUNTRY_ALIASES[upper] || upper;
 }
 
+function normalizeProxyInput(raw) {
+  let value = String(raw || "").trim().replace(/^```(?:text|txt)?\s*/i, "").replace(/```$/g, "").trim();
+  value = value.replace(/^proxy\s*[:=]\s*/i, "").replace(/^['"]|['"]$/g, "").trim();
+  if (!value) throw new Error("Enter a proxy address first.");
+  // People commonly paste a numbered line or an inline note from a provider.
+  if (/\s/.test(value)) value = value.split(/\s+/)[0];
+  if (!/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(value)) {
+    const ipv6 = value.match(/^\[([^\]]+)\]:(\d+):(.*?):(.*)$/);
+    const fields = ipv6 ? null : value.split(":");
+    if (ipv6) {
+      value = `http://${encodeURIComponent(ipv6[3])}:${encodeURIComponent(ipv6[4])}@[${ipv6[1]}]:${ipv6[2]}`;
+    } else if (fields && fields.length >= 4 && /^\d+$/.test(fields[1])) {
+      const host = fields.shift();
+      const port = fields.shift();
+      const user = fields.shift();
+      value = `http://${encodeURIComponent(user)}:${encodeURIComponent(fields.join(":"))}@${host}:${port}`;
+    } else if (fields && fields.length === 2 && /^\d+$/.test(fields[1])) {
+      value = `http://${value}`;
+    } else if (value.includes("@")) {
+      value = `http://${value}`;
+    }
+  }
+  let parsed;
+  try { parsed = new URL(value); } catch (err) { throw new Error("Use host:port:user:pass, user:pass@host:port, or a proxy URL."); }
+  const scheme = parsed.protocol.replace(":", "").toLowerCase();
+  if (!["http", "https", "socks4", "socks5"].includes(scheme) || !parsed.hostname || !parsed.port) {
+    throw new Error("Proxy must use HTTP, HTTPS, SOCKS4, or SOCKS5 with a host and port.");
+  }
+  return { value: parsed.toString().replace(/\/$/, ""), scheme, host: parsed.hostname, port: parsed.port,
+    display: `${scheme}://${parsed.hostname}:${parsed.port}` };
+}
+
+function updateProxyInputPreview(inputId, resultId) {
+  const input = document.getElementById(inputId);
+  const result = document.getElementById(resultId);
+  if (!input || !result) return true;
+  if (!input.value.trim()) {
+    result.textContent = "Paste a proxy in any supported format.";
+    result.className = "text-xs text-secondary mt-1";
+    return true;
+  }
+  try {
+    const parsed = normalizeProxyInput(input.value);
+    result.textContent = `✓ ${parsed.display} · credentials hidden until saved`;
+    result.className = "text-xs text-success mt-1";
+    return true;
+  } catch (err) {
+    result.textContent = `! ${err.message}`;
+    result.className = "text-xs text-warning mt-1";
+    return false;
+  }
+}
+
 function getCountryFlag(code) {
-  if (!code || typeof code !== "string") return "🌐";
+  if (!code || typeof code !== "string") return "";
   const clean = normalizeCountryCode(code);
-  if (clean.length !== 2) return "🌐";
+  if (clean.length !== 2) return "";
   try {
     return String.fromCodePoint(...[...clean].map(c => 127397 + c.charCodeAt(0)));
   } catch (e) {
-    return "🌐";
+    return "";
   }
 }
 
 function formatRegion(code) {
-  if (!code) return { code: "", name: "Not Specified", flag: "🌐" };
+  if (!code) return { code: "", name: "Not Specified", flag: "" };
   const upper = code.trim().toUpperCase();
   const iso = normalizeCountryCode(upper);
   const flag = getCountryFlag(iso);
@@ -375,7 +509,7 @@ function populateAddAccProxyProviders() {
   const sel = document.getElementById("add-acc-proxy-provider-select");
   if (!sel) return;
   const providers = (state.proxyProviders || []).filter(p => p.enabled);
-  let html = `<option value="auto">⚡ Auto (Best provider matching account region)</option>`;
+  let html = `<option value="auto">Auto (Best provider matching account region)</option>`;
   for (const p of providers) {
     const total = p.active_sessions || p.total_sessions || 0;
     html += `<option value="${p.id}">${escapeHtml(p.label)} (${total} sessions)</option>`;
@@ -430,16 +564,16 @@ async function checkAddAccProxyAvailability() {
     if (statusEl) {
       statusEl.classList.remove("hidden");
       if (count > 0) {
-        statusEl.innerHTML = `<span class="text-success">✅ ${count} proxy session(s) available for ${getCountryFlag(region)} ${region}.</span>`;
+        statusEl.innerHTML = `<span class="text-success">${count} proxy session(s) available for ${getCountryFlag(region)} ${region}.</span>`;
       } else {
-        statusEl.innerHTML = `<span class="text-danger">⚠️ No free sessions for ${getCountryFlag(region)} ${region} in this provider. Add sessions in Proxy Pools or choose another provider.</span>`;
+        statusEl.innerHTML = `<span class="text-danger">No free sessions for ${getCountryFlag(region)} ${region} in this provider. Add sessions in Proxy Pools or choose another provider.</span>`;
       }
     }
   } catch (err) {
     if (badge) { badge.textContent = "Unavailable"; badge.className = "badge text-xs badge-status-off"; }
     if (statusEl) {
       statusEl.classList.remove("hidden");
-      statusEl.innerHTML = `<span class="text-danger">⚠️ ${escapeHtml(err.message)}</span>`;
+      statusEl.innerHTML = `<span class="text-danger">${escapeHtml(err.message)}</span>`;
     }
   }
 }
@@ -453,7 +587,7 @@ async function runAutoHealProxies() {
     const healedCount = res.healed_count || 0;
     const failedCount = res.failed_count || 0;
     if (healedCount > 0) {
-      showToast(`🎉 Successfully auto-fixed ${healedCount} account(s) with working proxies!`, "success");
+      showToast(`Successfully auto-fixed ${healedCount} account(s) with working proxies!`, "success");
     } else if (failedCount > 0) {
       showToast(`Auto-fix could not find working proxies for ${failedCount} account(s). Check pool capacity.`, "warning");
     } else {
@@ -484,7 +618,7 @@ async function replaceAccountProxy(accId, btnEl = null) {
         ? { status: "recovered", result, proxyReplaced: true }
         : { status: "unresolved", result, error: "No working replacement proxy was found" };
       showToast(healed ? `Proxy replaced for ${account.label}.` : `No working replacement was found for ${account.label}.`, healed ? "success" : "warning");
-      await loadAll(true);
+      await loadAll();
     } catch (err) {
       state.recoveryStatus[accId] = { status: "unresolved", error: err.message };
       renderAccountsManagement();
@@ -615,26 +749,29 @@ function openBulkSessionsModal(preselectedPid = null) {
 
 function formatAccountProxyLabel(acc) {
   if (acc.binding) {
-    return `🔀 Pool (${acc.binding.country || acc.region || 'Auto'}: ${acc.binding.session_id.substring(0, 8)}…)`;
+    return `Pool (${acc.binding.country || acc.region || 'Auto'}: ${acc.binding.session_id.substring(0, 8)}…)`;
   }
   if (acc.has_proxy) {
-    return `🛡️ ${acc.proxy_masked || 'Custom Proxy'}`;
+    return `${acc.proxy_masked || 'Custom Proxy'}`;
   }
-  return `🌐 Direct Egress`;
+  return `Direct Egress`;
 }
 
 function getAccountFailureStatus(accId) {
   const err = (state.accountErrors && (state.accountErrors[accId] || state.accountErrors[String(accId)])) ||
               (state.accountBilling && state.accountBilling[accId] && state.accountBilling[accId].status === "error" && state.accountBilling[accId].error);
-  if (!err) return null;
-  const str = String(err);
-  const isProxy = window.CloudbotSync.proxyFailure(str);
-  return {
-    isProxy: isProxy,
-    error: str,
-    title: isProxy ? "Proxy Failed" : "Connection Error",
-    shortMessage: isProxy ? "Proxy Failed" : "Error"
-  };
+  if (err) return window.CloudbotSync.accountFailure(err);
+  const billing = state.accountBilling && state.accountBilling[accId];
+  if (billing && billing.status === 'suspended') {
+    return window.CloudbotSync.accountFailure(billing.error || 'Account suspended');
+  }
+  const suspended = (state.servers || []).filter(s => String(s.account_id) === String(accId) &&
+    (String(s.status || '').toLowerCase() === 'billing_suspension' ||
+      String(s.status || '').toLowerCase().split(/[^a-z]+/).includes('suspended')));
+  if (suspended.length) {
+    return window.CloudbotSync.accountFailure(`Account suspended: ${suspended.length} server(s) reported suspended by the provider.`);
+  }
+  return null;
 }
 
 function initSyncManager() {
@@ -650,12 +787,6 @@ function initSyncManager() {
   renderSyncStatus(syncManager.snapshot());
   const stripRefresh = document.getElementById("btn-sync-strip-refresh");
   if (stripRefresh) stripRefresh.addEventListener("click", () => loadAll(true));
-  document.addEventListener("visibilitychange", () => {
-    const isSyncing = state.syncSnapshot && Object.values(state.syncSnapshot.resources || {}).some(item => item.status === "syncing");
-    if (!document.hidden && syncManager && state.syncSnapshot && !state.syncSnapshot.fresh && !isSyncing) {
-      loadAll(true);
-    }
-  });
   return syncManager;
 }
 
@@ -680,10 +811,10 @@ function renderSyncStatus(snapshot) {
   strip.dataset.state = stateName;
   if (sidebarConnection) sidebarConnection.textContent = !hasStarted ? "Waiting" : syncing ? "Syncing" : attention ? "Needs attention" : snapshot.fresh ? "Connected" : "Cached data";
   if (sidebarDot) sidebarDot.className = `status-dot ${!hasStarted ? "idle" : attention ? "offline" : syncing ? "idle" : "online"}`;
-  if (label) label.textContent = !hasStarted ? "Waiting for first sync" : syncing ? "Syncing cloud data" : attention ? "Needs attention" : snapshot.fresh ? "All data is up to date" : "Data may be stale";
+  if (label) label.textContent = syncing ? "Refreshing selected accounts" : attention ? "Needs attention" : "Saved cloud data";
   if (detail) {
     const when = snapshot.lastSuccessAt ? formatRelativeTime(snapshot.lastSuccessAt) : "No successful sync yet";
-    detail.textContent = !hasStarted ? "Your cached data will appear here." : syncing ? "Keeping the last known values visible while live data arrives." : attention ? `${failedResources.join(", ")} need attention · Last successful sync ${when}.` : `Last successful sync ${when}.`;
+    detail.textContent = syncing ? "Refreshing the selected accounts…" : attention ? `${failedResources.join(", ")} need attention. Press Refresh to retry.` : "Showing saved data. Cloud data is fetched only when you press Refresh.";
   }
   if (badge) {
     badge.textContent = `${attention} need attention`;
@@ -761,29 +892,37 @@ async function performFailedProxyRecovery(generation, account, error) {
 }
 
 // ==================== DATA LOADER ====================
-async function loadAll(forceRefresh = false) {
+function getRefreshScope() {
+  const provider = String(state.activeTab || '').replace(/^tab-/, '');
+  if (['hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro'].includes(provider)) {
+    const accountId = state.providerSelectedAccount?.[provider];
+    return accountId ? { account_id: Number(accountId) } : { provider };
+  }
+  const accountId = state.activeTab === 'tab-ips' ? state.ipsAccountFilter : state.activeTab === 'tab-accounts' ? state.activeAccountFilter : null;
+  if (['hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro'].includes(accountId)) return { provider: accountId };
+  return accountId && accountId !== 'all' && Number.isFinite(Number(accountId)) ? { account_id: Number(accountId) } : {};
+}
+
+async function loadAll(forceRefresh = false, scope = null) {
+  state.inventoryLoads = (state.inventoryLoads || 0) + 1;
+  scope = forceRefresh ? (scope || getRefreshScope()) : {};
   const manager = initSyncManager();
   state.recoveryStatus = {};
   state.liveAccountFailures = {};
-  const generation = manager.begin();
+  const generation = manager.begin(forceRefresh);
   const refreshBtn = document.getElementById("btn-refresh-all");
-  if (refreshBtn) {
+  if (refreshBtn && forceRefresh) {
     refreshBtn.classList.add("loading");
     refreshBtn.disabled = true;
     refreshBtn.setAttribute("aria-busy", "true");
   }
 
   try {
-    await loadAllPhase(generation, false);
+    await loadAllPhase(generation, forceRefresh, scope);
     if (!manager.current(generation) || !state.authenticated) return;
     renderAllViews();
     updateBadges();
 
-    manager.startPhase(generation);
-    await loadAllPhase(generation, true);
-    if (!manager.current(generation) || !state.authenticated) return;
-
-    await autoRecoverFailedAccounts(generation);
     if (!manager.current(generation)) return;
     renderAllViews();
     updateBadges();
@@ -791,6 +930,7 @@ async function loadAll(forceRefresh = false) {
   } catch (err) {
     if (manager.current(generation)) showToast("Error loading data: " + err.message, "error");
   } finally {
+    state.inventoryLoads -= 1;
     if (manager.current(generation) && refreshBtn) {
       refreshBtn.classList.remove("loading");
       refreshBtn.disabled = false;
@@ -799,9 +939,12 @@ async function loadAll(forceRefresh = false) {
   }
 }
 
-async function loadAllPhase(generation, forceRefresh) {
+async function loadAllPhase(generation, forceRefresh, scope = {}) {
   if (!syncManager.current(generation) || !state.authenticated) return;
-  const refreshArg = forceRefresh ? { refresh: true } : {};
+  const refreshArg = forceRefresh ? { refresh: true, ...scope } : { cached_only: true };
+  const scoped = !!(scope.provider || scope.account_id);
+  const inScope = accountId => (!scope.account_id || String(accountId) === String(scope.account_id)) &&
+    (!scope.provider || state.accounts.some(a => String(a.id) === String(accountId) && a.provider === scope.provider));
   const recordLiveFailure = (accountId, error) => {
     if (!forceRefresh || accountId === undefined || accountId === null || !error) return;
     const key = String(accountId);
@@ -820,6 +963,22 @@ async function loadAllPhase(generation, forceRefresh) {
     return true;
   };
 
+  const mergeFailedAccountRows = (incoming, previous, errors) => {
+    const incomingIds = new Set((incoming || []).map(row => String(row.account_id)));
+    const failedIds = new Set(Object.keys(errors || {}).map(String).filter(id => !incomingIds.has(id)));
+    if (!failedIds.size && !scoped) return incoming || [];
+    const outside = scoped ? (previous || []).filter(row => !inScope(row.account_id)) : [];
+    const retained = (previous || []).filter(row => failedIds.has(String(row.account_id)));
+    const refreshed = (incoming || []).filter(row => !failedIds.has(String(row.account_id)));
+    const seen = new Set();
+    return [...outside, ...refreshed, ...retained].filter(row => {
+      const key = `${row.account_id}:${row.provider}:${String(row.id)}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  };
+
   const observe = (resource, request, handler) => request.then(value => {
     apply(resource, value, handler);
   }).catch(error => {
@@ -830,6 +989,7 @@ async function loadAllPhase(generation, forceRefresh) {
     }
   });
 
+  if (scoped) syncManager.hydrate(generation, 'dnsZones', state.dnsZones);
   await Promise.all([
     observe("accounts", api("accounts", {}, { retryMode: "read" }), data => { state.accounts = data.accounts || []; }),
     observe("proxyProviders", api("proxy_providers", {}, { retryMode: "read" }), data => { state.proxyProviders = data.providers || []; }),
@@ -837,8 +997,9 @@ async function loadAllPhase(generation, forceRefresh) {
     observe("watchdog", api("watch_status", {}, { retryMode: "read" }), data => { state.watchdog = data; }),
     observe("tunnels", api("tunnels", {}, { retryMode: "read" }), data => { state.tunnels = data.tunnels || []; }),
     observe("servers", api("all_servers", refreshArg, { retryMode: "read" }), data => {
-    state.servers = data.servers || [];
-    state.accountErrors = data.account_errors || {};
+    const errors = data.account_errors || {};
+    state.servers = mergeFailedAccountRows(data.servers, state.servers, errors);
+    state.accountErrors = { ...(scoped ? Object.fromEntries(Object.entries(state.accountErrors || {}).filter(([id]) => !inScope(id))) : {}), ...errors };
     if (forceRefresh) {
       Object.entries(state.accountErrors).forEach(([id, error]) => recordLiveFailure(id, error));
     }
@@ -846,8 +1007,14 @@ async function loadAllPhase(generation, forceRefresh) {
       syncManager.fail(generation, "servers", "One or more account server lists could not be refreshed", true);
     }
     }),
-    observe("floatingIps", api("all_floating_ips", refreshArg, { retryMode: "read" }), data => { state.floatingIps = data.floating_ips || []; }),
-    observe("dnsZones", api("dns_zones", {}, { retryMode: "read" }), data => { state.dnsZones = data.zones || []; }),
+    observe("floatingIps", api("all_floating_ips", refreshArg, { retryMode: "read" }), data => {
+      const errors = data.account_errors || {};
+      state.floatingIps = mergeFailedAccountRows(data.floating_ips, state.floatingIps, errors);
+      if (Object.keys(errors).length) {
+        syncManager.fail(generation, "floatingIps", "One or more account IP lists could not be refreshed", true);
+      }
+    }),
+    scoped ? Promise.resolve() : observe("dnsZones", api("dns_zones", { cached_only: !forceRefresh }, { retryMode: "read" }), data => { state.dnsZones = data.zones || []; }),
     observe("billing", api("check_all_accounts", refreshArg, { retryMode: "read" }), data => {
     if (!data || !data.accounts) return;
     for (const item of data.accounts) {
@@ -872,11 +1039,11 @@ async function loadAllPhase(generation, forceRefresh) {
   ]);
   if (!syncManager.current(generation) || !state.authenticated) return;
 
-  const hetznerAccs = state.accounts.filter(a => a.provider === "hetzner");
+  const hetznerAccs = state.accounts.filter(a => a.provider === "hetzner" && inScope(a.id));
   if (hetznerAccs.length === 0) {
-    if (forceRefresh) syncManager.apply(generation, "primaryIps", []);
+    if (forceRefresh) syncManager.apply(generation, "primaryIps", scoped ? state.primaryIps : []);
     else syncManager.hydrate(generation, "primaryIps", []);
-    state.primaryIps = [];
+    if (!scoped) state.primaryIps = [];
     renderAllViews();
     updateBadges();
     return;
@@ -888,11 +1055,13 @@ async function loadAllPhase(generation, forceRefresh) {
   if (!syncManager.current(generation) || !state.authenticated) return;
 
   const pIps = [];
+  const successfulAccounts = new Set();
   let primarySuccess = false;
   for (const pr of primaryResults) {
     if (pr.status === "fulfilled" && pr.value && pr.value.res && pr.value.res.primary_ips) {
       primarySuccess = true;
       const { h, res } = pr.value;
+      successfulAccounts.add(String(h.id));
       res.primary_ips.forEach(p => {
         p.provider = "hetzner";
         p.account_id = h.id;
@@ -904,7 +1073,7 @@ async function loadAllPhase(generation, forceRefresh) {
   if (primarySuccess) {
     if (forceRefresh) syncManager.apply(generation, "primaryIps", pIps);
     else syncManager.hydrate(generation, "primaryIps", pIps);
-    state.primaryIps = pIps;
+    state.primaryIps = [...state.primaryIps.filter(p => !successfulAccounts.has(String(p.account_id))), ...pIps];
   } else {
     syncManager.fail(generation, "primaryIps", "Hetzner Primary IP data could not be refreshed", true);
   }
@@ -976,6 +1145,8 @@ function updateBadges() {
   const hetznerServers = state.servers.filter(s => s.provider === "hetzner");
   const vultrServers = state.servers.filter(s => s.provider === "vultr");
   const linodeServers = state.servers.filter(s => s.provider === "linode");
+  const upcloudServers = state.servers.filter(s => s.provider === "upcloud");
+  const cloudferroServers = state.servers.filter(s => s.provider === "cloudferro");
 
   const bTotal = document.getElementById("badge-total-servers");
   const bAccounts = document.getElementById("badge-accounts-count");
@@ -983,6 +1154,8 @@ function updateBadges() {
   const bHetzner = document.getElementById("badge-hetzner-count");
   const bVultr = document.getElementById("badge-vultr-count");
   const bLinode = document.getElementById("badge-linode-count");
+  const bUpcloud = document.getElementById("badge-upcloud-count");
+  const bCloudferro = document.getElementById("badge-cloudferro-count");
   const bFips = document.getElementById("badge-fips-count");
   const bSsh = document.getElementById("badge-ssh-count");
 
@@ -992,6 +1165,8 @@ function updateBadges() {
   if (bHetzner) bHetzner.textContent = hetznerServers.length;
   if (bVultr) bVultr.textContent = vultrServers.length;
   if (bLinode) bLinode.textContent = linodeServers.length;
+  if (bUpcloud) bUpcloud.textContent = upcloudServers.length;
+  if (bCloudferro) bCloudferro.textContent = cloudferroServers.length;
   if (bFips) bFips.textContent = state.floatingIps.length + state.primaryIps.length;
   if (bSsh) bSsh.textContent = state.sshKeys.length;
 }
@@ -1004,6 +1179,8 @@ function renderAllViews() {
   renderHetznerHub();
   renderVultrHub();
   renderLinodeHub();
+  renderUpcloudHub();
+  renderCloudferroHub();
   renderAllCompute();
   renderIPManagement();
   renderSSHKeys();
@@ -1014,56 +1191,29 @@ function renderAllViews() {
 function getProviderBadge(provider) {
   const provKey = (provider || "").toLowerCase();
   const p = PROVIDERS[provKey] || { name: provider || "Cloud", logo: "/ui/assets/cloud.svg", badgeClass: "badge-hetzner" };
-  return `<span class="badge ${p.badgeClass}"><img src="${p.logo}" alt="${p.name}" width="14" height="14" class="w-3.5 h-3.5 object-contain" style="width:14px;height:14px;object-fit:contain;flex-shrink:0;"> ${p.name}</span>`;
+  return `<span class="provider-inline"><img src="${p.logo}" alt="" width="14" height="14">${p.name}</span>`;
 }
 
 // ---- TAB 1: EXECUTIVE OVERVIEW ----
 function renderOverview() {
-  const elTotalInstances = document.getElementById("stat-total-instances");
-  if (elTotalInstances) elTotalInstances.textContent = state.servers.length;
-  const elTotalFips = document.getElementById("stat-total-fips");
-  if (elTotalFips) elTotalFips.textContent = state.floatingIps.length + state.primaryIps.length;
-  const elTotalAccounts = document.getElementById("stat-total-accounts");
-  if (elTotalAccounts) elTotalAccounts.textContent = state.accounts.length;
-  const elTotalSsh = document.getElementById("stat-total-ssh");
-  if (elTotalSsh) elTotalSsh.textContent = state.sshKeys.length;
-
-  // Hetzner Metrics
-  const hAccs = state.accounts.filter(a => a.provider === "hetzner");
-  const hSrvs = state.servers.filter(s => s.provider === "hetzner");
-  const hFips = state.floatingIps.filter(f => f.provider === "hetzner").length + state.primaryIps.length;
-  document.getElementById("hub-hetzner-servers").textContent = hSrvs.length;
-  document.getElementById("hub-hetzner-accounts").textContent = hAccs.length;
-  document.getElementById("hub-hetzner-fips").textContent = hFips;
-
-  const hChips = document.getElementById("hub-hetzner-account-chips");
-  hChips.innerHTML = hAccs.length > 0
-    ? hAccs.map(a => `<span class="hub-account-chip" onclick="navigateToAccount('hetzner', ${a.id})" style="cursor: pointer;" title="View instances for ${escapeHtml(a.label)}">${escapeHtml(a.label)} (${hSrvs.filter(s => s.account_id === a.id).length})</span>`).join("")
-    : `<span class="text-xs text-muted">No accounts added</span>`;
-
-  // Vultr Metrics
-  const vAccs = state.accounts.filter(a => a.provider === "vultr");
-  const vSrvs = state.servers.filter(s => s.provider === "vultr");
-  const vFips = state.floatingIps.filter(f => f.provider === "vultr").length;
-  document.getElementById("hub-vultr-servers").textContent = vSrvs.length;
-  document.getElementById("hub-vultr-accounts").textContent = vAccs.length;
-  document.getElementById("hub-vultr-fips").textContent = vFips;
-
-  const vChips = document.getElementById("hub-vultr-account-chips");
-  vChips.innerHTML = vAccs.length > 0
-    ? vAccs.map(a => `<span class="hub-account-chip" onclick="navigateToAccount('vultr', ${a.id})" style="cursor: pointer;" title="View instances for ${escapeHtml(a.label)}">${escapeHtml(a.label)} (${vSrvs.filter(s => s.account_id === a.id).length})</span>`).join("")
-    : `<span class="text-xs text-muted">No accounts added</span>`;
-
-  // Linode Metrics
-  const lAccs = state.accounts.filter(a => a.provider === "linode");
-  const lSrvs = state.servers.filter(s => s.provider === "linode");
-  document.getElementById("hub-linode-servers").textContent = lSrvs.length;
-  document.getElementById("hub-linode-accounts").textContent = lAccs.length;
-
-  const lChips = document.getElementById("hub-linode-account-chips");
-  lChips.innerHTML = lAccs.length > 0
-    ? lAccs.map(a => `<span class="hub-account-chip" onclick="navigateToAccount('linode', ${a.id})" style="cursor: pointer;" title="View instances for ${escapeHtml(a.label)}">${escapeHtml(a.label)} (${lSrvs.filter(s => s.account_id === a.id).length})</span>`).join("")
-    : `<span class="text-xs text-muted">No accounts added</span>`;
+  const failures = state.accounts.filter(a => getAccountFailureStatus(a.id));
+  const metrics = document.getElementById("workspace-metrics");
+  if (!metrics) return;
+  metrics.innerHTML = [
+    ["Servers", state.servers.length, "Across all datacenters", "compute"],
+    ["Cloud accounts", state.accounts.length, "Provider credentials & access", "accounts"],
+    ["Accounts with proxies", state.accounts.filter(a => a.has_proxy).length, "Pool sessions or custom routes", "proxies"],
+    ["Need attention", failures.length, "Account connection issues", "accounts"]
+  ].map(([label, count, hint, tab]) => `<button class="workspace-metric" onclick="switchTab('tab-${tab}')"><span>${label}</span><strong>${count}</strong><small>${hint} →</small></button>`).join("");
+  document.getElementById("overview-attention").innerHTML = failures.length
+    ? failures.map(a => {
+      const failure = getAccountFailureStatus(a.id);
+      return `<div class="attention-row"><div><strong>${escapeHtml(a.label)}</strong><p class="text-sm text-secondary">${escapeHtml(failure.title)}</p></div><button class="btn btn-secondary btn-sm" onclick="${failure.isProxy ? `openEditProxyModal(${a.id})` : `navigateToAccount('${a.provider}', ${a.id})`}">${failure.isProxy ? 'Change route' : 'View account'}</button></div>`;
+    }).join("")
+    : `<div class="quiet-state"><strong>${state.accounts.length ? 'No account issues reported' : 'Connect your first account'}</strong><p>${state.accounts.length ? 'Use Check accounts to verify access when you need it.' : 'Add a provider API key to start managing servers.'}</p><button class="btn btn-secondary btn-sm" onclick="${state.accounts.length ? "switchTab('tab-accounts')" : 'openAddAccountModal()'}">${state.accounts.length ? 'View accounts' : '+ Add account'}</button></div>`;
+  document.getElementById("overview-providers").innerHTML = Object.entries(PROVIDERS).filter(([key]) => state.accounts.some(a => a.provider === key)).map(([key, provider]) =>
+    `<button class="provider-summary" onclick="switchTab('tab-${key}')"><img src="${provider.logo}" alt=""><span><strong>${provider.name}</strong><small>${state.accounts.filter(a => a.provider === key).length} accounts · ${state.servers.filter(server => server.provider === key).length} servers</small></span><span>→</span></button>`
+  ).join("") || '<p class="text-secondary text-sm">Your connected providers will appear here.</p>';
 }
 
 // ==================== LIVE BILLING REFRESH ====================
@@ -1092,6 +1242,7 @@ async function refreshAllBillingDetails(silent = false) {
             state.accountBilling[item.account.id] = {
               status: item.status,
               info: item.info,
+              limits: item.limits,
               identity: item.identity,
               latency_ms: item.latency_ms,
               error: item.error,
@@ -1122,55 +1273,15 @@ async function refreshAllBillingDetails(silent = false) {
 }
 
 async function refreshSingleAccountBilling(accId, btnEl = null) {
-  const btn = btnEl || document.getElementById(`btn-refresh-billing-${accId}`) || document.getElementById(`btn-check-status-${accId}`) || document.getElementById(`btn-check-status-drilldown-${accId}`);
-  await runWithButtonLoading(btn, async () => {
-    try {
-      let res = await api("test_account", { account_id: accId }, { retryMode: "read" });
-      const account = state.accounts.find(item => String(item.id) === String(accId));
-      if (res.status === "error" && account && account.has_proxy && window.CloudbotSync.proxyFailure(res.error)) {
-        const recovery = await recoverFailedProxy(syncManager.snapshot().generation, account, res.error);
-        if (recovery.status === "recovered" && recovery.result) res = recovery.result;
-      }
-      state.accountBilling[accId] = {
-        status: res.status,
-        info: res.info,
-        identity: res.identity,
-        latency_ms: res.latency_ms,
-        error: res.error,
-        lastChecked: new Date()
-      };
-      state.accountErrors = state.accountErrors || {};
-      if (res.status === "error") {
-        state.accountErrors[accId] = res.error;
-        state.accountErrors[String(accId)] = res.error;
-        const isProxy = window.CloudbotSync.proxyFailure(res.error || "");
-        showToast(isProxy ? `⚠️ Proxy failed for account #${accId}: ${res.error}` : `Connection error for account #${accId}: ${res.error}`, "error");
-      } else {
-        delete state.accountErrors[accId];
-        delete state.accountErrors[String(accId)];
-        showToast(`Account #${accId} verified (${res.identity || 'OK'})`, "success");
-        try {
-          const sRes = await api("all_servers");
-          if (sRes.servers) state.servers = sRes.servers;
-        } catch (e) {}
-      }
-      renderAllViews();
-    } catch (err) {
-      state.accountErrors = state.accountErrors || {};
-      state.accountErrors[accId] = err.message;
-      state.accountErrors[String(accId)] = err.message;
-      renderAllViews();
-      showToast(`Billing check failed: ${err.message}`, "error");
-    }
-  });
+  return runWithButtonLoading(btnEl, () => loadAll(true, { account_id: Number(accId) }), "Refreshing account…");
 }
 
 // ==================== TAB: ACCOUNT MANAGEMENT & BILLING ====================
 function filterAccountsByProvider(provider) {
   state.activeAccountFilter = provider;
-  document.querySelectorAll("#account-provider-filters .pill-filter").forEach(b => {
-    b.classList.toggle("active", b.dataset.filter === provider);
-  });
+  state.accountSearchQuery = "";
+  const input = document.getElementById("search-accounts-input");
+  if (input) input.value = "";
   renderAccountsManagement();
 }
 
@@ -1181,28 +1292,20 @@ function filterAccountsList() {
 }
 
 function formatAccountBillingDetails(acc, b, fail) {
-  if (fail) {
-    const isProxy = fail.isProxy;
+  if (fail && (fail.kind !== 'suspended' || !b || !b.info)) {
     return {
-      balanceDisplay: `<span class="text-danger font-bold text-xs">⚠️ ${escapeHtml(isProxy ? 'Proxy Failed' : 'Connection Error')}</span>`,
+      balanceDisplay: `<span class="text-danger font-bold text-xs">${escapeHtml(fail.title)}</span>`,
       usageDisplay: null,
-      balanceText: isProxy ? '⚠️ Proxy Failed' : '⚠️ Connection Error',
+      balanceText: `${fail.title}`,
       usageText: null,
-      badge: `<span class="badge badge-danger">⚠️ Proxy Failed</span>`,
+      badge: null,
       isCredit: false,
     };
   }
 
   if (!b || !b.info) {
     if (b && b.status === "error") {
-      return {
-        balanceDisplay: `<span class="text-danger font-bold text-xs" title="${escapeHtml(b.error || '')}">⚠️ Auth / Proxy Error</span>`,
-        usageDisplay: null,
-        balanceText: "Auth / Proxy error",
-        usageText: null,
-        badge: `<span class="badge badge-danger">⚠️ Error</span>`,
-        isCredit: false,
-      };
+      return formatAccountBillingDetails(acc, b, window.CloudbotSync.accountFailure(b.error || "Account check failed"));
     }
     return {
       balanceDisplay: `<span class="text-secondary text-xs">Live details ready</span>`,
@@ -1315,6 +1418,25 @@ function formatAccountBillingDetails(acc, b, fail) {
     };
   }
 
+  if (acc.provider === "cloudferro") {
+    const absolute = (b.limits && b.limits.limits) || {};
+    const usage = (b.limits && b.limits.usage) || {};
+    const usedServers = absolute.totalInstancesUsed ?? usage.servers ?? 0;
+    const maxServers = absolute.maxTotalInstances;
+    const usedIps = absolute.totalFloatingIpsUsed ?? usage.floating_ips ?? 0;
+    const maxIps = absolute.maxTotalFloatingIps;
+    const serverText = maxServers == null ? `${usedServers}` : `${usedServers}/${maxServers}`;
+    const ipText = maxIps == null ? `${usedIps}` : `${usedIps}/${maxIps}`;
+    return {
+      balanceDisplay: `<span class="text-primary font-bold">CloudFerro</span>`,
+      usageDisplay: `<span class="text-secondary font-mono text-xs">Servers ${serverText} · Floating IPs ${ipText}</span>`,
+      balanceText: "CloudFerro",
+      usageText: `Servers ${serverText} · Floating IPs ${ipText}`,
+      badge: `<span class="badge badge-upcloud font-mono text-xs">${serverText} servers</span>`,
+      isCredit: false,
+    };
+  }
+
   return {
     balanceDisplay: `<span class="text-secondary text-xs">Ready</span>`,
     usageDisplay: null,
@@ -1326,18 +1448,28 @@ function formatAccountBillingDetails(acc, b, fail) {
 }
 
 function renderAccountsManagement() {
-  const totalAccs = state.accounts.length;
-  const cAll = document.getElementById("filter-acc-count-all");
-  const cHetz = document.getElementById("filter-acc-count-hetzner");
-  const cVul = document.getElementById("filter-acc-count-vultr");
-  const cLin = document.getElementById("filter-acc-count-linode");
-  if (cAll) cAll.textContent = totalAccs;
-  if (cHetz) cHetz.textContent = state.accounts.filter(a => a.provider === "hetzner").length;
-  if (cVul) cVul.textContent = state.accounts.filter(a => a.provider === "vultr").length;
-  if (cLin) cLin.textContent = state.accounts.filter(a => a.provider === "linode").length;
-
   const container = document.getElementById("accounts-master-grid");
   if (!container) return;
+  const showProviders = !state.activeAccountFilter || state.activeAccountFilter === "all";
+  const toolbar = document.getElementById("account-list-toolbar");
+  if (toolbar) toolbar.hidden = showProviders;
+  if (showProviders) {
+    const connected = Object.entries(PROVIDERS).filter(([key]) => state.accounts.some(a => a.provider === key));
+    container.innerHTML = connected.length ? `<div class="account-provider-grid">${connected.map(([key, provider]) => {
+      const accounts = state.accounts.filter(a => a.provider === key);
+      const servers = state.servers.filter(s => s.provider === key);
+      const issues = accounts.filter(a => getAccountFailureStatus(a.id)).length;
+      return `<button class="account-provider-card" style="--provider-color: ${provider.color}" onclick="filterAccountsByProvider('${key}')">
+        <span class="account-provider-brand"><span class="account-provider-logo"><img src="${provider.logo}" alt="" width="48" height="48"></span><span class="account-provider-arrow" aria-hidden="true">↗</span></span>
+        <strong class="account-provider-name">${provider.name}</strong>
+        <span class="account-provider-counts">${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}<span aria-hidden="true"> · </span>${servers.length} ${servers.length === 1 ? 'server' : 'servers'}</span>
+        <span class="account-provider-footer"><span>${issues ? `${issues} ${issues === 1 ? 'account needs' : 'accounts need'} attention` : 'View accounts'}</span><span aria-hidden="true">→</span></span>
+      </button>`;
+    }).join("")}</div>` : `<div class="quiet-state"><strong>Connect your first provider</strong><p>Add a cloud account to see its provider here.</p><button class="btn btn-primary" onclick="openAddAccountModal()">+ Add account</button></div>`;
+    return;
+  }
+  const title = document.getElementById("account-list-title");
+  if (title) title.textContent = PROVIDERS[state.activeAccountFilter]?.name || "Accounts";
 
   let filtered = state.accounts;
   if (state.activeAccountFilter && state.activeAccountFilter !== "all") {
@@ -1349,7 +1481,8 @@ function renderAccountsManagement() {
       (a.label && a.label.toLowerCase().includes(q)) ||
       String(a.id).includes(q) ||
       (a.region && a.region.toLowerCase().includes(q)) ||
-      (a.proxy_masked && a.proxy_masked.toLowerCase().includes(q))
+      (a.proxy_masked && a.proxy_masked.toLowerCase().includes(q)) ||
+      (a.note && a.note.toLowerCase().includes(q))
     );
   }
 
@@ -1378,11 +1511,11 @@ function renderAccountsManagement() {
         let billingClass = bDetails.isCredit ? "text-success font-bold" : (fail ? "text-danger font-bold" : "text-primary font-bold");
 
         const latPill = b && b.latency_ms !== undefined ? (
-          b.latency_ms < 300 ? `<span class="latency-tag fast">⚡ ${b.latency_ms}ms</span>` :
-          `<span class="latency-tag medium">⚡ ${b.latency_ms}ms</span>`
+          b.latency_ms < 300 ? `<span class="latency-tag fast">${b.latency_ms}ms</span>` :
+          `<span class="latency-tag medium">${b.latency_ms}ms</span>`
         ) : "";
 
-        let subBillingText = latPill || 'Live status ready';
+        let subBillingText = latPill || (isOk ? 'Access verified' : 'Not checked yet');
         if (fail) {
           subBillingText = `<span class="text-danger font-mono text-xs" title="${escapeHtml(fail.error)}">${escapeHtml(fail.error.length > 40 ? fail.error.substring(0, 38) + '…' : fail.error)}</span>`;
         }
@@ -1392,19 +1525,19 @@ function renderAccountsManagement() {
           const recoveryLabel = recovery.proxyReplaced ? "Proxy replaced" : "Connection recovered";
           subBillingText = `<span class="text-success text-xs">✓ ${recoveryLabel} ${formatRelativeTime(Date.now())}</span>`;
         } else if (recovery && recovery.status === "unresolved") {
-          subBillingText = `<span class="text-warning text-xs" title="${escapeHtml(recovery.error || 'No working replacement proxy was found')}">⚠ Replacement needed</span>`;
+          subBillingText = `<span class="text-warning text-xs" title="${escapeHtml(recovery.error || 'No working replacement proxy was found')}">Replacement needed</span>`;
         }
 
         // Proxy Route pill
         let proxyPill = "";
         if (fail && fail.isProxy) {
-          proxyPill = `<span class="badge-proxy-custom" style="background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4); color: #fca5a5;" title="${escapeHtml(fail.error)}">⚠️ Proxy Failed</span>`;
+          proxyPill = `<span class="badge-proxy-custom" style="background: rgba(239, 68, 68, 0.15); border-color: rgba(239, 68, 68, 0.4); color: #fca5a5;" title="${escapeHtml(fail.error)}">Proxy Failed</span>`;
         } else if (acc.binding) {
-          proxyPill = `<span class="badge-proxy-pool" title="Rotating session: ${escapeHtml(acc.binding.session_id)}">🔀 ${escapeHtml(acc.binding.country || acc.region || 'POOL')} · ${escapeHtml(acc.binding.session_id.substring(0, 8))}…</span>`;
+          proxyPill = `<span class="badge-proxy-pool" title="Rotating session: ${escapeHtml(acc.binding.session_id)}">${escapeHtml(acc.binding.country || acc.region || 'POOL')} · ${escapeHtml(acc.binding.session_id.substring(0, 8))}…</span>`;
         } else if (acc.has_proxy) {
-          proxyPill = `<span class="badge-proxy-custom" title="${escapeHtml(acc.proxy_masked)}">🛡️ ${escapeHtml(acc.proxy_masked)}</span>`;
+          proxyPill = `<span class="badge-proxy-custom" title="${escapeHtml(acc.proxy_masked)}">${escapeHtml(acc.proxy_masked)}</span>`;
         } else {
-          proxyPill = `<span class="badge-proxy-direct">🌐 Direct</span>`;
+          proxyPill = `<span class="badge-proxy-direct">Direct</span>`;
         }
 
         return `
@@ -1415,14 +1548,16 @@ function renderAccountsManagement() {
               <div class="account-clean-info">
                 <div class="account-clean-title">
                   <span class="account-clean-label" title="${escapeHtml(acc.label)}">${escapeHtml(acc.label)}</span>
+                  ${fail && fail.kind === 'suspended' ? '<span class="badge badge-danger">Suspended</span>' : ''}
                   ${hasChecked ? (
                     isOk ? `<span class="status-dot online" title="Verified"></span>` :
                     `<span class="status-dot offline" title="${escapeHtml((fail ? fail.error : b.error) || 'Connection Error')}"></span>`
-                  ) : `<span class="status-dot idle" title="Ready"></span>`}
+                  ) : `<span class="status-dot idle" title="Not checked"></span>`}
                 </div>
                 <div class="account-clean-sub text-xs text-muted font-mono">
                   #${acc.id} · ${p.name}
                 </div>
+                <button type="button" class="account-clean-note${acc.note ? '' : ' empty'}" onclick="openEditNoteModal(${acc.id})" title="${acc.note ? 'Click to edit note' : 'Add a note'}">${acc.note ? `${icon('edit')}<span>${escapeHtml(acc.note)}</span>` : '+ Add note'}</button>
               </div>
             </div>
 
@@ -1431,32 +1566,37 @@ function renderAccountsManagement() {
               <button class="region-badge-btn" onclick="openEditRegionModal(${acc.id})" title="Edit region">
                 <span>${reg.flag}</span>
                 <span class="font-mono">${reg.code || 'Set Region'}</span>
-                <span class="text-xs text-muted">✏️</span>
+                <span class="text-muted">${icon('edit')}</span>
               </button>
             </div>
 
             <!-- Col 3: Proxy -->
             <div class="account-clean-proxy">
               ${proxyPill}
-              <button class="btn btn-secondary btn-sm flex-shrink-0" onclick="openEditProxyModal(${acc.id})" title="Manage proxy route and pool">Manage pool</button>
+              <button class="btn btn-secondary btn-sm flex-shrink-0" onclick="openEditProxyModal(${acc.id})" title="Choose account proxy route">Change route</button>
             </div>
 
             <!-- Col 4: Live Billing & Latency -->
             <div class="account-clean-billing">
               <div class="billing-amount-wrap">
                 <span class="${billingClass} text-sm billing-amount-text">${billingText}</span>
-                <button class="btn-icon-subtle" id="btn-refresh-billing-${acc.id}" onclick="refreshSingleAccountBilling(${acc.id}, this)" title="Refresh account billing & test proxy">🔄</button>
+                <button class="btn-icon-subtle" id="btn-refresh-billing-${acc.id}" onclick="refreshSingleAccountBilling(${acc.id}, this)" title="Refresh account billing & test proxy" aria-label="Refresh account">${icon('refresh')}</button>
               </div>
               <div class="text-xs text-secondary mt-0.5">${subBillingText}</div>
             </div>
 
             <!-- Col 5: Actions -->
             <div class="account-clean-actions">
-              ${acc.provider === "linode" ? `<button class="btn btn-secondary btn-sm" onclick="openLinodePromoModal(${acc.id})" title="Apply Linode Promo Code">🎟 Promo</button>` : ''}
-              <button class="btn btn-secondary btn-sm" id="btn-test-proxy-${acc.id}" onclick="testSingleAccountProxy(${acc.id}, this)" title="Retry connection">↻ Retry connection</button>
-              ${acc.has_proxy ? `<button class="btn btn-warning btn-sm" id="btn-replace-proxy-${acc.id}" onclick="replaceAccountProxy(${acc.id}, this)" title="Replace the proxy session">Replace proxy</button>` : ''}
-              <button class="btn btn-secondary btn-sm" onclick="openDeployModalForProvider('${acc.provider}', ${acc.id})">🚀 Deploy</button>
-              <button class="btn btn-danger btn-sm" onclick="deleteAccount(${acc.id}, '${escapeHtml(acc.label)}')">🗑️</button>
+              <button class="btn btn-secondary btn-sm" onclick="openEditAccountModal(${acc.id})">Edit account</button>
+              <button class="btn btn-secondary btn-sm" onclick="navigateToAccount('${acc.provider}', ${acc.id})">Servers (${state.servers.filter(s => s.account_id === acc.id).length})</button>
+              <details class="row-more"><summary class="btn btn-secondary btn-sm" aria-label="More actions for ${escapeHtml(acc.label)}">More ▾</summary><div class="row-more-menu">
+                <button class="btn btn-secondary btn-sm" onclick="openEditNoteModal(${acc.id})">${acc.note ? 'Edit note' : 'Add note'}</button>
+                <button class="btn btn-secondary btn-sm" id="btn-test-proxy-${acc.id}" onclick="testSingleAccountProxy(${acc.id}, this)">Check connection</button>
+                ${fail && fail.isProxy && acc.has_proxy ? `<button class="btn btn-warning btn-sm" id="btn-replace-proxy-${acc.id}" onclick="replaceAccountProxy(${acc.id}, this)">Replace failed session</button>` : ''}
+                <button class="btn btn-secondary btn-sm" onclick="openDeployModalForAccount(${acc.id}, '${acc.provider}')">Create server</button>
+                ${acc.provider === "linode" ? `<button class="btn btn-secondary btn-sm" onclick="openLinodePromoModal(${acc.id})">Apply promo code</button>` : ''}
+                <button class="btn btn-danger btn-sm" onclick="deleteAccount(${acc.id}, '${escapeHtml(acc.label)}')">Remove account</button>
+              </div></details>
             </div>
           </div>
         `;
@@ -1467,30 +1607,6 @@ function renderAccountsManagement() {
 
 // ==================== TAB: PROXY POOL & ROUTES ====================
 function renderProxyManagement() {
-  const totalProviders = state.proxyProviders.length;
-  let totalSessions = 0;
-  for (const p of state.proxyProviders) {
-    totalSessions += p.total_sessions || 0;
-  }
-  const accWithProxy = state.accounts.filter(a => a.has_proxy).length;
-
-  let latencies = [];
-  for (const id in state.accountBilling) {
-    const lat = state.accountBilling[id]?.latency_ms;
-    if (typeof lat === "number" && lat > 0) latencies.push(lat);
-  }
-  const avgLat = latencies.length > 0 ? Math.round(latencies.reduce((a, b) => a + b, 0) / latencies.length) + "ms" : "—";
-
-  const elP = document.getElementById("proxy-stat-providers");
-  const elS = document.getElementById("proxy-stat-sessions");
-  const elA = document.getElementById("proxy-stat-accounts");
-  const elL = document.getElementById("proxy-stat-latency");
-
-  if (elP) elP.textContent = totalProviders;
-  if (elS) elS.textContent = totalSessions;
-  if (elA) elA.textContent = accWithProxy;
-  if (elL) elL.textContent = avgLat;
-
   const grid = document.getElementById("proxy-providers-grid");
   if (grid) {
     if (state.proxyProviders.length === 0) {
@@ -1521,7 +1637,7 @@ function renderProxyManagement() {
             <!-- Capacity Bar -->
             <div class="proxy-capacity-container">
               <div class="flex items-center justify-between text-xs">
-                <span class="text-secondary">Session Capacity</span>
+                <span class="text-secondary">${p.identity_kind === 'port' ? 'Sticky ports' : 'Session Capacity'}</span>
                 <span class="font-mono font-bold text-primary">${active} / ${total} (${pct}%)</span>
               </div>
               <div class="proxy-capacity-bar">
@@ -1530,10 +1646,14 @@ function renderProxyManagement() {
             </div>
 
             <!-- Bound Accounts Section -->
+            <div class="text-xs mt-3 ${p.usage_exhausted ? 'text-danger' : 'text-secondary'}">
+              Cloudbot traffic: ${Number(p.usage_gb || 0).toFixed(5)} GB / ${p.usage_limit_gb ? Number(p.usage_limit_gb).toFixed(3) + ' GB' : 'Unlimited'}
+              ${p.usage_exhausted ? ' · Limit reached' : ''}
+            </div>
             <div class="proxy-bound-accounts-section mt-3">
               <div class="flex items-center justify-between mb-2">
                 <span class="text-xs font-bold text-secondary uppercase tracking-wider">Attached Accounts (${boundAccs.length})</span>
-                <button class="btn btn-secondary btn-xs" onclick="openBulkSessionsModal(${p.id})" title="Bulk import sessions to this pool">➕ Import</button>
+                <button class="btn btn-secondary btn-xs" onclick="openBulkSessionsModal(${p.id})" title="Bulk import sessions to this pool">Import</button>
               </div>
               <div class="proxy-bound-accounts-list">
                 ${boundAccs.length > 0 ? boundAccs.map(ba => {
@@ -1557,12 +1677,12 @@ function renderProxyManagement() {
             <!-- Actions -->
             <div class="flex items-center justify-between gap-2 mt-auto pt-3 border-t border-subtle flex-wrap">
               <div class="flex items-center gap-1.5 flex-wrap">
-                <button class="btn btn-primary btn-sm" onclick="openManageProxySessionsModal(${p.id})" title="View and manage individual session tokens">📋 Sessions (${total})</button>
-                <button class="btn btn-secondary btn-sm" onclick="openEditProxyProviderModal(${p.id})" title="Edit pool label or format">✏️</button>
+                <button class="btn btn-primary btn-sm" onclick="openManageProxySessionsModal(${p.id})" title="View and manage supplied identities">${p.identity_kind === 'port' ? 'Ports' : 'Sessions'} (${total})</button>
+                <button class="btn btn-secondary btn-sm" onclick="openEditProxyProviderModal(${p.id})" title="Edit pool label or format" aria-label="Edit pool">${icon('edit')}</button>
               </div>
               <div class="flex items-center gap-1.5 flex-wrap">
-                <button class="btn btn-secondary btn-sm" onclick="toggleProxyProvider(${p.id}, this)">${isEnabled ? '⏸ Pause' : '▶ Resume'}</button>
-                <button class="btn btn-danger btn-sm" onclick="deleteProxyProvider(${p.id}, '${escapeHtml(p.label)}')">🗑️</button>
+                <button class="btn btn-secondary btn-sm" onclick="toggleProxyProvider(${p.id}, this)">${isEnabled ? 'Pause' : '▶ Resume'}</button>
+                <button class="btn btn-danger btn-sm" onclick="deleteProxyProvider(${p.id}, '${escapeHtml(p.label)}')" aria-label="Delete pool">${icon('trash')}</button>
               </div>
             </div>
           </div>
@@ -1572,50 +1692,40 @@ function renderProxyManagement() {
   }
 
   const tbody = document.getElementById("account-proxies-tbody");
-  if (tbody) {
-    if (state.accounts.length === 0) {
-      tbody.innerHTML = `<tr><td colspan="6" class="text-center py-6 text-secondary">No cloud accounts available.</td></tr>`;
-    } else {
-      tbody.innerHTML = state.accounts.map(acc => {
-        const p = PROVIDERS[acc.provider] || { name: acc.provider };
-        const b = state.accountBilling[acc.id];
-        const latPill = b && b.latency_ms !== undefined ? (
-          b.latency_ms < 200 ? `<span class="latency-tag fast">⚡ ${b.latency_ms}ms OK</span>` :
-          b.latency_ms < 500 ? `<span class="latency-tag medium">⚡ ${b.latency_ms}ms High</span>` :
-          `<span class="latency-tag slow">⚡ ${b.latency_ms}ms Slow</span>`
-        ) : `<span class="latency-tag muted">Not Verified</span>`;
+  if (!tbody) return;
+  const query = (document.getElementById("search-routes")?.value || "").trim().toLowerCase();
+  const filter = document.getElementById("filter-route-status")?.value || "all";
+  const accounts = state.accounts.filter(acc => {
+    const type = acc.binding ? "pool" : acc.has_proxy ? "custom" : "direct";
+    return (filter === "all" || (filter === "attention" ? !!getAccountFailureStatus(acc.id) : filter === type)) &&
+      [acc.label, acc.provider, acc.region, acc.proxy_masked, acc.binding?.country, acc.binding?.session_id].some(value => String(value || "").toLowerCase().includes(query));
+  });
+  tbody.innerHTML = accounts.map(acc => {
+    const provider = PROVIDERS[acc.provider] || { name: acc.provider };
+    const failure = getAccountFailureStatus(acc.id);
+    const billing = state.accountBilling[acc.id];
+    const pool = state.proxyProviders.find(p => p.id === acc.binding?.provider_id);
+    const type = acc.binding ? "Pool session" : acc.has_proxy ? "Custom proxy" : "Direct";
+    const route = acc.binding ? `${pool?.label || 'Proxy pool'} · ${acc.binding.country} · ${acc.binding.session_id}` : acc.has_proxy ? acc.proxy_masked || "Configured proxy" : "No proxy · server’s own connection";
+    const status = failure ? failure.title : billing?.status === "ok" ? "Access verified" : "Not checked";
+    return `<tr>
+      <td><button class="text-link" onclick="navigateToAccount('${acc.provider}', ${acc.id})">${escapeHtml(acc.label)}</button><div class="text-xs text-secondary">${escapeHtml(acc.region || 'No country set')}</div></td>
+      <td>${escapeHtml(provider.name)}</td><td class="route-address">${escapeHtml(route)}</td><td><span class="badge">${type}</span></td>
+      <td><span class="${failure ? 'text-danger' : billing?.status === 'ok' ? 'text-success' : 'text-secondary'}">${escapeHtml(status)}</span>${failure ? `<div class="text-xs text-secondary route-error">${escapeHtml(failure.error)}</div>` : ''}</td>
+      <td><div class="flex items-center justify-end gap-2"><button class="btn btn-secondary btn-sm" id="btn-route-test-${acc.id}" onclick="testSingleAccountProxy(${acc.id}, this)">Test</button><button class="btn btn-secondary btn-sm" onclick="openEditProxyModal(${acc.id})">Change route</button></div></td>
+    </tr>`;
+  }).join("") || `<tr><td colspan="6" class="text-center py-8 text-secondary">${state.accounts.length ? 'No routes match these filters.' : 'Add a cloud account to configure its route.'}</td></tr>`;
+}
 
-        return `
-          <tr>
-            <td>
-              <div class="font-bold text-primary">${escapeHtml(acc.label)}</div>
-              <div class="text-xs text-muted font-mono">Account #${acc.id}</div>
-            </td>
-            <td>
-              <span class="badge badge-${acc.provider}">${p.name}</span>
-            </td>
-            <td>
-              ${acc.has_proxy ? `
-                <code class="font-mono text-xs text-primary">${escapeHtml(acc.proxy_masked || 'Configured')}</code>
-              ` : `
-                <span class="text-muted text-xs">Direct Server Egress</span>
-              `}
-            </td>
-            <td>
-              <span class="badge text-xs uppercase">${escapeHtml(acc.proxy_family || 'default')}</span>
-            </td>
-            <td>${latPill}</td>
-            <td class="text-right">
-              <div class="flex items-center justify-end gap-1">
-                <button class="btn btn-secondary btn-sm" id="btn-test-proxy-${acc.id}" onclick="testSingleAccountProxy(${acc.id}, this)" title="Check proxy connectivity & latency">🔍 Check</button>
-                <button class="btn btn-secondary btn-sm" onclick="openEditProxyModal(${acc.id})" title="Configure Proxy">⚙️ Proxy</button>
-              </div>
-            </td>
-          </tr>
-        `;
-      }).join("");
-    }
+function setProxyWorkspace(view) {
+  for (const name of ["routes", "pools"]) {
+    const active = name === view;
+    document.getElementById(`proxy-${name}-view`).hidden = !active;
+    const tab = document.getElementById(`proxy-${name}-tab`);
+    tab.classList.toggle("active", active);
+    tab.setAttribute("aria-pressed", String(active));
   }
+  document.getElementById("btn-bulk-import-sessions").hidden = view !== "pools";
 }
 
 // Modal: Edit Account Proxy with 3 modes (Rotating Pool, Custom, Direct)
@@ -1636,7 +1746,7 @@ function openEditProxyModal(accId) {
   // Populate rotating pool provider dropdown
   const provSelect = document.getElementById("pool-assign-provider");
   if (provSelect) {
-    provSelect.innerHTML = state.proxyProviders.map(p =>
+    provSelect.innerHTML = state.proxyProviders.filter(p => p.enabled || p.id === acc.binding?.provider_id).map(p =>
       `<option value="${p.id}">${escapeHtml(p.label)} (${p.active_sessions || p.total_sessions || 0} sessions)</option>`
     ).join("");
     if (state.proxyProviders.length === 0) {
@@ -1653,6 +1763,7 @@ function openEditProxyModal(accId) {
   // Custom proxy values
   const customInput = document.getElementById("custom-proxy-input");
   if (customInput) customInput.value = acc.has_proxy && !acc.binding ? (acc.proxy || "") : "";
+  updateProxyInputPreview("custom-proxy-input", "custom-proxy-format-status");
   const customFam = document.getElementById("custom-proxy-family");
   if (customFam) customFam.value = acc.proxy_family || "default";
   const customReg = document.getElementById("custom-proxy-region");
@@ -1670,7 +1781,7 @@ function openEditProxyModal(accId) {
   } else if (acc.has_proxy) {
     switchProxyMode("custom");
   } else {
-    switchProxyMode(state.proxyProviders.length > 0 ? "pool" : "custom");
+    switchProxyMode("direct");
   }
 
   openModal("modal-edit-proxy");
@@ -1705,6 +1816,32 @@ function openEditRegionModal(accId) {
   }
   openModal("modal-edit-region");
 }
+
+function openEditAccountModal(accId) {
+  const acc = state.accounts.find(a => a.id === Number(accId));
+  if (!acc) return;
+  document.getElementById("edit-account-id").value = acc.id;
+  document.getElementById("edit-account-name").value = acc.label;
+  document.getElementById("edit-account-token").value = "";
+  openModal("modal-edit-account");
+}
+window.openEditAccountModal = openEditAccountModal;
+
+function openEditNoteModal(accId) {
+  const acc = state.accounts.find(a => a.id === Number(accId));
+  if (!acc) return;
+  const idInput = document.getElementById("edit-note-account-id");
+  const noteInput = document.getElementById("edit-note-text");
+  const labelEl = document.getElementById("edit-note-account-label");
+  if (idInput) idInput.value = acc.id;
+  if (noteInput) noteInput.value = acc.note || "";
+  if (labelEl) labelEl.textContent = `Account Note: ${acc.label} (#${acc.id})`;
+  openModal("modal-edit-note");
+  if (noteInput) {
+    setTimeout(() => noteInput.focus(), 60);
+  }
+}
+window.openEditNoteModal = openEditNoteModal;
 
 function openLinodePromoModal(accId) {
   const acc = state.accounts.find(a => a.id === Number(accId));
@@ -1751,7 +1888,7 @@ async function testSingleAccountProxy(accId, btnEl = null) {
         state.accountErrors[accId] = res.error;
         state.accountErrors[String(accId)] = res.error;
         const isProxy = window.CloudbotSync.proxyFailure(res.error || "");
-        showToast(isProxy ? `⚠️ Proxy failed for account #${accId}: ${res.error}` : `Connection error for account #${accId}: ${res.error}`, "error");
+        showToast(isProxy ? `Proxy failed for account #${accId}: ${res.error}` : `${window.CloudbotSync.accountFailure(res.error).title} for account #${accId}: ${res.error}`, "error");
       } else {
         delete state.accountErrors[accId];
         delete state.accountErrors[String(accId)];
@@ -1872,7 +2009,7 @@ function updateBuilderTemplatePreview() {
   }
   const scheme = document.getElementById("builder-proxy-scheme")?.value || "http";
   const host = document.getElementById("builder-proxy-host")?.value.trim() || "proxy.example.com";
-  const port = document.getElementById("builder-proxy-port")?.value.trim() || "8080";
+  const port = document.getElementById('proxy-provider-identity-kind')?.value === 'port' ? '{port}' : document.getElementById("builder-proxy-port")?.value.trim() || "8080";
   const user = document.getElementById("builder-proxy-user")?.value.trim() || "user-{country}-{session}";
   const pass = document.getElementById("builder-proxy-pass")?.value.trim();
   const passPart = pass ? "••••••" : "pass";
@@ -1891,8 +2028,9 @@ async function parseSampleProxyLines() {
     const parsed = await api("parse_proxy_sessions", { text: raw });
     const sids = parsed.session_ids || [];
     if (sids.length > 0) {
-      document.getElementById("proxy-provider-sessions").value = sids.slice(0, 50).join(",");
-      if (statusEl) statusEl.textContent = `✅ Detected ${sids.length} session tokens!`;
+      document.getElementById("proxy-provider-sessions").value = sids.join(",");
+      if (parsed.identity_kind === 'port') selectProxyIdentityKind('port');
+      if (statusEl) statusEl.textContent = `Detected ${sids.length} ${parsed.identity_kind === 'port' ? 'sticky ports' : 'session tokens'}!`;
     } else {
       if (statusEl) statusEl.textContent = "Could not extract session IDs automatically; enter manually.";
     }
@@ -1901,10 +2039,31 @@ async function parseSampleProxyLines() {
   }
 }
 
+function selectProxyIdentityKind(kind) {
+  const portBased = kind === 'port';
+  document.getElementById('proxy-provider-identity-kind').value = portBased ? 'port' : 'session';
+  const port = document.getElementById('builder-proxy-port');
+  port.disabled = portBased;
+  document.getElementById('builder-username-help').textContent = portBased ? 'Your DataImpulse login followed by __cr.{country}. Supply sticky ports below, e.g. 10000-10014.' : 'Include {country} and {session}.';
+  document.getElementById('proxy-identities-label').textContent = portBased ? 'Sticky ports (10000–20000)' : 'Initial Session IDs (Range or List)';
+  if (portBased) {
+    document.getElementById('builder-proxy-host').value = 'gw.dataimpulse.com';
+    port.value = '10000';
+    document.getElementById('builder-proxy-user').placeholder = 'Your login__cr.{country}';
+    document.getElementById('proxy-provider-sessions').placeholder = '10000-10014';
+    if (!document.getElementById('proxy-provider-label').value) document.getElementById('proxy-provider-label').value = 'DataImpulse';
+  } else {
+    document.getElementById('builder-proxy-user').placeholder = 'user-{country}-{session}';
+    document.getElementById('proxy-provider-sessions').placeholder = '1-50 or sess1,sess2,sess3';
+  }
+  updateBuilderTemplatePreview();
+}
+
 function openAddProxyProviderModal() {
   document.getElementById("form-add-proxy-provider")?.reset();
   switchProxyCreationMode('builder');
   selectProxyScheme('http');
+  selectProxyIdentityKind('session');
   updateBuilderTemplatePreview();
   openModal("modal-add-proxy-provider");
 }
@@ -1965,7 +2124,7 @@ function renderManageSessionsTable(sessions) {
         <td>
           <span class="ip-copyable" onclick="copyText('${escapeHtml(s.session_id)}')">
             <code class="font-mono text-xs font-bold text-primary">${escapeHtml(s.session_id)}</code>
-            <span class="text-xs text-muted">📋</span>
+            <span class="copy-hint">${icon('copy')}</span>
           </span>
         </td>
         <td>
@@ -1975,11 +2134,9 @@ function renderManageSessionsTable(sessions) {
         <td class="text-right">
           <div class="flex items-center justify-end gap-1">
             <button class="btn-icon-xs ${isAct ? 'btn-icon-warning' : 'btn-icon-success'}" onclick="toggleProxySession(${s.provider_id}, '${escapeHtml(s.session_id)}')" title="${isAct ? 'Disable Session' : 'Enable Session'}">
-              ${isAct ? '⏸' : '▶'}
+              ${isAct ? icon('pause') : icon('play')}
             </button>
-            <button class="btn-icon-xs btn-icon-danger" onclick="deleteProxySession(${s.provider_id}, '${escapeHtml(s.session_id)}')" title="Delete Session">
-              🗑️
-            </button>
+            <button class="btn-icon-xs btn-icon-danger" onclick="deleteProxySession(${s.provider_id}, '${escapeHtml(s.session_id)}')" title="Delete Session" aria-label="Delete session">${icon('trash')}</button>
           </div>
         </td>
       </tr>
@@ -2070,6 +2227,8 @@ function openEditProxyProviderModal(providerId) {
   document.getElementById("edit-proxy-provider-id").value = p.id;
   document.getElementById("edit-proxy-provider-label").value = p.label || "";
   document.getElementById("edit-proxy-provider-template").value = "";
+  document.getElementById('edit-proxy-provider-usage-limit').value = p.usage_limit_gb || 0;
+  document.getElementById('edit-proxy-provider-reset-usage').checked = false;
   openModal("modal-edit-proxy-provider");
 }
 
@@ -2149,6 +2308,8 @@ function selectProviderAccount(provider, accountId) {
   if (provider === "hetzner") renderHetznerHub();
   else if (provider === "vultr") renderVultrHub();
   else if (provider === "linode") renderLinodeHub();
+  else if (provider === "cloudferro") renderCloudferroHub();
+  else if (provider === "upcloud") renderUpcloudHub();
 }
 
 function setAccountSubTab(provider, tab) {
@@ -2168,6 +2329,34 @@ function formatReverseDnsText(dnsPtr) {
   return "";
 }
 
+async function editUpcloudIpSettings(accountId, address, currentPtr = "", currentPolicy = "keep") {
+  const ptr = window.prompt("UpCloud reverse DNS PTR (leave empty to clear):", currentPtr || "");
+  if (ptr === null) return;
+  const policy = window.prompt("Release policy: enter keep or release", currentPolicy || "keep");
+  if (policy === null) return;
+  const normalizedPolicy = policy.trim().toLowerCase();
+  if (!["keep", "release"].includes(normalizedPolicy)) {
+    showToast("Release policy must be keep or release.", "error");
+    return;
+  }
+  confirmAction(`Update PTR and release policy for ${address}?`, "UPDATE_FLOATING_IP", async () => {
+    try {
+      await api("update_floating_ip", {
+        account_id: accountId,
+        floating_id: String(address),
+        ptr: ptr.trim(),
+        release_policy: normalizedPolicy,
+        confirm: "UPDATE_FLOATING_IP"
+      });
+      showToast("UpCloud IP settings updated.", "success");
+      await loadAll();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
+}
+window.editUpcloudIpSettings = editUpcloudIpSettings;
+
 function navigateToAccount(provider, accountId) {
   state.providerSelectedAccount[provider] = accountId ? Number(accountId) : null;
   switchTab(`tab-${provider}`, true);
@@ -2179,7 +2368,7 @@ function renderProviderHubView(provider) {
     state.providerAccountSubTab[provider] = "instances";
   }
   let subTab = state.providerAccountSubTab[provider] || "instances";
-  if (subTab === "ips" && provider !== "hetzner" && provider !== "vultr") {
+  if (subTab === "ips" && !providerSupports(provider, "floating_ip")) {
     subTab = "instances";
     state.providerAccountSubTab[provider] = "instances";
   }
@@ -2209,10 +2398,10 @@ function renderProviderHubView(provider) {
         }
       }
       if (totalCredit > 0) {
-        badgesHtml += ` <span class="badge badge-status-running">💳 Total Credit: $${totalCredit.toFixed(2)}</span>`;
+        badgesHtml += ` <span class="badge badge-status-running">Total Credit: $${totalCredit.toFixed(2)}</span>`;
       }
       if (totalUnbilled > 0) {
-        badgesHtml += ` <span class="badge badge-secondary">⏳ Unbilled: $${totalUnbilled.toFixed(2)}</span>`;
+        badgesHtml += ` <span class="badge badge-secondary">Unbilled: $${totalUnbilled.toFixed(2)}</span>`;
       }
     } else if (provider === "vultr") {
       let totalBal = 0;
@@ -2225,12 +2414,12 @@ function renderProviderHubView(provider) {
         }
       }
       if (totalBal < 0) {
-        badgesHtml += ` <span class="badge badge-status-running">💳 Net Credit: -$${Math.abs(totalBal).toFixed(2)}</span>`;
+        badgesHtml += ` <span class="badge badge-status-running">Net Credit: -$${Math.abs(totalBal).toFixed(2)}</span>`;
       } else if (totalBal > 0) {
-        badgesHtml += ` <span class="badge badge-danger">💳 Total Owed: $${totalBal.toFixed(2)}</span>`;
+        badgesHtml += ` <span class="badge badge-danger">Total Owed: $${totalBal.toFixed(2)}</span>`;
       }
       if (totalPending > 0) {
-        badgesHtml += ` <span class="badge badge-secondary">⏳ Total Pending: $${totalPending.toFixed(2)}</span>`;
+        badgesHtml += ` <span class="badge badge-secondary">Total Pending: $${totalPending.toFixed(2)}</span>`;
       }
     } else if (provider === "hetzner") {
       let totalMonthly = 0;
@@ -2239,10 +2428,10 @@ function renderProviderHubView(provider) {
         if (info) totalMonthly += Number(info.monthly_runrate || 0);
       }
       if (totalMonthly > 0) {
-        badgesHtml += ` <span class="badge badge-hetzner">💶 Est. Cost: €${totalMonthly.toFixed(2)}/mo</span>`;
+        badgesHtml += ` <span class="badge badge-hetzner">Est. Cost: €${totalMonthly.toFixed(2)}/mo</span>`;
       }
     }
-    badgesHtml += ` <button class="btn btn-secondary btn-xs" onclick="refreshAllBillingDetails()" title="Refresh live balances">🔄 Refresh</button>`;
+    badgesHtml += ` <button class="btn btn-secondary btn-xs" onclick="loadAll(true)" title="Refresh current view">Refresh</button>`;
     statsEl.innerHTML = badgesHtml;
   }
 
@@ -2280,7 +2469,7 @@ function renderProviderHubView(provider) {
               <span class="account-card-title">${escapeHtml(acc.label)}</span>
             </div>
             <div class="flex items-center gap-1.5 flex-shrink-0">
-              ${fail ? `<span class="badge badge-danger">⚠️ Proxy Failed</span>` : `
+              ${fail ? `<span class="badge badge-danger">${escapeHtml(fail.title)}</span>` : `
                 <span class="badge ${p.badgeClass}">${count} instances</span>
                 ${bDetails.badge || ''}
               `}
@@ -2288,23 +2477,24 @@ function renderProviderHubView(provider) {
           </div>
           <table class="account-card-info-table">
             <tr><td>Account ID:</td><td class="font-mono">#${acc.id}</td></tr>
+            ${acc.note ? `<tr><td>Note:</td><td class="text-xs text-secondary cursor-pointer" onclick="openEditNoteModal(${acc.id})" title="Click to edit note">${escapeHtml(acc.note)}</td></tr>` : ''}
             <tr><td>Region:</td><td>${reg.flag} ${escapeHtml(reg.name || reg.code || 'Not Specified')}</td></tr>
             <tr><td>Proxy:</td><td class="font-mono text-xs">${escapeHtml(proxyLabel)}</td></tr>
             <tr><td>Credit / Balance:</td><td>${bDetails.balanceDisplay}</td></tr>
             ${bDetails.usageDisplay ? `<tr><td>Usage / Pending:</td><td>${bDetails.usageDisplay}</td></tr>` : ''}
             <tr><td>Status:</td><td>${fail ? `<span class="text-danger font-bold text-xs"><span class="status-dot offline"></span> ${escapeHtml(fail.title)}</span>` : `<span class="text-success text-xs"><span class="status-dot online"></span> Connected</span>`}</td></tr>
-            ${b && b.latency_ms !== undefined ? `<tr><td>Latency:</td><td class="font-mono text-xs text-secondary">⚡ ${b.latency_ms}ms</td></tr>` : ''}
+            ${b && b.latency_ms !== undefined ? `<tr><td>Latency:</td><td class="font-mono text-xs text-secondary">${b.latency_ms}ms</td></tr>` : ''}
             ${fail ? `<tr><td>Details:</td><td class="text-danger font-mono text-xs" style="word-break: break-all;">${escapeHtml(fail.error.length > 70 ? fail.error.substring(0, 68) + '…' : fail.error)}</td></tr>` : ''}
           </table>
           <div class="account-card-footer" onclick="event.stopPropagation()">
             <button class="btn btn-primary btn-sm w-full account-card-view-btn" onclick="selectProviderAccount('${provider}', ${acc.id})">
-              🖥️ View Servers (${count}) ➔
+              View servers (${count}) →
             </button>
             <div class="account-card-actions">
               <button class="btn btn-secondary btn-sm flex-1" onclick="openDeployModalForAccount(${acc.id}, '${provider}')" title="Deploy instance">+ Deploy</button>
-              <button class="btn btn-secondary btn-sm flex-1" onclick="openEditProxyModal(${acc.id})" title="Configure proxy">⚙️ Proxy</button>
-              <button class="btn btn-secondary btn-sm btn-icon-sm" id="btn-check-status-${acc.id}" onclick="checkAccountStatus(${acc.id}, this)" title="Check status">🔄</button>
-              <button class="btn btn-danger btn-sm btn-icon-sm" onclick="deleteAccount(${acc.id}, '${escapeHtml(acc.label)}')" title="Delete account">🗑️</button>
+              <button class="btn btn-secondary btn-sm flex-1" onclick="openEditProxyModal(${acc.id})" title="Configure proxy">Proxy</button>
+              <button class="btn btn-secondary btn-sm btn-icon-sm" id="btn-check-status-${acc.id}" onclick="checkAccountStatus(${acc.id}, this)" title="Check status" aria-label="Check status">${icon('refresh')}</button>
+              <button class="btn btn-danger btn-sm btn-icon-sm" onclick="deleteAccount(${acc.id}, '${escapeHtml(acc.label)}')" title="Delete account" aria-label="Delete account">${icon('trash')}</button>
             </div>
           </div>
         </div>
@@ -2328,7 +2518,7 @@ function renderProviderHubView(provider) {
     const b = state.accountBilling[acc.id];
     const reg = formatRegion(acc.region);
     const bDetails = formatAccountBillingDetails(acc, b, fail);
-    const showFips = provider === "hetzner" || provider === "vultr";
+    const showFips = providerSupports(provider, "floating_ip");
 
     const accFips = showFips ? state.floatingIps.filter(f => f.account_id === acc.id) : [];
     const accPrimaryIps = (provider === "hetzner") ? state.primaryIps.filter(p => p.account_id === acc.id) : [];
@@ -2381,7 +2571,7 @@ function renderProviderHubView(provider) {
             <img src="${p.logo}" width="22" height="22">
             <h2 class="text-lg font-bold text-primary">${escapeHtml(acc.label)}</h2>
             <span class="badge ${p.badgeClass}">ID: ${acc.id}</span>
-            ${fail ? '<span class="badge badge-danger">⚠️ Proxy Failed</span>' : '<span class="badge badge-status-running"><span class="w-1.5 h-1.5 rounded-full bg-success"></span> Connected</span>'}
+            ${fail ? `<span class="badge badge-danger">${escapeHtml(fail.title)}</span>` : '<span class="badge badge-status-running"><span class="w-1.5 h-1.5 rounded-full bg-success"></span> Connected</span>'}
             ${bDetails.badge ? bDetails.badge : ''}
           </div>
         </div>
@@ -2395,10 +2585,10 @@ function renderProviderHubView(provider) {
               </select>
             </div>
           ` : ''}
-          <button class="btn btn-secondary btn-sm" onclick="openEditProxyModal(${acc.id})" title="Configure proxy">⚙️ Proxy</button>
-          ${provider === "linode" ? `<button class="btn btn-secondary btn-sm" onclick="openLinodePromoModal(${acc.id})" title="Apply Linode Promo Code">🎟 Apply Promo</button>` : ''}
-          <button class="btn btn-secondary btn-sm" id="btn-check-status-drilldown-${acc.id}" onclick="checkAccountStatus(${acc.id}, this)" title="Refresh account details">🔄</button>
-          <button class="btn btn-primary btn-sm" onclick="openDeployModalForAccount(${acc.id}, '${provider}')">🚀 + Deploy Instance</button>
+          <button class="btn btn-secondary btn-sm" onclick="openEditProxyModal(${acc.id})" title="Configure proxy">Proxy</button>
+          ${provider === "linode" ? `<button class="btn btn-secondary btn-sm" onclick="openLinodePromoModal(${acc.id})" title="Apply Linode Promo Code">Apply Promo</button>` : ''}
+          <button class="btn btn-secondary btn-sm" id="btn-check-status-drilldown-${acc.id}" onclick="loadAll(true, {account_id: ${acc.id}})" title="Refresh this account">${icon('refresh')} Refresh</button>
+          <button class="btn btn-primary btn-sm" onclick="openDeployModalForAccount(${acc.id}, '${provider}')">+ Create server</button>
         </div>
       </div>
 
@@ -2433,18 +2623,18 @@ function renderProviderHubView(provider) {
           <span>•</span>
           <div class="flex items-center gap-1.5">
             <span class="text-tertiary">Latency:</span>
-            <span class="text-success font-bold font-mono">⚡ ${b.latency_ms}ms</span>
+            <span class="text-success font-bold font-mono">${b.latency_ms}ms</span>
           </div>
         ` : ''}
       </div>
 
       <div class="account-subtabs-nav">
         <button type="button" class="account-subtab-btn ${subTab === 'instances' ? 'active' : ''}" onclick="setAccountSubTab('${provider}', 'instances')">
-          🖥️ Compute Instances (${accServers.length})
+          Compute Instances (${accServers.length})
         </button>
-        ${(provider === 'hetzner' || provider === 'vultr') ? `
+        ${providerSupports(provider, 'floating_ip') ? `
           <button type="button" class="account-subtab-btn ${subTab === 'ips' ? 'active' : ''}" onclick="setAccountSubTab('${provider}', 'ips')">
-            🌐 IP Management (${totalAccountIps}) ${unassignedCount > 0 ? `<span class="badge badge-warning text-xs ml-1">${unassignedCount} Free</span>` : ''}
+            IP Management (${totalAccountIps}) ${unassignedCount > 0 ? `<span class="badge badge-warning text-xs ml-1">${unassignedCount} Free</span>` : ''}
           </button>
         ` : ''}
       </div>
@@ -2454,17 +2644,17 @@ function renderProviderHubView(provider) {
       html += `
         <div class="mb-6" style="padding: 1.25rem; background: rgba(239, 68, 68, 0.08); border: 1px solid rgba(239, 68, 68, 0.35); border-radius: var(--radius-md);">
           <div class="text-base font-bold text-danger mb-1">
-            ⚠️ ${fail.isProxy ? 'Proxy Failed for this Account' : 'Account Connection Failed'}
+            ${escapeHtml(fail.title)}
           </div>
           <div class="text-xs text-secondary mb-3">
-            Cloudbot could not reach ${p.name} for <strong>${escapeHtml(acc.label)}</strong> through its configured proxy.
+            <strong>${escapeHtml(acc.label)}</strong> · ${escapeHtml(p.name)}<br>${escapeHtml(fail.guidance)}
           </div>
           <div class="text-xs font-mono text-danger mb-3 p-2 bg-black rounded" style="word-break: break-all; text-align: left;">
             ${escapeHtml(fail.error)}
           </div>
           <div class="flex items-center gap-2">
-            <button class="btn btn-primary btn-sm" onclick="openEditProxyModal(${acc.id})">⚙️ Reconfigure Proxy</button>
-            <button class="btn btn-secondary btn-sm" onclick="checkAccountStatus(${acc.id}, this)">🔄 Retry Connection</button>
+            ${fail.isProxy ? `<button class="btn btn-primary btn-sm" onclick="openEditProxyModal(${acc.id})">Reconfigure Proxy</button>` : ''}
+            <button class="btn btn-secondary btn-sm" onclick="checkAccountStatus(${acc.id}, this)">Retry Connection</button>
           </div>
         </div>
       `;
@@ -2475,8 +2665,8 @@ function renderProviderHubView(provider) {
       if (accServers.length === 0) {
         html += `
           <div class="data-table-container text-center py-12 text-secondary">
-            No instances deployed under <strong>${escapeHtml(acc.label)}</strong>.<br>
-            <button class="btn btn-primary btn-sm mt-3" onclick="openDeployModalForAccount(${acc.id}, '${provider}')">🚀 Deploy First Instance</button>
+            ${fail ? `Instance inventory is unavailable until the account check succeeds.` : `No instances deployed under <strong>${escapeHtml(acc.label)}</strong>.<br>
+            <button class="btn btn-primary btn-sm mt-3" onclick="openDeployModalForAccount(${acc.id}, '${provider}')">Deploy First Instance</button>`}
           </div>
         `;
       } else {
@@ -2490,7 +2680,7 @@ function renderProviderHubView(provider) {
             <div class="flex items-center gap-2">
               <button type="button" class="btn btn-secondary btn-sm" onclick="clearServerSelection()">Deselect All</button>
               <button type="button" class="btn btn-danger btn-sm" id="btn-drilldown-bulk-delete" onclick="deleteSelectedServers(this)">
-                🗑️ Delete Selected Instances (<span id="drilldown-bulk-btn-count">0</span>)
+                Delete Selected Instances (<span id="drilldown-bulk-btn-count">0</span>)
               </button>
             </div>
           </div>
@@ -2540,13 +2730,13 @@ function renderProviderHubView(provider) {
             <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
               <div>
                 <h3 class="text-base font-bold text-primary flex items-center gap-2">
-                  <span>🌐 ${provider === 'hetzner' ? 'Hetzner Floating IPs' : 'Vultr Reserved & Floating IPs'}</span>
+                  <span>${provider === 'hetzner' ? 'Hetzner Floating IPs' : provider === 'upcloud' ? 'UpCloud Floating IPs' : 'Vultr Reserved & Floating IPs'}</span>
                   <span class="badge badge-secondary text-xs">${accFips.length}</span>
                 </h3>
                 <div class="text-xs text-secondary mt-0.5">Flexible virtual IPs that can be dynamically reassigned between instances</div>
               </div>
-              <button class="btn btn-primary btn-sm" onclick="openAllocIpModal(${acc.id})">
-                ⚡ + Allocate Floating IP
+              <button class="btn btn-primary btn-sm" onclick="${provider === 'upcloud' ? `setAccountSubTab('upcloud', 'instances')` : `openAllocIpModal(${acc.id})`}">
+                ${provider === 'upcloud' ? 'Choose Server to Allocate IP' : '+ Allocate floating IP'}
               </button>
             </div>
 
@@ -2555,7 +2745,7 @@ function renderProviderHubView(provider) {
               <div class="account-ip-metric-card">
                 <div class="account-ip-metric-header">
                   <span class="account-ip-metric-label">Floating IPs</span>
-                  <span class="account-ip-metric-icon">🌐</span>
+                  
                 </div>
                 <div class="account-ip-metric-val">${accFips.length}</div>
                 <div class="account-ip-metric-sub">Allocated in this account</div>
@@ -2563,7 +2753,7 @@ function renderProviderHubView(provider) {
               <div class="account-ip-metric-card">
                 <div class="account-ip-metric-header">
                   <span class="account-ip-metric-label">Attached</span>
-                  <span class="account-ip-metric-icon">⚡</span>
+                  
                 </div>
                 <div class="account-ip-metric-val text-success">${fipsAttachedCount}</div>
                 <div class="account-ip-metric-sub">Active on instances</div>
@@ -2571,7 +2761,7 @@ function renderProviderHubView(provider) {
               <div class="account-ip-metric-card ${fipsUnassignedCount > 0 ? 'highlight-warning' : ''}">
                 <div class="account-ip-metric-header">
                   <span class="account-ip-metric-label">Free / Unassigned</span>
-                  <span class="account-ip-metric-icon">⚠️</span>
+                  
                 </div>
                 <div class="account-ip-metric-val ${fipsUnassignedCount > 0 ? 'text-warning' : 'text-secondary'}">${fipsUnassignedCount}</div>
                 <div class="account-ip-metric-sub">${fipsUnassignedCount > 0 ? 'Ready to attach' : 'All IPs bound to servers'}</div>
@@ -2587,7 +2777,7 @@ function renderProviderHubView(provider) {
                   Attached (${fipsAttachedCount})
                 </button>
                 <button type="button" class="fip-filter-btn ${currentFilter === 'unassigned' ? 'active' : ''}" onclick="setProviderIpFilter('unassigned', '${provider}')">
-                  ⚠️ Unassigned (${fipsUnassignedCount})
+                  Unassigned (${fipsUnassignedCount})
                 </button>
               </div>
             </div>
@@ -2601,7 +2791,7 @@ function renderProviderHubView(provider) {
               <div class="flex items-center gap-2">
                 <button type="button" class="btn btn-secondary btn-sm" onclick="clearIpSelection()">Deselect All</button>
                 <button type="button" class="btn btn-danger btn-sm" onclick="deleteSelectedIps(this)">
-                  🗑️ Delete Selected IPs (<span id="drilldown-ips-bulk-btn-count">0</span>)
+                  Delete Selected IPs (<span id="drilldown-ips-bulk-btn-count">0</span>)
                 </button>
               </div>
             </div>
@@ -2610,7 +2800,7 @@ function renderProviderHubView(provider) {
               <div class="data-table-container text-center py-8 text-secondary">
                 ${accFips.length === 0 ? `
                   No floating IPs allocated in <strong>${escapeHtml(acc.label)}</strong>.<br>
-                  <button class="btn btn-primary btn-sm mt-3" onclick="openAllocIpModal(${acc.id})">⚡ + Allocate Floating IP</button>
+                  <button class="btn btn-primary btn-sm mt-3" onclick="${provider === 'upcloud' ? `selectProviderAccount('upcloud', ${acc.id}); setAccountSubTab('upcloud', 'instances')` : `openAllocIpModal(${acc.id})`}">${provider === 'upcloud' ? 'Choose a server' : '+ Allocate floating IP'}</button>
                 ` : `
                   No floating IPs match the filter (<b>${escapeHtml(currentFilter)}</b>).
                 `}
@@ -2633,9 +2823,10 @@ function renderProviderHubView(provider) {
                     </thead>
                     <tbody id="drilldown-fips-tbody">
                       ${filteredFips.map(f => {
-                        const ipVal = f.ip || f.subnet || f.ip_address;
+                        const ipVal = ipAddress(f);
                         const isAttached = !!f.server_id;
                         const srv = isAttached ? state.servers.find(s => s.account_id === acc.id && String(s.id) === String(f.server_id)) : null;
+                        const stopRequired = provider === 'upcloud' && srv && !isUpcloudStopped(srv);
                         const srvLabel = srv ? (srv.name || srv.label || '#' + f.server_id) : (f.server_id ? '#' + f.server_id : '');
                         const revDns = formatReverseDnsText(f.dns_ptr || f.reverse || '');
                         const isSelected = state.selectedIps && state.selectedIps.has(`${acc.id}:${f.id}:floating`);
@@ -2656,7 +2847,7 @@ function renderProviderHubView(provider) {
                                 <div class="flex items-center gap-1.5 flex-wrap">
                                   <span class="ip-copyable" onclick="copyText('${escapeHtml(ipVal)}')">
                                     <code class="font-mono text-sm font-bold text-primary">${escapeHtml(ipVal)}</code>
-                                    <span class="text-xs text-muted" title="Copy IP address">📋</span>
+                                    <span class="copy-hint" title="Copy IP address">${icon('copy')}</span>
                                   </span>
                                   ${f.name ? `<span class="badge badge-secondary text-xs">${escapeHtml(f.name)}</span>` : ''}
                                 </div>
@@ -2664,7 +2855,7 @@ function renderProviderHubView(provider) {
                                   <div class="flex items-center gap-1 text-xs text-secondary font-mono">
                                     <span class="text-tertiary">PTR:</span>
                                     <span class="truncate" style="max-width: 180px;" title="${escapeHtml(revDns)}">${escapeHtml(revDns)}</span>
-                                    <span class="cursor-pointer text-muted hover-text-primary" onclick="copyText('${escapeHtml(revDns)}')" title="Copy Reverse DNS">📋</span>
+                                    <span class="cursor-pointer text-muted hover-text-primary" onclick="copyText('${escapeHtml(revDns)}')" title="Copy Reverse DNS">${icon('copy')}</span>
                                   </div>
                                 ` : ''}
                               </div>
@@ -2675,17 +2866,18 @@ function renderProviderHubView(provider) {
                               ${isAttached ? `
                                 <span class="badge badge-status-running cursor-pointer" onclick="openServerDetailsModal(${acc.id}, '${f.server_id}')" title="Click to view instance details">Attached to ${escapeHtml(srvLabel)}</span>
                               ` : `
-                                <span class="badge badge-warning">⚠️ Free / Not Attached</span>
+                                <span class="badge badge-warning">Free / Not Attached</span>
                               `}
                             </td>
                             <td class="text-right">
                               <div class="flex items-center justify-end gap-1.5 flex-wrap">
-                                ${isAttached ? `
-                                  <button class="btn btn-secondary btn-sm" onclick="unassignFloatingIp(${acc.id}, '${f.id}', this)" title="Detach IP from server">🔓 Detach</button>
-                                  <button class="btn btn-danger btn-sm" onclick="deleteFloatingIp(${acc.id}, '${f.id}', '${escapeHtml(ipVal)}', this)" title="Detach and permanently delete Floating IP">🗑️ Detach & Delete</button>
+                                ${provider === 'upcloud' ? `<button class="btn btn-secondary btn-sm" onclick="editUpcloudIpSettings(${acc.id}, '${escapeHtml(ipAddress(f))}', '${escapeHtml(f.ptr || f.dns_ptr || '')}', '${escapeHtml(f.release_policy || 'keep')}')" title="Edit PTR and release policy">IP settings</button>` : ''}
+                                ${stopRequired ? '<span class="text-xs text-warning">Stop server to change IPs</span>' : isAttached ? `
+                                  <button class="btn btn-secondary btn-sm" onclick="unassignFloatingIp(${acc.id}, '${f.id}', this)" title="Detach IP from server">Detach</button>
+                                  <button class="btn btn-danger btn-sm" onclick="deleteFloatingIp(${acc.id}, '${f.id}', '${escapeHtml(ipVal)}', this)" title="Detach and permanently delete Floating IP">Detach & Delete</button>
                                 ` : `
-                                  <button class="btn btn-primary btn-sm" onclick="openAttachFipModal('${f.id}', ${acc.id}, '${escapeHtml(ipVal)}')" title="Attach Floating IP to server">🔗 Attach</button>
-                                  <button class="btn btn-danger btn-sm" onclick="deleteFloatingIp(${acc.id}, '${f.id}', '${escapeHtml(ipVal)}', this)" title="Permanently delete unassigned Floating IP">🗑️ Delete IP</button>
+                                  <button class="btn btn-primary btn-sm" onclick="openAttachFipModal('${ipId(f)}', ${acc.id}, '${escapeHtml(ipVal)}')" title="Attach Floating IP to server">Attach</button>
+                                  <button class="btn btn-danger btn-sm" onclick="deleteFloatingIp(${acc.id}, '${f.id}', '${escapeHtml(ipVal)}', this)" title="Permanently delete unassigned Floating IP">Delete IP</button>
                                 `}
                               </div>
                             </td>
@@ -2705,7 +2897,7 @@ function renderProviderHubView(provider) {
               <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
                 <div>
                   <h3 class="text-base font-bold text-primary flex items-center gap-2">
-                    <span>🏷️ Hetzner Primary IPs</span>
+                    <span>Hetzner Primary IPs</span>
                     <span class="badge badge-hetzner text-xs">${accPrimaryIps.length}</span>
                   </h3>
                   <div class="text-xs text-secondary mt-0.5">Fixed primary interface network IPs allocated directly to Hetzner instances</div>
@@ -2755,7 +2947,7 @@ function renderProviderHubView(provider) {
                                 <div class="flex items-center gap-1.5 flex-wrap">
                                   <span class="ip-copyable" onclick="copyText('${escapeHtml(p.ip)}')">
                                     <code class="font-mono text-sm font-bold text-primary">${escapeHtml(p.ip)}</code>
-                                    <span class="text-xs text-muted" title="Copy IP">📋</span>
+                                    <span class="copy-hint" title="Copy IP">${icon('copy')}</span>
                                   </span>
                                   ${p.name ? `<span class="badge badge-secondary text-xs">${escapeHtml(p.name)}</span>` : ''}
                                 </div>
@@ -2773,7 +2965,7 @@ function renderProviderHubView(provider) {
                               </td>
                               <td><span class="text-xs text-secondary">${p.auto_delete ? 'Yes (with server)' : 'No (Retained)'}</span></td>
                               <td class="text-right">
-                                <button class="btn btn-danger btn-sm" onclick="deletePrimaryIp(${acc.id}, ${p.id}, this)" title="Permanently delete Hetzner Primary IP">🗑️ Delete IP</button>
+                                <button class="btn btn-danger btn-sm" onclick="deletePrimaryIp(${acc.id}, ${p.id}, this)" title="Permanently delete Hetzner Primary IP">Delete IP</button>
                               </td>
                             </tr>
                           `;
@@ -2811,14 +3003,28 @@ function renderLinodeHub() {
   renderProviderHubView("linode");
 }
 
+function renderUpcloudHub() {
+  renderProviderHubView("upcloud");
+}
+
+function renderCloudferroHub() {
+  renderProviderHubView("cloudferro");
+}
+
 // ---- ALL COMPUTE TABLE ----
 function renderAllCompute() {
-  const filter = document.getElementById("filter-all-provider").value;
-  let srvs = state.servers;
-  if (filter !== "all") {
-    srvs = srvs.filter(s => s.provider === filter);
+  const provider = document.getElementById("filter-all-provider").value;
+  const query = (document.getElementById("search-servers")?.value || "").trim().toLowerCase();
+  const status = document.getElementById("filter-server-status")?.value || "all";
+  const servers = state.servers.filter(s => (provider === "all" || s.provider === provider) &&
+    (status === "all" || (status === "running" ? isServerRunning(s.status) : !isServerRunning(s.status))) &&
+    [s.name, s.label, s.ip, s.id, s.account_label, s.region, ...(s.floating_ips || []).map(f => f.ip)].some(value => String(value || "").toLowerCase().includes(query)));
+  const summary = document.getElementById("compute-summary");
+  if (summary) {
+    const failed = Object.keys(state.accountErrors || {}).length;
+    summary.textContent = `${servers.length} of ${state.servers.length} servers${failed ? ` · ${failed} account inventories need attention; some data may be unavailable or outdated.` : ''}`;
   }
-  renderServersTable(srvs, "all-compute-tbody");
+  renderServersTable(servers, "all-compute-tbody");
 }
 
 function renderServersTable(servers, tbodyId) {
@@ -2834,62 +3040,59 @@ function renderServersTable(servers, tbodyId) {
   updateBulkActionBars();
 }
 
+function serverStatusLabel(status) {
+  const raw = String(status || "unknown");
+  // Vultr reports "active/running"; the power half is the useful part.
+  return raw.includes("/") ? raw.split("/").pop() || raw : raw;
+}
+
+function serverStatusTone(status) {
+  const label = serverStatusLabel(status).toLowerCase();
+  if (isServerRunning(status)) return "ok";
+  if (/off|stop|halt|shutdown|terminated|deleted/.test(label)) return "off";
+  return "busy";
+}
+
 function renderServerRow(s, showProviderCol = true, showFipsCol = true, showCheckboxCol = true) {
-  const isRunning = isServerRunning(s.status);
   const isSelected = state.selectedServers && state.selectedServers.has(`${s.account_id}:${s.id}`);
+  const name = escapeHtml(s.name || s.label || s.id);
+  const provider = PROVIDERS[s.provider] || { name: s.provider || "Cloud", logo: "/ui/assets/cloud.svg" };
   const fips = (s.floating_ips || []).map(f => `
-    <span class="ip-copyable" onclick="copyText('${escapeHtml(f.ip)}')">
-      <code class="font-mono text-xs">${escapeHtml(f.ip)}</code>
-    </span>
-  `).join("") || '<span class="text-muted text-xs">—</span>';
+    <button type="button" class="ip-copyable" onclick="event.stopPropagation(); copyText('${escapeHtml(f.ip)}')" title="Copy ${escapeHtml(f.ip)}">
+      <code>${escapeHtml(f.ip)}</code>
+    </button>
+  `).join("") || '<span class="text-muted">—</span>';
 
   return `
-    <tr id="server-row-${s.id}" data-server-id="${s.id}">
+    <tr id="server-row-${s.id}" data-server-id="${s.id}" class="server-row">
       ${showCheckboxCol ? `
-      <td style="width: 38px; text-align: center;" onclick="event.stopPropagation()">
-        <input type="checkbox" class="cb-server-select" data-acc-id="${s.account_id}" data-srv-id="${s.id}" data-provider="${s.provider}" data-label="${escapeHtml(s.name || s.label || s.id)}" ${isSelected ? 'checked' : ''} onchange="toggleServerSelection(${s.account_id}, '${s.id}', '${escapeHtml(s.name || s.label || s.id)}', '${s.provider}', this)">
+      <td class="cell-select" onclick="event.stopPropagation()">
+        <input type="checkbox" class="cb-server-select" aria-label="Select ${name}" data-acc-id="${s.account_id}" data-srv-id="${s.id}" data-provider="${s.provider}" data-label="${name}" ${isSelected ? 'checked' : ''} onchange="toggleServerSelection(${s.account_id}, '${s.id}', '${name}', '${s.provider}', this)">
       </td>` : ''}
-      <td>
-        <div class="font-bold text-primary server-title-link flex items-center gap-1.5" onclick="openServerDetailsModal(${s.account_id}, '${s.id}')" title="Manage Server & IPs">
-          <span>${escapeHtml(s.name || s.label || s.id)}</span>
-          <span class="text-xs text-muted">↗</span>
-        </div>
-        <div class="text-xs text-muted font-mono">ID: ${s.id}</div>
+      <td class="cell-name">
+        <button type="button" class="server-title-link" onclick="openServerDetailsModal(${s.account_id}, '${s.id}')" title="Open ${name}">${name}</button>
+        <div class="cell-sub mono">${escapeHtml(String(s.id))}</div>
       </td>
-      <td>
-        <span class="badge ${isRunning ? 'badge-status-running' : 'badge-status-off'}">
-          <span class="w-1.5 h-1.5 rounded-full ${isRunning ? 'bg-success' : 'bg-muted'}"></span>
-          ${s.status || 'running'}
-        </span>
+      <td class="cell-status">
+        <span class="status-text" data-tone="${serverStatusTone(s.status)}">${escapeHtml(serverStatusLabel(s.status))}</span>
       </td>
       ${showProviderCol ? `
-      <td>
-        <div class="flex items-center gap-1.5">
-          ${getProviderBadge(s.provider)}
-        </div>
-        <div class="text-xs text-secondary mt-0.5">${escapeHtml(s.account_label || '')}</div>
+      <td class="cell-provider">
+        <span class="provider-inline"><img src="${provider.logo}" alt="" width="14" height="14">${escapeHtml(s.account_label || provider.name)}</span>
+        <div class="cell-sub">${escapeHtml(provider.name)}</div>
       </td>` : ''}
-      <td>
-        <div class="font-medium">${escapeHtml(s.region || '—')}</div>
-      </td>
-      <td>
+      <td class="cell-region"><span class="mono">${escapeHtml(s.region || '—')}</span></td>
+      <td class="cell-ip">
         ${s.ip ? `
-          <span class="ip-copyable" onclick="copyText('${s.ip}')" title="Click to copy">
-            <code class="font-mono text-sm">${s.ip}</code>
-            <span class="text-xs text-muted">📋</span>
-          </span>
+          <button type="button" class="ip-copyable" onclick="event.stopPropagation(); copyText('${escapeHtml(s.ip)}')" title="Copy ${escapeHtml(s.ip)}">
+            <code>${escapeHtml(s.ip)}</code>${icon('copy')}
+          </button>
         ` : '<span class="text-muted">—</span>'}
       </td>
-      ${showFipsCol ? `<td>${fips}</td>` : ''}
-      <td><span class="text-xs font-mono text-secondary">${escapeHtml(s.plan || '—')}</span></td>
-      <td class="text-right">
-        <div class="flex items-center justify-end gap-1">
-          <button class="btn btn-secondary btn-sm" onclick="openServerDetailsModal(${s.account_id}, '${s.id}')" title="Server Overview, IPs & SSH">🖥️ Manage</button>
-          <button class="btn btn-secondary btn-sm" onclick="powerServer(${s.account_id}, '${s.id}', 'reboot')" title="Reboot">🔄</button>
-          <button class="btn btn-secondary btn-sm" onclick="powerServer(${s.account_id}, '${s.id}', '${isRunning ? 'halt' : 'start'}')" title="${isRunning ? 'Halt/Stop' : 'Start'}">${isRunning ? '⏸️' : '▶️'}</button>
-          <button class="btn btn-secondary btn-sm" onclick="showServerPassword(${s.account_id}, '${s.id}')" title="Show Root Password">🔐</button>
-          <button class="btn btn-danger btn-sm" onclick="deleteServer(${s.account_id}, '${s.id}', '${escapeHtml(s.name || s.label || s.id)}')" title="Delete">🗑️</button>
-        </div>
+      ${showFipsCol ? `<td class="cell-fips">${fips}</td>` : ''}
+      <td class="cell-plan"><span class="mono text-secondary">${escapeHtml(s.plan || '—')}</span></td>
+      <td class="cell-actions text-right">
+        <button class="btn btn-secondary btn-sm" onclick="openServerDetailsModal(${s.account_id}, '${s.id}')">Manage</button>
       </td>
     </tr>
   `;
@@ -2978,7 +3181,7 @@ async function deleteSelectedServers(btn) {
   const confirmed = await confirmAction({
     title: `Delete ${count} Instances?`,
     message: `Are you sure you want to permanently delete these ${count} instances (${escapeHtml(serverNames)})? This action cannot be undone and will terminate all selected cloud servers immediately.`,
-    confirmText: `🗑️ Delete ${count} Instances`,
+    confirmText: `Delete ${count} Instances`,
     isDanger: true
   });
   if (!confirmed) return;
@@ -3177,7 +3380,7 @@ function renderIPManagement() {
       const accFipsCount = state.floatingIps.filter(f => f.account_id === acc.id).length;
       const accPipsCount = (acc.provider === 'hetzner') ? state.primaryIps.filter(p => p.account_id === acc.id).length : 0;
       const accTotal = accFipsCount + accPipsCount;
-      const provIcon = acc.provider === 'hetzner' ? '🇩🇪' : (acc.provider === 'vultr' ? '🌊' : '🟢');
+      const provIcon = `<img src="${(PROVIDERS[acc.provider] || {}).logo || '/ui/assets/cloud.svg'}" alt="" class="pill-logo">`;
 
       pillsHtml += `
         <div class="ips-account-pill ${currentFilter === String(acc.id) ? 'active' : ''}" onclick="setIpsAccountFilter(${acc.id})">
@@ -3224,6 +3427,7 @@ function renderIPManagement() {
       tbody.innerHTML = fips.map(f => {
         const safeId = "ip-row-" + (f.ip || '').replace(/[^a-zA-Z0-9]/g, '_');
         const attachedSrv = f.server_id ? (state.servers || []).find(s => String(s.id) === String(f.server_id)) : null;
+        const upcloudStopRequired = f.provider === "upcloud" && attachedSrv && !isUpcloudStopped(attachedSrv);
         const attachedLabel = attachedSrv ? `Attached #${f.server_id} (${attachedSrv.name || attachedSrv.label})` : `Attached #${f.server_id}`;
         let ptrDisplay = '—';
         if (Array.isArray(f.dns_ptr) && f.dns_ptr.length > 0) {
@@ -3242,7 +3446,7 @@ function renderIPManagement() {
             <td>
               <span class="ip-copyable" onclick="copyText('${escapeHtml(f.ip)}')">
                 <code class="font-mono text-sm font-bold text-primary">${escapeHtml(f.ip)}</code>
-                <span class="text-xs text-muted">📋</span>
+                <span class="copy-hint">${icon('copy')}</span>
               </span>
             </td>
             <td><span class="badge text-xs uppercase">${f.type || 'ipv4'}</span></td>
@@ -3252,19 +3456,20 @@ function renderIPManagement() {
             </td>
             <td>${escapeHtml(f.location || '—')}</td>
             <td>
-              ${f.server_id ? `<span class="badge badge-status-running" title="Server ID: ${f.server_id}">${escapeHtml(attachedLabel)}</span>` : '<span class="badge badge-unassigned">⚠️ Unassigned</span>'}
+              ${f.server_id ? `<span class="badge badge-status-running" title="Server ID: ${f.server_id}">${escapeHtml(attachedLabel)}</span>` : '<span class="badge badge-unassigned">Unassigned</span>'}
             </td>
             <td>
               <span class="truncate font-mono text-xs text-secondary" style="max-width: 180px; display: inline-block;" title="${escapeHtml(ptrDisplay)}">${escapeHtml(ptrDisplay)}</span>
             </td>
             <td class="text-right">
               <div class="flex items-center justify-end gap-1.5 flex-wrap">
-                ${f.server_id ? `
-                  <button class="btn btn-secondary btn-sm" onclick="unassignFloatingIp(${f.account_id}, '${f.id}', this)" title="Detach from server">🔓 Detach</button>
-                  <button class="btn btn-danger btn-sm" onclick="deleteFloatingIp(${f.account_id}, '${f.id}', '${escapeHtml(f.ip)}', this)" title="Detach and delete">🗑️ Detach & Delete</button>
+                                ${f.provider === 'upcloud' ? `<button class="btn btn-secondary btn-sm" onclick="editUpcloudIpSettings(${f.account_id}, '${escapeHtml(ipAddress(f))}', '${escapeHtml(f.ptr || f.dns_ptr || '')}', '${escapeHtml(f.release_policy || 'keep')}')" title="Edit PTR and release policy">IP settings</button>` : ''}
+                                ${upcloudStopRequired ? '<span class="text-xs text-warning">Stop server to change IPs</span>' : f.server_id ? `
+                  <button class="btn btn-secondary btn-sm" onclick="unassignFloatingIp(${f.account_id}, '${f.id}', this)" title="Detach from server">Detach</button>
+                  <button class="btn btn-danger btn-sm" onclick="deleteFloatingIp(${f.account_id}, '${f.id}', '${escapeHtml(f.ip)}', this)" title="Detach and delete">Detach & Delete</button>
                 ` : `
-                  <button class="btn btn-primary btn-sm" onclick="openAttachFipModal('${f.id}', ${f.account_id}, '${escapeHtml(f.ip)}')" title="Attach to server">🔗 Attach</button>
-                  <button class="btn btn-danger btn-sm" onclick="deleteFloatingIp(${f.account_id}, '${f.id}', '${escapeHtml(f.ip)}', this)" title="Permanently delete IP">🗑️ Delete IP</button>
+                  <button class="btn btn-primary btn-sm" onclick="openAttachFipModal('${ipId(f)}', ${f.account_id}, '${escapeHtml(ipAddress(f))}')" title="Attach to server">Attach</button>
+                  <button class="btn btn-danger btn-sm" onclick="deleteFloatingIp(${f.account_id}, '${f.id}', '${escapeHtml(f.ip)}', this)" title="Permanently delete IP">Delete IP</button>
                 `}
               </div>
             </td>
@@ -3295,7 +3500,7 @@ function renderIPManagement() {
             <td>${p.assignee_id ? `<span class="badge badge-status-running">#${p.assignee_id}</span>` : '<span class="badge badge-status-off">Free</span>'}</td>
             <td>${p.auto_delete ? 'Yes' : 'No'}</td>
             <td class="text-right">
-              <button class="btn btn-danger btn-sm" onclick="deletePrimaryIp(${p.account_id}, ${p.id}, this)" title="Delete Hetzner Primary IP">🗑️ Delete</button>
+              <button class="btn btn-danger btn-sm" onclick="deletePrimaryIp(${p.account_id}, ${p.id}, this)" title="Delete Hetzner Primary IP">Delete</button>
             </td>
           </tr>
         `;
@@ -3322,7 +3527,7 @@ function renderSSHKeys() {
       <td>
         <span class="ip-copyable" onclick="copyText('${escapeHtml(k.public_key)}')">
           <code class="font-mono text-xs">${escapeHtml(k.public_key.slice(0, 32))}...</code>
-          <span class="text-xs text-muted">📋</span>
+          <span class="copy-hint">${icon('copy')}</span>
         </span>
       </td>
       <td class="text-xs text-secondary">${new Date(k.created_at * 1000).toLocaleDateString()}</td>
@@ -3375,7 +3580,7 @@ async function loadDnsRecords(zoneId) {
 // ---- TAB 9: WATCHDOG & TUNNELS ----
 function renderWatchdog() {
   if (state.watchdog) {
-    document.getElementById("watchdog-state").textContent = state.watchdog.enabled ? "Active ✅" : "Disabled ❌";
+    document.getElementById("watchdog-state").textContent = state.watchdog.enabled ? "Active" : "Disabled";
     document.getElementById("watchdog-last-probe").textContent = `Cap: ${state.watchdog.daily_cap || 3} repairs/day · Interval: ${state.watchdog.interval || 300}s`;
   }
   document.getElementById("stat-tunnels-count").textContent = state.tunnels.length;
@@ -3396,20 +3601,380 @@ function renderWatchdog() {
   `).join("");
 }
 
+// ---- TAB 10: LOGS & OPERATIONAL ACTIVITY ----
+let logsInitialized = false;
+
+function initLogsUI() {
+  if (logsInitialized) return;
+  logsInitialized = true;
+
+  const serviceSelect = document.getElementById("log-service-filter");
+  if (serviceSelect) {
+    serviceSelect.addEventListener("change", (e) => {
+      state.logs.service = e.target.value;
+      const lbl = document.getElementById("terminal-service-label");
+      if (lbl) lbl.textContent = e.target.options[e.target.selectedIndex].text;
+      fetchSystemLogs(true);
+    });
+  }
+
+  const levelSelect = document.getElementById("log-level-filter");
+  if (levelSelect) {
+    levelSelect.addEventListener("change", (e) => {
+      state.logs.level = e.target.value;
+      renderTerminalLines(state.logs.systemLogs);
+    });
+  }
+
+  const linesSelect = document.getElementById("log-lines-limit");
+  if (linesSelect) {
+    linesSelect.addEventListener("change", (e) => {
+      state.logs.lines = parseInt(e.target.value, 10) || 200;
+      fetchSystemLogs(true);
+    });
+  }
+
+  const searchInput = document.getElementById("log-search-filter");
+  const clearSearchBtn = document.getElementById("btn-clear-log-search");
+  if (searchInput) {
+    searchInput.addEventListener("input", (e) => {
+      state.logs.search = e.target.value.trim().toLowerCase();
+      if (clearSearchBtn) clearSearchBtn.style.display = state.logs.search ? "inline" : "none";
+      renderTerminalLines(state.logs.systemLogs);
+    });
+  }
+  if (clearSearchBtn && searchInput) {
+    clearSearchBtn.addEventListener("click", () => {
+      searchInput.value = "";
+      state.logs.search = "";
+      clearSearchBtn.style.display = "none";
+      renderTerminalLines(state.logs.systemLogs);
+    });
+  }
+
+  const autoScrollCb = document.getElementById("log-autoscroll-toggle");
+  if (autoScrollCb) {
+    autoScrollCb.addEventListener("change", (e) => {
+      state.logs.autoScroll = e.target.checked;
+    });
+  }
+
+  const streamToggle = document.getElementById("btn-log-stream-toggle");
+  if (streamToggle) {
+    streamToggle.addEventListener("click", toggleLogStreaming);
+  }
+
+  const clearBtn = document.getElementById("btn-log-clear-screen");
+  if (clearBtn) {
+    clearBtn.addEventListener("click", () => {
+      const container = document.getElementById("log-stream-content");
+      if (container) container.innerHTML = `<div class="terminal-empty-msg text-secondary py-12 text-center">Log view cleared. Waiting for new lines...</div>`;
+      const counter = document.getElementById("terminal-line-counter");
+      if (counter) counter.textContent = "0 lines";
+    });
+  }
+
+  const refreshBtn = document.getElementById("btn-logs-refresh");
+  if (refreshBtn) {
+    refreshBtn.addEventListener("click", () => {
+      if (state.logs.activeSubTab === "system") {
+        fetchSystemLogs(true);
+      } else {
+        fetchActivityLogs(true);
+      }
+    });
+  }
+
+  const downloadBtn = document.getElementById("btn-logs-download");
+  if (downloadBtn) {
+    downloadBtn.addEventListener("click", exportLogs);
+  }
+
+  // Activity filter listeners
+  const actAction = document.getElementById("activity-action-filter");
+  if (actAction) {
+    actAction.addEventListener("change", (e) => {
+      state.logs.activityAction = e.target.value;
+      fetchActivityLogs();
+    });
+  }
+  const actProvider = document.getElementById("activity-provider-filter");
+  if (actProvider) {
+    actProvider.addEventListener("change", (e) => {
+      state.logs.activityProvider = e.target.value;
+      fetchActivityLogs();
+    });
+  }
+  const actStatus = document.getElementById("activity-status-filter");
+  if (actStatus) {
+    actStatus.addEventListener("change", (e) => {
+      state.logs.activityStatus = e.target.value;
+      fetchActivityLogs();
+    });
+  }
+}
+
+function renderLogs() {
+  initLogsUI();
+  switchLogsSubTab(state.logs.activeSubTab || "system");
+}
+
+function switchLogsSubTab(subTab) {
+  state.logs.activeSubTab = subTab;
+  const sysBtn = document.getElementById("btn-subtab-system-logs");
+  const actBtn = document.getElementById("btn-subtab-activity-logs");
+  const sysPanel = document.getElementById("logs-panel-system");
+  const actPanel = document.getElementById("logs-panel-activity");
+
+  if (sysBtn) sysBtn.classList.toggle("active", subTab === "system");
+  if (actBtn) actBtn.classList.toggle("active", subTab === "activity");
+  if (sysPanel) sysPanel.style.display = subTab === "system" ? "block" : "none";
+  if (actPanel) actPanel.style.display = subTab === "activity" ? "block" : "none";
+
+  if (subTab === "system") {
+    fetchSystemLogs(false);
+    startLogPolling();
+  } else {
+    stopLogPolling();
+    fetchActivityLogs(false);
+  }
+}
+
+function startLogPolling() {
+  stopLogPolling();
+  if (!state.logs.isStreaming || state.activeTab !== "tab-logs" || state.logs.activeSubTab !== "system") {
+    return;
+  }
+  state.logs.pollTimer = setInterval(() => {
+    if (state.activeTab === "tab-logs" && state.logs.activeSubTab === "system" && state.logs.isStreaming) {
+      fetchSystemLogs(false);
+    } else {
+      stopLogPolling();
+    }
+  }, 2500);
+}
+
+function stopLogPolling() {
+  if (state.logs && state.logs.pollTimer) {
+    clearInterval(state.logs.pollTimer);
+    state.logs.pollTimer = null;
+  }
+}
+
+function toggleLogStreaming() {
+  state.logs.isStreaming = !state.logs.isStreaming;
+  const icon = document.getElementById("btn-log-stream-icon");
+  const label = document.getElementById("btn-log-stream-label");
+  const pill = document.getElementById("log-live-status-pill");
+  const pillText = document.getElementById("log-status-text");
+
+  if (state.logs.isStreaming) {
+    if (icon) icon.innerHTML = window.icon('pause');
+    if (label) label.textContent = "Pause";
+    if (pill) pill.classList.remove("paused");
+    if (pillText) pillText.textContent = "LIVE STREAMING";
+    startLogPolling();
+    if (typeof showToast === "function") showToast("Live log streaming resumed", "info");
+  } else {
+    if (icon) icon.innerHTML = window.icon('play');
+    if (label) label.textContent = "Resume";
+    if (pill) pill.classList.add("paused");
+    if (pillText) pillText.textContent = "STREAM PAUSED";
+    stopLogPolling();
+    if (typeof showToast === "function") showToast("Live log streaming paused", "warning");
+  }
+}
+
+async function fetchSystemLogs(forceScroll = false) {
+  if (state.logs.isFetching) return;
+  state.logs.isFetching = true;
+  try {
+    const res = await api("system_logs", {
+      service: state.logs.service || "all",
+      lines: state.logs.lines || 200,
+      level: state.logs.level || "all"
+    });
+    if (res && Array.isArray(res.logs)) {
+      state.logs.systemLogs = res.logs;
+      renderTerminalLines(res.logs, forceScroll);
+      const badge = document.getElementById("badge-system-logs-count");
+      if (badge) badge.textContent = res.logs.length;
+    }
+  } catch (err) {
+    console.warn("fetchSystemLogs error:", err);
+  } finally {
+    state.logs.isFetching = false;
+  }
+}
+
+function formatLogMessage(msg) {
+  if (!msg) return "";
+  const esc = (typeof escapeHtml === "function") ? escapeHtml(msg) : String(msg);
+  let out = esc.replace(/\b(POST|GET|DELETE|PUT|PATCH)\b/g, '<span class="method-post">$1</span>');
+  out = out.replace(/\b(HTTP\/1\.[01])\s+(200|201|204)\b/g, '$1 <span class="status-200">$2</span>');
+  out = out.replace(/\b(HTTP\/1\.[01])\s+([45]\d\d)\b/g, '$1 <span class="status-err">$2</span>');
+  out = out.replace(/\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b/g, '<span style="color:#38bdf8;">$1</span>');
+  return out;
+}
+
+function renderTerminalLines(logs, forceScroll = false) {
+  const container = document.getElementById("log-stream-content");
+  if (!container) return;
+
+  const query = state.logs.search || "";
+  const levelFilter = state.logs.level || "all";
+
+  let filtered = logs;
+  if (levelFilter !== "all") {
+    filtered = filtered.filter(l => l.level === levelFilter);
+  }
+  if (query) {
+    filtered = filtered.filter(l => (l.raw && l.raw.toLowerCase().includes(query)) || (l.message && l.message.toLowerCase().includes(query)));
+  }
+
+  const counter = document.getElementById("terminal-line-counter");
+  if (counter) counter.textContent = `${filtered.length} lines`;
+
+  if (filtered.length === 0) {
+    container.innerHTML = `<div class="terminal-empty-msg text-secondary py-12 text-center">${logs.length === 0 ? 'No log lines received from services yet.' : 'No lines match current search filter.'}</div>`;
+    return;
+  }
+
+  const wasAtBottom = (container.scrollHeight - container.scrollTop <= container.clientHeight + 50);
+
+  const html = filtered.map(item => {
+    const lvl = item.level || "info";
+    const lvlClass = `term-lvl-${lvl}`;
+    const formattedMsg = formatLogMessage(item.message || item.raw);
+    const tsStr = item.ts ? ((typeof escapeHtml === "function") ? escapeHtml(item.ts.replace(/^[0-9]{4}-/, "").replace(/\+[0-9]{4}$/, "")) : item.ts) : "";
+    const procStr = item.process ? ((typeof escapeHtml === "function") ? escapeHtml(item.process) : item.process) : "";
+
+    return `<div class="terminal-row">
+      <span class="term-ts">${tsStr}</span>
+      <span class="term-proc">${procStr}</span>
+      <span class="term-lvl ${lvlClass}">${lvl}</span>
+      <span class="term-msg">${formattedMsg}</span>
+    </div>`;
+  }).join("");
+
+  container.innerHTML = html;
+
+  if (forceScroll || (state.logs.autoScroll && wasAtBottom)) {
+    container.scrollTop = container.scrollHeight;
+  }
+}
+
+async function fetchActivityLogs(notify = false) {
+  const tbody = document.getElementById("activity-logs-tbody");
+  try {
+    const res = await api("activity_logs", {
+      limit: 150,
+      action: state.logs.activityAction === "all" ? null : state.logs.activityAction,
+      provider: state.logs.activityProvider === "all" ? null : state.logs.activityProvider,
+      status: state.logs.activityStatus === "all" ? null : state.logs.activityStatus
+    });
+
+    const items = (res && res.activity_logs) || [];
+    state.logs.activityLogs = items;
+    const badge = document.getElementById("badge-activity-logs-count");
+    if (badge) badge.textContent = items.length;
+
+    if (!tbody) return;
+    if (items.length === 0) {
+      tbody.innerHTML = `<tr><td colspan="6" class="text-center py-8 text-secondary">No recorded activity matches current filters.</td></tr>`;
+      if (notify && typeof showToast === "function") showToast("No activity records found", "info");
+      return;
+    }
+
+    const actionBadgeMap = {
+      CREATE_SERVER: { cls: "act-create", icon: "", label: "Server Created" },
+      CREATE_SERVER_BATCH: { cls: "act-create", icon: "", label: "Batch Created" },
+      DELETE_SERVER: { cls: "act-delete", icon: "", label: "Server Deleted" },
+      POWER_ACTION: { cls: "act-power", icon: "", label: "Power Cycled" },
+      CREATE_FLOATING_IP: { cls: "act-ip", icon: "", label: "Floating IP Allocated" },
+      DELETE_FLOATING_IP: { cls: "act-delete", icon: "", label: "Floating IP Deleted" },
+      ASSIGN_FLOATING_IP: { cls: "act-ip", icon: "", label: "IP Attached" },
+      UNASSIGN_FLOATING_IP: { cls: "act-delete", icon: "", label: "IP Detached" },
+      ADD_ACCOUNT: { cls: "act-account", icon: "◉", label: "Account Added" },
+      DELETE_ACCOUNT: { cls: "act-delete", icon: "", label: "Account Removed" },
+      SWAP_IPS: { cls: "act-ip", icon: "⇄", label: "Linode IPs Swapped" },
+    };
+
+    tbody.innerHTML = items.map(act => {
+      const b = actionBadgeMap[act.action] || { cls: "act-system", icon: "ℹ", label: act.action };
+      const dateStr = act.ts ? new Date(act.ts * 1000).toLocaleString() : "—";
+      const provInfo = (typeof PROVIDERS !== "undefined" && PROVIDERS[act.provider]) ? PROVIDERS[act.provider] : null;
+      const provHtml = provInfo
+        ? `<div class="flex items-center gap-1.5"><img src="${provInfo.logo}" style="width:14px;height:14px;" alt=""><span>${(typeof escapeHtml === "function") ? escapeHtml(provInfo.name) : provInfo.name}</span></div>`
+        : `<span class="text-secondary uppercase text-xs">${(typeof escapeHtml === "function") ? escapeHtml(act.provider || 'system') : act.provider}</span>`;
+
+      const statusBadge = act.status === "success"
+        ? `<span class="badge text-xs" style="background:rgba(16,185,129,0.15);color:#34d399;">Success</span>`
+        : `<span class="badge text-xs" style="background:rgba(239,68,68,0.15);color:#f87171;">Failed</span>`;
+
+      return `<tr>
+        <td class="font-mono text-xs text-secondary">${(typeof escapeHtml === "function") ? escapeHtml(dateStr) : dateStr}</td>
+        <td><span class="activity-badge ${b.cls}"><span>${(typeof escapeHtml === "function") ? escapeHtml(b.label) : b.label}</span></span></td>
+        <td>${provHtml}</td>
+        <td><code class="font-mono text-xs font-bold">${(typeof escapeHtml === "function") ? escapeHtml(act.target || '—') : act.target}</code></td>
+        <td>${statusBadge}</td>
+        <td class="text-xs text-secondary">
+          ${(typeof escapeHtml === "function") ? escapeHtml(act.details || '') : act.details}
+          ${act.error ? `<div class="text-danger mt-1">Error: ${(typeof escapeHtml === "function") ? escapeHtml(act.error) : act.error}</div>` : ''}
+        </td>
+      </tr>`;
+    }).join("");
+
+    if (notify && typeof showToast === "function") showToast(`Loaded ${items.length} activity audit records`, "success");
+  } catch (err) {
+    if (tbody) tbody.innerHTML = `<tr><td colspan="6" class="text-center py-6 text-danger">Failed to load activity logs: ${(typeof escapeHtml === "function") ? escapeHtml(err.message) : err.message}</td></tr>`;
+  }
+}
+
+function exportLogs() {
+  const isSystem = state.logs.activeSubTab === "system";
+  let content = "";
+  let filename = "";
+
+  if (isSystem) {
+    filename = `cloudbot-system-logs-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+    content = state.logs.systemLogs.map(l => l.raw || `${l.ts} ${l.process}: ${l.message}`).join("\n");
+  } else {
+    filename = `cloudbot-activity-audit-${new Date().toISOString().replace(/[:.]/g, "-")}.txt`;
+    content = state.logs.activityLogs.map(a =>
+      `[${new Date(a.ts * 1000).toISOString()}] [${a.status.toUpperCase()}] [${a.action}] [${a.provider}] Target: ${a.target} | ${a.details} ${a.error ? 'Error: ' + a.error : ''}`
+    ).join("\n");
+  }
+
+  const blob = new Blob([content], { type: "text/plain;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  if (typeof showToast === "function") showToast(`Exported ${filename}`, "success");
+}
+
 // Route mapping for clean multi-page URL navigation
 const ROUTE_MAP = {
-  "/": "tab-overview",
+  "/": "tab-compute",
   "/overview": "tab-overview",
   "/accounts": "tab-accounts",
   "/proxies": "tab-proxies",
   "/hetzner": "tab-hetzner",
   "/vultr": "tab-vultr",
   "/linode": "tab-linode",
+  "/upcloud": "tab-upcloud",
+  "/cloudferro": "tab-cloudferro",
   "/compute": "tab-compute",
   "/ips": "tab-ips",
   "/ssh": "tab-ssh",
   "/dns": "tab-dns",
-  "/watchdog": "tab-watchdog"
+  "/watchdog": "tab-watchdog",
+  "/logs": "tab-logs"
 };
 
 const TAB_TO_ROUTE = {
@@ -3419,11 +3984,14 @@ const TAB_TO_ROUTE = {
   "tab-hetzner": "/hetzner",
   "tab-vultr": "/vultr",
   "tab-linode": "/linode",
+  "tab-upcloud": "/upcloud",
+  "tab-cloudferro": "/cloudferro",
   "tab-compute": "/compute",
   "tab-ips": "/ips",
   "tab-ssh": "/ssh",
   "tab-dns": "/dns",
-  "tab-watchdog": "/watchdog"
+  "tab-watchdog": "/watchdog",
+  "tab-logs": "/logs"
 };
 
 // ==================== NAVIGATION & TAB SWITCHING ====================
@@ -3434,7 +4002,8 @@ function initNavigation() {
 
   if (mobileToggle && sidebarContent) {
     mobileToggle.addEventListener("click", () => {
-      sidebarContent.classList.toggle("mobile-open");
+      const open = sidebarContent.classList.toggle("mobile-open");
+      mobileToggle.setAttribute("aria-expanded", String(open));
     });
   }
 
@@ -3444,6 +4013,9 @@ function initNavigation() {
       if (targetTab === "tab-hetzner") state.providerSelectedAccount.hetzner = null;
       if (targetTab === "tab-vultr") state.providerSelectedAccount.vultr = null;
       if (targetTab === "tab-linode") state.providerSelectedAccount.linode = null;
+      if (targetTab === "tab-upcloud") state.providerSelectedAccount.upcloud = null;
+      if (targetTab === "tab-cloudferro") state.providerSelectedAccount.cloudferro = null;
+      if (targetTab === "tab-cloudferro") state.providerSelectedAccount.cloudferro = null;
       switchTab(targetTab, true);
     });
   });
@@ -3455,6 +4027,7 @@ function initNavigation() {
       if (targetTab === "tab-hetzner") state.providerSelectedAccount.hetzner = null;
       if (targetTab === "tab-vultr") state.providerSelectedAccount.vultr = null;
       if (targetTab === "tab-linode") state.providerSelectedAccount.linode = null;
+      if (targetTab === "tab-upcloud") state.providerSelectedAccount.upcloud = null;
       switchTab(targetTab, true);
     });
   });
@@ -3485,6 +4058,13 @@ function initNavigation() {
 
 function switchTab(tabId, pushState = true) {
   state.activeTab = tabId;
+  const tools = document.querySelector(".nav-disclosure .nav-item[data-tab='" + tabId + "']")?.closest("details");
+  if (tools) tools.open = true;
+  document.querySelectorAll(".nav-item").forEach(item => item.setAttribute("aria-current", item.dataset.tab === tabId ? "page" : "false"));
+  const mobileButton = document.getElementById("btn-mobile-nav");
+  if (mobileButton) mobileButton.setAttribute("aria-expanded", "false");
+  const headerActions = { "btn-open-deploy-modal": tabId === "tab-compute" || tabId === "tab-overview", "btn-open-add-account": false, "btn-open-alloc-ip": false };
+  Object.entries(headerActions).forEach(([id, visible]) => { document.getElementById(id).hidden = !visible; });
   const sidebarContent = document.querySelector(".sidebar-content");
   if (sidebarContent) sidebarContent.classList.remove("mobile-open");
 
@@ -3496,17 +4076,20 @@ function switchTab(tabId, pushState = true) {
   });
 
   const titles = {
-    "tab-overview": "Infrastructure Overview",
-    "tab-accounts": "Cloud Account & Billing Center",
-    "tab-proxies": "Proxy Pool & Management",
-    "tab-hetzner": "Hetzner Cloud Hub",
-    "tab-vultr": "Vultr Cloud Hub",
-    "tab-linode": "Linode / Akamai Hub",
-    "tab-compute": "All Compute Instances",
-    "tab-ips": "Floating & Reserved IP Management",
-    "tab-ssh": "SSH Key Vault",
-    "tab-dns": "Cloudflare DNS Management",
-    "tab-watchdog": "Watchdog Probing & Tunnels"
+    "tab-overview": "Overview",
+    "tab-accounts": "Accounts",
+    "tab-proxies": "Account proxies",
+    "tab-hetzner": "Hetzner",
+    "tab-vultr": "Vultr",
+    "tab-linode": "Linode",
+    "tab-upcloud": "UpCloud",
+    "tab-cloudferro": "CloudFerro",
+    "tab-compute": "Servers",
+    "tab-ips": "IP addresses",
+    "tab-ssh": "SSH keys",
+    "tab-dns": "DNS records",
+    "tab-watchdog": "Watchdog & tunnels",
+    "tab-logs": "Logs & activity"
   };
   const title = titles[tabId] || "Hosting Console";
   document.getElementById("view-title").textContent = title;
@@ -3520,16 +4103,23 @@ function switchTab(tabId, pushState = true) {
     }
   }
 
-  if (tabId === "tab-accounts") renderAccountsManagement();
+  if (tabId === "tab-accounts") filterAccountsByProvider("all");
   if (tabId === "tab-proxies") renderProxyManagement();
   if (tabId === "tab-hetzner") renderHetznerHub();
   if (tabId === "tab-vultr") renderVultrHub();
   if (tabId === "tab-linode") renderLinodeHub();
+  if (tabId === "tab-upcloud") renderUpcloudHub();
+  if (tabId === "tab-cloudferro") renderCloudferroHub();
   if (tabId === "tab-compute") renderAllCompute();
   if (tabId === "tab-ips") renderIPManagement();
   if (tabId === "tab-ssh") renderSSHKeys();
   if (tabId === "tab-dns") renderDNS();
   if (tabId === "tab-watchdog") renderWatchdog();
+  if (tabId === "tab-logs") {
+    if (typeof renderLogs === "function") renderLogs();
+  } else if (state.logs && state.logs.pollTimer) {
+    if (typeof stopLogPolling === "function") stopLogPolling();
+  }
 }
 
 // ==================== SEARCH ====================
@@ -3598,7 +4188,7 @@ function initSearch() {
         const acc = String(s.account_label || '').toLowerCase();
         const reg = String(s.region || '').toLowerCase();
         const plan = String(s.plan || '').toLowerCase();
-        const fips = (s.floating_ips || []).map(f => String(f.ip || f.ip_address || f.subnet || f.network || '').toLowerCase()).join(' ');
+        const fips = (s.floating_ips || []).map(f => ipAddress(f).toLowerCase()).join(' ');
         return name.includes(q) || ip.includes(q) || ips.includes(q) || ipv4.includes(q) || ipv6.includes(q) || id.includes(q) || prov.includes(q) || acc.includes(q) || reg.includes(q) || plan.includes(q) || fips.includes(q);
       });
 
@@ -3608,14 +4198,15 @@ function initSearch() {
         ...(state.primaryIps || []).map(p => ({ ...p, provider: p.provider || 'hetzner', ipType: 'Primary IP' }))
       ];
       const matchedIps = allIps.filter(f => {
-        const ip = String(f.ip || f.ip_address || f.subnet || f.network || '').toLowerCase();
+        const ip = ipAddress(f).toLowerCase();
         const name = String(f.name || f.server_name || '').toLowerCase();
         const prov = String(f.provider || '').toLowerCase();
-        const reg = String(f.region || '').toLowerCase();
+        const reg = String(f.region || f.zone || '').toLowerCase();
+        const ptr = String(f.ptr || f.dns_ptr || '').toLowerCase();
         const acc = String(f.account_label || '').toLowerCase();
         const id = String(f.id || '').toLowerCase();
         const srvId = String(f.server_id || f.assignee_id || '').toLowerCase();
-        return ip.includes(q) || name.includes(q) || prov.includes(q) || reg.includes(q) || acc.includes(q) || id.includes(q) || srvId.includes(q);
+        return ip.includes(q) || name.includes(q) || prov.includes(q) || reg.includes(q) || ptr.includes(q) || acc.includes(q) || id.includes(q) || srvId.includes(q);
       });
 
       // 3. Matches in Cloud Accounts
@@ -3643,7 +4234,7 @@ function initSearch() {
       if (totalMatches === 0) {
         resultsContainer.innerHTML = `
           <div class="search-empty-state">
-            <div class="search-empty-icon">🔍</div>
+            <div class="search-empty-icon">${icon('search')}</div>
             <div class="font-bold text-primary">No infrastructure matches for "${escapeHtml(rawVal)}"</div>
             <div class="text-xs text-muted mt-1">Search by server name, public IP, region code, cloud provider, or account</div>
           </div>
@@ -3660,7 +4251,7 @@ function initSearch() {
         html += `
           <div class="search-category-group">
             <div class="search-category-title">
-              <span>🖥️</span> Instances (${matchedServers.length})
+              Servers (${matchedServers.length})
             </div>
             ${displayServers.map(s => {
               const isRunning = isServerRunning(s.status);
@@ -3668,7 +4259,7 @@ function initSearch() {
               return `
                 <div class="search-result-item" tabindex="0" data-action="server" data-server-id="${escapeHtml(s.id)}" data-account-id="${s.account_id}">
                   <div class="search-item-main">
-                    <div class="search-item-icon">🖥️</div>
+                    <div class="search-item-icon">${icon('server')}</div>
                     <div class="search-item-info">
                       <div class="search-item-title">
                         <span>${highlightSearchMatch(s.name || s.label || s.id, rawVal)}</span>
@@ -3710,7 +4301,7 @@ function initSearch() {
         html += `
           <div class="search-category-group">
             <div class="search-category-title">
-              <span>🌐</span> Floating & Primary IPs (${matchedIps.length})
+              IP addresses (${matchedIps.length})
             </div>
             ${displayIps.map(f => {
               const srv = (f.server_id || f.assignee_id) ? (state.servers || []).find(s => String(s.id) === String(f.server_id || f.assignee_id)) : null;
@@ -3718,7 +4309,7 @@ function initSearch() {
               return `
               <div class="search-result-item" tabindex="0" data-action="ip" data-ip="${escapeHtml(f.ip)}" data-account-id="${f.account_id}">
                 <div class="search-item-main">
-                  <div class="search-item-icon">🌐</div>
+                  <div class="search-item-icon">${icon('globe')}</div>
                   <div class="search-item-info">
                     <div class="search-item-title font-mono font-bold">
                       <span>${highlightSearchMatch(f.ip, rawVal)}</span>
@@ -3748,12 +4339,12 @@ function initSearch() {
         html += `
           <div class="search-category-group">
             <div class="search-category-title">
-              <span>🔑</span> Cloud Accounts (${matchedAccounts.length})
+              Accounts (${matchedAccounts.length})
             </div>
             ${displayAccounts.map(a => `
               <div class="search-result-item" tabindex="0" data-action="account" data-account-id="${a.id}">
                 <div class="search-item-main">
-                  <div class="search-item-icon">🔑</div>
+                  <div class="search-item-icon">${icon('key')}</div>
                   <div class="search-item-info">
                     <div class="search-item-title">
                       <span>${highlightSearchMatch(a.label, rawVal)}</span>
@@ -3910,14 +4501,16 @@ async function getCachedPlans(accId, region) {
   return state.plansCache[cacheKey];
 }
 
-async function getCachedImages(accId) {
+async function getCachedImages(accId, region = null) {
   const id = parseInt(accId);
-  if (state.imagesCache[id]) {
-    return state.imagesCache[id];
+  const upcloud = state.accounts.find(a => String(a.id) === String(id))?.provider === "upcloud";
+  const cacheKey = upcloud ? `${id}:${region || ""}` : id;
+  if (state.imagesCache[cacheKey]) {
+    return state.imagesCache[cacheKey];
   }
-  const res = await api("images", { account_id: id });
-  state.imagesCache[id] = res.images || [];
-  return state.imagesCache[id];
+  const res = await api("images", { account_id: id, ...(upcloud && region ? { region } : {}) });
+  state.imagesCache[cacheKey] = res.images || [];
+  return state.imagesCache[cacheKey];
 }
 
 function prefetchAccountDeployOptions(accId) {
@@ -3930,42 +4523,165 @@ function prefetchAccountDeployOptions(accId) {
       getCachedPlans(id, targetRegion).catch(() => {});
     }
   }).catch(() => {});
-  getCachedImages(id).catch(() => {});
+  const acc = state.accounts.find(a => a.id === id);
+  if (!acc || acc.provider !== "upcloud") getCachedImages(id).catch(() => {});
 }
 window.prefetchAccountDeployOptions = prefetchAccountDeployOptions;
 window.getCachedRegions = getCachedRegions;
 window.getCachedPlans = getCachedPlans;
 window.getCachedImages = getCachedImages;
 
+function toggleDeployProviderPicker() {
+  const grp = document.getElementById("deploy-provider-group");
+  if (grp) {
+    grp.hidden = !grp.hidden;
+  }
+}
+window.toggleDeployProviderPicker = toggleDeployProviderPicker;
+
+function updateDeployContextBanner(prov, accId) {
+  const banner = document.getElementById("deploy-context-banner");
+  if (!banner) return;
+  const pMeta = (typeof PROVIDERS !== "undefined" && PROVIDERS[prov]) ? PROVIDERS[prov] : { name: prov, logo: "/ui/assets/cloud.svg" };
+  const acc = (state.accounts || []).find(a => String(a.id) === String(accId));
+  const logoEl = document.getElementById("deploy-banner-logo");
+  const provEl = document.getElementById("deploy-banner-provider-name");
+  const accEl = document.getElementById("deploy-banner-account-name");
+  const metaEl = document.getElementById("deploy-banner-account-meta");
+
+  if (logoEl) logoEl.src = pMeta.logo || "/ui/assets/cloud.svg";
+  if (provEl) provEl.textContent = pMeta.name || prov;
+
+  if (acc) {
+    if (accEl) accEl.textContent = `${acc.label} (#${acc.id})`;
+    const reg = typeof formatRegion === "function" ? formatRegion(acc.region) : { flag: "", name: acc.region || "" };
+    if (metaEl) metaEl.textContent = `${reg.flag ? reg.flag + ' ' : ''}${reg.name || 'Default Region'} • ${acc.has_proxy ? 'Proxy Configured' : 'Direct Egress'}`;
+    banner.style.display = "flex";
+  } else {
+    if (accEl) accEl.textContent = "Select Account";
+    if (metaEl) metaEl.textContent = "Choose an account to continue";
+    banner.style.display = "flex";
+  }
+}
+
+function pickDefaultPlan(plans, provider) {
+  if (!plans || plans.length === 0) return "";
+  const p = String(provider || "").toLowerCase();
+
+  if (p === "hetzner") {
+    const preferred = ["cx22", "cpx11", "cx11", "cpx21", "cx32"];
+    for (const pref of preferred) {
+      const match = plans.find(x => String(x.id).toLowerCase() === pref);
+      if (match) return match.id;
+    }
+    const anyCx = plans.find(x => String(x.id).toLowerCase().includes("cx"));
+    if (anyCx) return anyCx.id;
+  } else if (p === "vultr") {
+    const preferred = ["vc2-1c-1gb", "vc2-1c-2gb", "vhf-1c-1gb", "vc2-2c-4gb"];
+    for (const pref of preferred) {
+      const match = plans.find(x => String(x.id).toLowerCase() === pref);
+      if (match) return match.id;
+    }
+  } else if (p === "linode") {
+    const preferred = ["g6-nanode-1", "g6-standard-1", "g6-standard-2"];
+    for (const pref of preferred) {
+      const match = plans.find(x => String(x.id).toLowerCase() === pref);
+      if (match) return match.id;
+    }
+  } else if (p === "upcloud") {
+    const preferred = ["1xCPU-1GB", "1xCPU-2GB", "2xCPU-4GB"];
+    for (const pref of preferred) {
+      const match = plans.find(x => String(x.id).toLowerCase() === pref.toLowerCase());
+      if (match) return match.id;
+    }
+  }
+  return plans[0].id;
+}
+
+function pickDefaultImage(images) {
+  if (!images || images.length === 0) return "";
+  const u24 = images.find(i => {
+    const s = `${i.id} ${i.label || ''} ${i.name || ''}`.toLowerCase();
+    return s.includes("ubuntu") && (s.includes("24.04") || s.includes("24_04") || s.includes("24"));
+  });
+  if (u24) return u24.id;
+
+  const u22 = images.find(i => {
+    const s = `${i.id} ${i.label || ''} ${i.name || ''}`.toLowerCase();
+    return s.includes("ubuntu") && (s.includes("22.04") || s.includes("22_04") || s.includes("22"));
+  });
+  if (u22) return u22.id;
+
+  const uAny = images.find(i => `${i.id} ${i.label || ''} ${i.name || ''}`.toLowerCase().includes("ubuntu"));
+  if (uAny) return uAny.id;
+
+  const deb = images.find(i => `${i.id} ${i.label || ''} ${i.name || ''}`.toLowerCase().includes("debian"));
+  if (deb) return deb.id;
+
+  return images[0].id;
+}
+
 function openDeployModalForProvider(prov) {
   state.deploySelectedProvider = prov;
   openModal("modal-deploy-server");
-  updateDeployProviderPicker(prov);
+
+  const matching = (state.accounts || []).filter(a => a.provider === prov);
+  let targetAccId = null;
+  if (state.providerSelectedAccount && state.providerSelectedAccount[prov]) {
+    targetAccId = state.providerSelectedAccount[prov];
+  } else if (matching.length === 1) {
+    targetAccId = matching[0].id;
+  }
+
+  updateDeployProviderPicker(prov, targetAccId);
+  document.getElementById("deploy-provider-group").hidden = true;
+  document.getElementById("deploy-account-group").hidden = false;
+
   const countInput = document.getElementById("deploy-count-input");
   if (countInput) countInput.value = "1";
-  updateDeployCountPreview();
 
-  // Background prefetch for accounts of this provider
-  const matching = state.accounts.filter(a => a.provider === prov);
-  matching.forEach(a => prefetchAccountDeployOptions(a.id));
+  const nameInput = document.getElementById("deploy-name-input");
+  if (nameInput && !nameInput.value) {
+    nameInput.value = "node-01";
+  }
+  updateDeployCountPreview();
 }
 
 function openDeployModalForAccount(accId, prov) {
   state.deploySelectedProvider = prov;
   openModal("modal-deploy-server");
-  updateDeployProviderPicker(prov);
+  updateDeployProviderPicker(prov, accId);
+  document.getElementById("deploy-provider-group").hidden = true;
+  document.getElementById("deploy-account-group").hidden = true;
+
   const countInput = document.getElementById("deploy-count-input");
   if (countInput) countInput.value = "1";
+
+  const nameInput = document.getElementById("deploy-name-input");
+  if (nameInput && !nameInput.value) {
+    nameInput.value = "node-01";
+  }
   updateDeployCountPreview();
+
   const accSel = document.getElementById("deploy-account-select");
-  accSel.value = accId;
-  prefetchAccountDeployOptions(accId);
-  accSel.dispatchEvent(new Event("change"));
+  if (accSel) {
+    accSel.value = accId;
+    accSel.dispatchEvent(new Event("change"));
+  }
 }
 
-function updateDeployProviderPicker(prov) {
+function updateDeployProviderPicker(prov, preferredAccId = null) {
   document.querySelectorAll(".provider-picker-btn").forEach(btn => {
     btn.classList.toggle("active", btn.getAttribute("data-prov") === prov);
+  });
+
+  // Update account count badges
+  ["hetzner", "vultr", "linode", "upcloud", "cloudferro"].forEach(p => {
+    const el = document.getElementById(`deploy-prov-count-${p}`);
+    if (el) {
+      const cnt = (state.accounts || []).filter(a => a.provider === p).length;
+      el.textContent = `${cnt} account${cnt === 1 ? '' : 's'}`;
+    }
   });
 
   // Hetzner IPv6 options visibility
@@ -3975,20 +4691,43 @@ function updateDeployProviderPicker(prov) {
     const v6Cb = document.getElementById("deploy-enable-ipv6");
     if (v6Cb) v6Cb.checked = false;
   }
+  const upcloudOpts = document.getElementById("deploy-upcloud-options");
+  if (upcloudOpts) upcloudOpts.style.display = prov === "upcloud" ? "block" : "none";
 
   // Populate accounts matching this provider
   const accSel = document.getElementById("deploy-account-select");
-  const matching = state.accounts.filter(a => a.provider === prov);
-  accSel.innerHTML = `<option value="">Select ${prov} account...</option>` +
-    matching.map(a => `<option value="${a.id}">${escapeHtml(a.label)}</option>`).join("");
+  const matching = (state.accounts || []).filter(a => a.provider === prov);
+  const pMeta = (typeof PROVIDERS !== "undefined" && PROVIDERS[prov]) ? PROVIDERS[prov] : { name: prov };
+  accSel.innerHTML = `<option value="">Select ${pMeta.name || prov} account...</option>` +
+    matching.map(a => `<option value="${a.id}">${escapeHtml(a.label)} (#${a.id})</option>`).join("");
 
   // Reset dependent selectors
   resetDeploySelectors();
 
   // Populate SSH keys
   const sshSel = document.getElementById("deploy-ssh-select");
-  sshSel.innerHTML = `<option value="">Auto-inject all vault SSH keys</option>` +
-    state.sshKeys.map(k => `<option value="${k.id}">${escapeHtml(k.name)}</option>`).join("");
+  if (sshSel) {
+    sshSel.innerHTML = `<option value="">Auto-inject all vault SSH keys (${(state.sshKeys || []).length} available)</option>` +
+      (state.sshKeys || []).map(k => `<option value="${k.id}">${escapeHtml(k.name)}</option>`).join("");
+  }
+
+  // Smart account selection
+  let targetAccId = preferredAccId;
+  if (!targetAccId && state.providerSelectedAccount && state.providerSelectedAccount[prov]) {
+    targetAccId = state.providerSelectedAccount[prov];
+  }
+  if (!targetAccId && matching.length === 1) {
+    targetAccId = matching[0].id;
+  }
+
+  if (targetAccId && matching.some(a => String(a.id) === String(targetAccId))) {
+    accSel.value = targetAccId;
+    accSel.dispatchEvent(new Event("change"));
+  }
+
+  if (typeof updateDeployContextBanner === "function") {
+    updateDeployContextBanner(prov, targetAccId);
+  }
 }
 
 function resetDeploySelectors() {
@@ -4021,7 +4760,34 @@ function initModals() {
   });
 
   document.getElementById("btn-open-deploy-modal").addEventListener("click", () => {
-    openDeployModalForProvider("hetzner");
+    let prov = "hetzner";
+    if (state.activeTab === "tab-vultr") prov = "vultr";
+    else if (state.activeTab === "tab-linode") prov = "linode";
+    else if (state.activeTab === "tab-upcloud") prov = "upcloud";
+    else if (state.activeTab === "tab-cloudferro") prov = "cloudferro";
+    else if (state.deploySelectedProvider) prov = state.deploySelectedProvider;
+
+    const matching = (state.accounts || []).filter(a => a.provider === prov);
+    let targetAccId = null;
+    if (state.providerSelectedAccount && state.providerSelectedAccount[prov]) {
+      targetAccId = state.providerSelectedAccount[prov];
+    } else if (matching.length === 1) {
+      targetAccId = matching[0].id;
+    }
+
+    state.deploySelectedProvider = prov;
+    openModal("modal-deploy-server");
+    updateDeployProviderPicker(prov, targetAccId);
+    document.getElementById("deploy-provider-group").hidden = false;
+    document.getElementById("deploy-account-group").hidden = false;
+
+    const countInput = document.getElementById("deploy-count-input");
+    if (countInput) countInput.value = "1";
+    const nameInput = document.getElementById("deploy-name-input");
+    if (nameInput && !nameInput.value) {
+      nameInput.value = "node-01";
+    }
+    updateDeployCountPreview();
   });
 
   document.getElementById("btn-open-alloc-ip").addEventListener("click", () => {
@@ -4049,6 +4815,12 @@ function initModals() {
     });
   }
 
+  const addAccountProxyInput = document.getElementById("acc-proxy");
+  if (addAccountProxyInput) {
+    addAccountProxyInput.addEventListener("input", () => updateProxyInputPreview("acc-proxy", "acc-proxy-format-status"));
+    addAccountProxyInput.addEventListener("blur", () => updateProxyInputPreview("acc-proxy", "acc-proxy-format-status"));
+  }
+
   document.getElementById("btn-add-ssh-key-modal").addEventListener("click", () => {
     openModal("modal-add-ssh");
   });
@@ -4069,12 +4841,22 @@ function initModals() {
 
 function openModal(id) {
   const el = document.getElementById(id);
-  if (el) el.classList.add("open");
+  if (el) {
+    if (el.classList && typeof el.classList.add === "function") {
+      el.classList.add("open");
+    }
+    el.scrollTop = 0;
+    const body = (typeof el.querySelector === "function") ? el.querySelector(".modal-body") : null;
+    if (body) body.scrollTop = 0;
+  }
 }
 
 function closeModal(id) {
   const el = document.getElementById(id);
   if (el) el.classList.remove("open");
+  if (id === "modal-edit-account") {
+    document.getElementById("edit-account-token").value = "";
+  }
   if (id === "modal-server-details") {
     clearServerModalFipSelection();
   }
@@ -4082,10 +4864,20 @@ function closeModal(id) {
 
 function openAddAccountModal(prov) {
   openModal("modal-add-account");
-  if (prov) {
+  document.getElementById("add-account-provider-group").hidden = !!prov;
+  const contextualProv = (state.activeAccountFilter && state.activeAccountFilter !== "all")
+    ? state.activeAccountFilter
+    : (state.activeTab && state.activeTab.startsWith("tab-") && PROVIDERS[state.activeTab.replace("tab-", "")]
+       ? state.activeTab.replace("tab-", "")
+       : null);
+  const targetProv = prov || contextualProv;
+  if (targetProv) {
     const provEl = document.getElementById("acc-provider");
-    if (provEl) provEl.value = prov;
+    if (provEl) provEl.value = targetProv;
   }
+  const noteInput = document.getElementById("acc-note");
+  if (noteInput) noteInput.value = "";
+  updateCloudCredentialHint();
   populateAddAccProxyProviders();
   const hasPool = (state.proxyProviders || []).some(p => p.enabled);
   const defaultMode = hasPool ? "pool" : "none";
@@ -4093,7 +4885,31 @@ function openAddAccountModal(prov) {
   if (r) r.checked = true;
   switchAddAccountProxyMode(defaultMode);
   updateAddAccProxyRegionHint();
+  const addProxyInput = document.getElementById("acc-proxy");
+  if (addProxyInput) addProxyInput.value = "";
+  updateProxyInputPreview("acc-proxy", "acc-proxy-format-status");
 }
+
+function updateCloudCredentialHint() {
+  const provider = document.getElementById("acc-provider")?.value;
+  const input = document.getElementById("acc-token");
+  const help = document.getElementById("acc-token-help");
+  const fields = document.getElementById("cloudferro-credential-fields");
+  if (!input || !help) return;
+  if (provider === "cloudferro") {
+    input.required = false;
+    input.classList.add("hidden");
+    if (fields) fields.classList.remove("hidden");
+    help.textContent = "Enter the three CloudFerro application-credential values below.";
+  } else {
+    input.required = true;
+    input.classList.remove("hidden");
+    if (fields) fields.classList.add("hidden");
+    input.placeholder = "Paste provider API token";
+    help.textContent = "Your provider API token is encrypted when saved.";
+  }
+}
+window.updateCloudCredentialHint = updateCloudCredentialHint;
 
 function openAddAccountModalFor(prov) {
   openAddAccountModal(prov);
@@ -4166,9 +4982,12 @@ function openAttachFipModal(fipId, accId, ipText) {
   document.getElementById("attach-fip-label").textContent = ipText;
 
   const targetSel = document.getElementById("attach-target-server-select");
-  const accServers = state.servers.filter(s => s.account_id === accId);
+  const account = state.accounts.find(a => a.id === Number(accId));
+  const accServers = state.servers.filter(s => s.account_id === Number(accId) &&
+    (account?.provider !== "upcloud" || isUpcloudStopped(s)));
   targetSel.innerHTML = `<option value="">Select target instance...</option>` +
     accServers.map(s => `<option value="${s.id}">${escapeHtml(s.name || s.label)} (${s.ip || 'No IP'})</option>`).join("");
+  if (!accServers.length && account?.provider === "upcloud") showToast("Stop an UpCloud server before attaching this IP.", "info");
 }
 
 function openOsConfigModal(ip) {
@@ -4218,8 +5037,78 @@ function navigateFromModalToAccount() {
   }
 }
 
-function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
-  currentServerModal = { server: s, floating_ips: fips, primary_ips: pips, linode_networking: linodeNet };
+function renderUpcloudNetworking(network, isRunning) {
+  const list = document.getElementById("srvmodal-upcloud-network-list");
+  const note = document.getElementById("srvmodal-upcloud-network-note");
+  if (!list) return;
+  if (note) note.textContent = isRunning
+    ? "Stop this server before adding or removing interface IPs."
+    : "Interface IP changes take effect through UpCloud; configure the guest OS as needed.";
+  const interfaces = network && Array.isArray(network.interfaces) ? network.interfaces : [];
+  if (!network) {
+    list.innerHTML = '<span class="text-xs text-secondary">Network details unavailable. Refresh interfaces to retry.</span>';
+    return;
+  }
+  if (!interfaces.length) {
+    list.innerHTML = '<span class="text-xs text-secondary">No network interfaces reported.</span>';
+    return;
+  }
+  list.innerHTML = interfaces.map((iface, position) => {
+    const index = Number(iface.index ?? position);
+    const ips = Array.isArray(iface.ip_addresses) ? iface.ip_addresses : [];
+    return `<div class="upcloud-interface-card">
+      <div class="flex items-center justify-between gap-2 flex-wrap"><strong>Interface ${index}</strong><span class="text-xs text-secondary">${escapeHtml(iface.type || iface.network || 'Network')}</span></div>
+      <div class="upcloud-interface-ips">${ips.length ? ips.map(ip => {
+        const address = ipAddress(ip);
+        return `<div class="flex items-center justify-between gap-2 flex-wrap"><code class="font-mono text-xs">${escapeHtml(address)}</code><span class="text-xs text-secondary">${escapeHtml(ip.family || '')}${ip.floating ? ' · Floating' : ''}</span>${isRunning || ip.floating ? '' : `<button type="button" class="btn btn-danger btn-xs" onclick="removeUpcloudInterfaceIp(${index}, '${escapeHtml(address)}')">Remove IP</button>`}</div>`;
+      }).join('') : '<span class="text-xs text-muted">No IP addresses</span>'}</div>
+      ${isRunning ? '' : `<div class="flex gap-2 mt-2"><button type="button" class="btn btn-secondary btn-xs" onclick="addUpcloudInterfaceIp(${index}, 'IPv4')">+ IPv4</button><button type="button" class="btn btn-secondary btn-xs" onclick="addUpcloudInterfaceIp(${index}, 'IPv6')">+ IPv6</button></div>`}
+    </div>`;
+  }).join('');
+}
+
+async function refreshUpcloudNetworking() {
+  if (!currentServerModal || currentServerModal.server.provider !== "upcloud") return;
+  const list = document.getElementById("srvmodal-upcloud-network-list");
+  if (list) list.textContent = "Loading UpCloud interfaces…";
+  try {
+    const res = await api("upcloud_networking", { account_id: currentServerModalAccId, server_id: String(currentServerModalSrvId) }, { retryMode: "read" });
+    currentServerModal.upcloud_networking = res.networking;
+    renderUpcloudNetworking(res.networking, !isUpcloudStopped(currentServerModal.server));
+  } catch (err) {
+    if (list) list.textContent = `Could not load UpCloud interfaces: ${err.message}`;
+  }
+}
+
+function addUpcloudInterfaceIp(interfaceIndex, family) {
+  if (!currentServerModal || !isUpcloudStopped(currentServerModal.server)) return;
+  confirmAction(`Add ${family} address to UpCloud interface ${interfaceIndex}?`, "ADD_INTERFACE_IP", async () => {
+    try {
+      await api("upcloud_add_interface_ip", { account_id: currentServerModalAccId, server_id: String(currentServerModalSrvId), interface_index: interfaceIndex, family, confirm: "ADD_INTERFACE_IP" });
+      showToast(`${family} address added.`, "success");
+      await loadAll();
+      await refreshUpcloudNetworking();
+    } catch (err) { showToast(err.message, "error"); }
+  });
+}
+
+function removeUpcloudInterfaceIp(interfaceIndex, address) {
+  if (!currentServerModal || !isUpcloudStopped(currentServerModal.server)) return;
+  confirmAction(`Remove ${address} from UpCloud interface ${interfaceIndex}?`, "REMOVE_INTERFACE_IP", async () => {
+    try {
+      await api("upcloud_remove_interface_ip", { account_id: currentServerModalAccId, server_id: String(currentServerModalSrvId), interface_index: interfaceIndex, address, confirm: "REMOVE_INTERFACE_IP" });
+      showToast(`Address ${address} removed.`, "success");
+      await loadAll();
+      await refreshUpcloudNetworking();
+    } catch (err) { showToast(err.message, "error"); }
+  });
+}
+
+function populateServerModalData(s, fips = [], pips = [], linodeNet = null, upcloudNet = null) {
+  if (s.provider === "upcloud") {
+    fips = fips.map(f => ({ ...f, id: ipId(f), ip: ipAddress(f), type: f.type || f.family || "IPv4" }));
+  }
+  currentServerModal = { server: s, floating_ips: fips, primary_ips: pips, linode_networking: linodeNet, upcloud_networking: upcloudNet };
 
   const isRunning = isServerRunning(s.status);
   const label = s.name || s.label || s.id;
@@ -4241,7 +5130,8 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
   if (s.provider === "hetzner") provIcon.innerHTML = `🇩🇪`;
   else if (s.provider === "vultr") provIcon.innerHTML = `<img src="/ui/assets/vultr.svg" width="22" height="22" class="object-contain" alt="Vultr">`;
   else if (s.provider === "linode") provIcon.innerHTML = `<img src="/ui/assets/linode.svg" width="22" height="22" class="object-contain" alt="Linode">`;
-  else provIcon.innerHTML = `☁️`;
+  else if (s.provider === "upcloud") provIcon.innerHTML = `<img src="/ui/assets/cloud.svg" alt="">`;
+  else provIcon.innerHTML = `<img src="/ui/assets/cloud.svg" alt="">`;
 
   // Primary IP
   const serverIpv4 = Array.isArray(s.ipv4) ? s.ipv4[0] : s.ipv4;
@@ -4252,7 +5142,7 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
   // Region & Flag
   const countryCode = s.country || (s.region ? s.region.slice(0, 2) : "");
   const regInfo = formatRegion(countryCode || s.region);
-  document.getElementById("srvmodal-region-flag").textContent = regInfo.flag || "🌐";
+  document.getElementById("srvmodal-region-flag").textContent = regInfo.flag || "";
   document.getElementById("srvmodal-region-name").textContent = s.region || "Default";
   document.getElementById("srvmodal-country-name").textContent = regInfo.name || (s.region || "—");
 
@@ -4276,11 +5166,17 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
     featureNote.textContent = hasBackup ? "Automated snapshot protection enabled" : "No active backup snapshots";
     backupBtn.classList.remove("hidden");
     backupBtn.style.display = "inline-flex";
-    backupBtn.textContent = hasBackup ? "💾 Disable" : "💾 Enable";
+    backupBtn.textContent = hasBackup ? "Disable" : "Enable";
   } else if (s.provider === "hetzner") {
     featureStatus.className = "badge badge-primary text-xs";
     featureStatus.textContent = "Hetzner Cloud";
     featureNote.textContent = "Primary & Floating IPs supported";
+    backupBtn.classList.add("hidden");
+    backupBtn.style.display = "none";
+  } else if (s.provider === "upcloud") {
+    featureStatus.className = "badge badge-upcloud text-xs";
+    featureStatus.textContent = "UpCloud";
+    featureNote.textContent = "Floating IPs and network interfaces; stop server before network changes";
     backupBtn.classList.add("hidden");
     backupBtn.style.display = "none";
   } else {
@@ -4292,11 +5188,13 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
   }
 
   // SSH Commands
-  document.getElementById("srvmodal-ssh-box").textContent = `ssh root@${mainIp}`;
+  const sshUser = s.provider === "cloudferro" ? "eouser" : "root";
+  document.getElementById("srvmodal-cloudferro-network-help")?.classList.toggle("hidden", s.provider !== "cloudferro");
+  document.getElementById("srvmodal-ssh-box").textContent = `ssh ${sshUser}@${mainIp}`;
   if (currentServerModalPw) {
-    document.getElementById("srvmodal-sshpass-box").textContent = `sshpass -p '${currentServerModalPw}' ssh -o StrictHostKeyChecking=no root@${mainIp}`;
+    document.getElementById("srvmodal-sshpass-box").textContent = `sshpass -p '${currentServerModalPw}' ssh -o StrictHostKeyChecking=no ${sshUser}@${mainIp}`;
   } else {
-    document.getElementById("srvmodal-sshpass-box").textContent = `sshpass -p '<password>' ssh -o StrictHostKeyChecking=no root@${mainIp}`;
+    document.getElementById("srvmodal-sshpass-box").textContent = `sshpass -p '<password>' ssh -o StrictHostKeyChecking=no ${sshUser}@${mainIp}`;
   }
 
   // Root Password Preview
@@ -4342,6 +5240,12 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
   const osGuideIcon = document.getElementById("srvmodal-os-guide-icon");
   const osGuideTitle = document.getElementById("srvmodal-os-guide-title");
   const osGuideText = document.getElementById("srvmodal-os-guide-text");
+  const upcloudNetworkSection = document.getElementById("srvmodal-upcloud-networking");
+  if (upcloudNetworkSection) {
+    upcloudNetworkSection.classList.toggle("hidden", s.provider !== "upcloud");
+    upcloudNetworkSection.style.display = s.provider === "upcloud" ? "block" : "none";
+  }
+  if (s.provider === "upcloud") renderUpcloudNetworking(upcloudNet, !isUpcloudStopped(s));
 
   if (s.provider === "linode") {
     // Hide floating IP allocate & attach buttons
@@ -4367,11 +5271,10 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
       ipCardsHtml += `
         <div class="attached-fip-card">
           <div class="flex items-center gap-2">
-            <span class="text-lg">🌐</span>
-            <div>
+                        <div>
               <div class="flex items-center gap-2">
                 <code class="font-mono font-bold text-sm text-primary">${escapeHtml(ip)}</code>
-                <button type="button" class="btn btn-xs btn-secondary" onclick="copyText('${escapeHtml(ip)}')" title="Copy IP">📋</button>
+                <button type="button" class="btn btn-xs btn-secondary" onclick="copyText('${escapeHtml(ip)}')" title="Copy IP" aria-label="Copy IP">${icon('copy')}</button>
                 <span class="badge badge-primary text-xs uppercase">${idx === 0 ? 'Primary IPv4' : 'Secondary IPv4'}</span>
               </div>
               <div class="text-xs text-secondary mt-0.5">Interface eth0 · Public Routing · Region ${escapeHtml(s.region || '—')}</div>
@@ -4388,11 +5291,10 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
       ipCardsHtml += `
         <div class="attached-fip-card">
           <div class="flex items-center gap-2">
-            <span class="text-lg">🪐</span>
-            <div>
+                        <div>
               <div class="flex items-center gap-2">
                 <code class="font-mono font-bold text-sm text-primary truncate max-w-xs">${escapeHtml(pubIpv6)}</code>
-                <button type="button" class="btn btn-xs btn-secondary" onclick="copyText('${escapeHtml(pubIpv6)}')" title="Copy IPv6">📋</button>
+                <button type="button" class="btn btn-xs btn-secondary" onclick="copyText('${escapeHtml(pubIpv6)}')" title="Copy IPv6" aria-label="Copy IPv6">${icon('copy')}</button>
                 <span class="badge text-xs uppercase">IPv6 SLAAC</span>
               </div>
               <div class="text-xs text-secondary mt-0.5">Global SLAAC /64 block</div>
@@ -4414,7 +5316,7 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
     if (swapBtn) {
       if (peerLinodes.length > 0) {
         swapBtn.style.display = "inline-flex";
-        swapBtn.textContent = `🔄 Swap IP with Regional Peer (${peerLinodes.length} available)`;
+        swapBtn.textContent = `Swap IP with Regional Peer (${peerLinodes.length} available)`;
       } else {
         swapBtn.style.display = "none";
       }
@@ -4433,9 +5335,9 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
       `;
     }
   } else {
-    // Hetzner or Vultr
-    if (btnAddFip) btnAddFip.classList.remove("hidden");
-    if (btnAttachFip) btnAttachFip.classList.remove("hidden");
+    // Floating IP providers
+    if (btnAddFip) btnAddFip.classList.toggle("hidden", !providerSupports(s.provider, "floating_ip") || (s.provider === "upcloud" && !isUpcloudStopped(s)));
+    if (btnAttachFip) btnAttachFip.classList.toggle("hidden", !providerSupports(s.provider, "floating_ip") || (s.provider === "upcloud" && !isUpcloudStopped(s)));
     if (fipsSection) fipsSection.classList.remove("hidden");
     if (linodeSection) linodeSection.classList.add("hidden");
 
@@ -4456,20 +5358,23 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
         </div>
       `;
     } else {
-      if (fipsSelectRow) fipsSelectRow.style.display = "flex";
+      if (fipsSelectRow) fipsSelectRow.style.display = s.provider === "upcloud" && !isUpcloudStopped(s) ? "none" : "flex";
+      if (s.provider === "upcloud" && !isUpcloudStopped(s)) {
+        const bulkBar = document.getElementById("srvmodal-fip-bulk-bar");
+        if (bulkBar) bulkBar.style.display = "none";
+      }
       const accIdForFip = s.account_id || currentServerModalAccId;
       fipsListContainer.innerHTML = fips.map(f => {
-        const fipVal = f.ip || f.ip_address || f.subnet || f.network || f.id;
+        const fipVal = ipAddress(f);
         const isSelected = state.selectedServerModalFips && state.selectedServerModalFips.has(String(f.id));
         return `
           <div class="attached-fip-card ${isSelected ? 'selected' : ''}" id="srvmodal-fip-card-${f.id}">
             <div class="flex items-center gap-3">
-              <input type="checkbox" class="cb-srvmodal-fip checkbox-input" data-fip-id="${f.id}" data-fip-ip="${escapeHtml(fipVal)}" ${isSelected ? 'checked' : ''} onchange="toggleServerModalFipSelection('${f.id}', '${escapeHtml(fipVal)}', this)" title="Select this IP for batch action">
-              <span class="text-lg">🌐</span>
-              <div>
+              ${s.provider === 'upcloud' && !isUpcloudStopped(s) ? '' : `<input type="checkbox" class="cb-srvmodal-fip checkbox-input" data-fip-id="${f.id}" data-fip-ip="${escapeHtml(fipVal)}" ${isSelected ? 'checked' : ''} onchange="toggleServerModalFipSelection('${f.id}', '${escapeHtml(fipVal)}', this)" title="Select this IP for batch action">`}
+                            <div>
                 <div class="flex items-center gap-2 flex-wrap">
                   <code class="font-mono font-bold text-sm text-primary">${escapeHtml(fipVal)}</code>
-                  <button type="button" class="btn btn-xs btn-secondary" onclick="copyText('${escapeHtml(fipVal)}')" title="Copy IP">📋</button>
+                  <button type="button" class="btn btn-xs btn-secondary" onclick="copyText('${escapeHtml(fipVal)}')" title="Copy IP" aria-label="Copy IP">${icon('copy')}</button>
                   <span class="badge text-xs uppercase">${f.type || 'ipv4'}</span>
                 </div>
                 <div class="text-xs text-secondary mt-0.5">${escapeHtml(f.description || f.name || f.dns_ptr || 'Attached Floating IP')}</div>
@@ -4477,16 +5382,15 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
             </div>
             <div class="flex items-center gap-2 flex-wrap">
               <button type="button" class="btn btn-secondary btn-sm" onclick="openOsConfigModal('${escapeHtml(fipVal)}')">Netplan / Config</button>
-              <button type="button" class="btn btn-secondary btn-sm" onclick="unassignFloatingIpFromModal(${accIdForFip}, '${f.id}', '${escapeHtml(fipVal)}')">🔓 Detach</button>
-              <button type="button" class="btn btn-danger btn-sm" onclick="detachAndDeleteFloatingIpFromModal(${accIdForFip}, '${f.id}', '${escapeHtml(fipVal)}')">🗑️ Detach & Delete</button>
+              ${s.provider === 'upcloud' && !isUpcloudStopped(s) ? '<span class="text-xs text-warning">Stop server to change IPs</span>' : `<button type="button" class="btn btn-secondary btn-sm" onclick="unassignFloatingIpFromModal(${accIdForFip}, '${ipId(f)}', '${escapeHtml(fipVal)}')">Detach</button><button type="button" class="btn btn-danger btn-sm" onclick="detachAndDeleteFloatingIpFromModal(${accIdForFip}, '${ipId(f)}', '${escapeHtml(fipVal)}')">Detach & Delete</button>`}
             </div>
           </div>
         `;
       }).join("");
-      updateServerModalFipBulkBar();
+      if (!(s.provider === "upcloud" && !isUpcloudStopped(s))) updateServerModalFipBulkBar();
     }
 
-    if (osGuideIcon) osGuideIcon.textContent = "💡";
+    if (osGuideIcon) osGuideIcon.textContent = "";
     if (osGuideTitle) osGuideTitle.textContent = "Guest OS Network Activation";
     if (osGuideText) {
       osGuideText.innerHTML = `
@@ -4498,11 +5402,11 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null) {
 
   // Footer Power Button
   const powerBtn = document.getElementById("btn-srvmodal-power");
-  powerBtn.textContent = isRunning ? "⏹ Halt / Shutdown" : "▶️ Power On / Boot";
+  powerBtn.textContent = isRunning ? "Halt / Shutdown" : "▶️ Power On / Boot";
   powerBtn.className = isRunning ? "btn btn-secondary btn-sm" : "btn btn-primary btn-sm";
 }
 
-async function openServerDetailsModal(accId, srvId) {
+async function openServerDetailsModal(accId, srvId, forceRefresh = false) {
   // Ensure accId is resolved
   if (!accId) {
     const found = state.servers.find(x => String(x.id) === String(srvId));
@@ -4514,7 +5418,7 @@ async function openServerDetailsModal(accId, srvId) {
   clearServerModalFipSelection();
 
   // 1. Instant render from local cache if present
-  const cachedSrv = state.servers.find(x => String(x.id) === String(srvId));
+    const cachedSrv = state.servers.find(x => String(x.id) === String(srvId) && String(x.account_id) === String(accId));
   if (cachedSrv) {
     populateServerModalData(cachedSrv, cachedSrv.floating_ips || [], []);
   } else {
@@ -4526,7 +5430,7 @@ async function openServerDetailsModal(accId, srvId) {
     document.getElementById("srvmodal-id-text").textContent = `ID: ${srvId}`;
     document.getElementById("srvmodal-primary-ip").textContent = "...";
     document.getElementById("srvmodal-ipv6-sub").textContent = "IPv6: ...";
-    document.getElementById("srvmodal-region-flag").textContent = "🌐";
+    document.getElementById("srvmodal-region-flag").textContent = "";
     document.getElementById("srvmodal-region-name").textContent = "...";
     document.getElementById("srvmodal-country-name").textContent = "...";
     document.getElementById("srvmodal-plan").textContent = "...";
@@ -4534,8 +5438,9 @@ async function openServerDetailsModal(accId, srvId) {
     document.getElementById("srvmodal-feature-status").textContent = "Standard";
     document.getElementById("srvmodal-feature-note").textContent = "...";
     document.getElementById("btn-toggle-vultr-backup").classList.add("hidden");
-    document.getElementById("srvmodal-ssh-box").textContent = `ssh root@...`;
-    document.getElementById("srvmodal-sshpass-box").textContent = `sshpass -p '••••••' ssh -o StrictHostKeyChecking=no root@...`;
+    document.getElementById("srvmodal-ssh-box").textContent = `ssh eouser@...`;
+    document.getElementById("srvmodal-sshpass-box").textContent = `sshpass -p '••••••' ssh -o StrictHostKeyChecking=no eouser@...`;
+    document.getElementById("srvmodal-cloudferro-network-help")?.classList.add("hidden");
     document.getElementById("srvmodal-preview-password").textContent = "••••••••••••••••";
     document.getElementById("srvmodal-full-password").textContent = "••••••••••••••••";
     document.getElementById("srvmodal-ips-badge").textContent = "0";
@@ -4547,11 +5452,19 @@ async function openServerDetailsModal(accId, srvId) {
   switchSrvModalTab("overview");
   openModal("modal-server-details");
 
-  // 2. Fetch live data from server
+  if (!forceRefresh) {
+    if (!cachedSrv) {
+      document.getElementById("srvmodal-label").textContent = "No saved details. Press Refresh to fetch this server.";
+      document.getElementById("srvmodal-status-badge").textContent = "Not fetched";
+      document.getElementById("srvmodal-fips-list").textContent = "Press Refresh to fetch network details.";
+    }
+    return;
+  }
+  // Fetch live details only after an explicit refresh.
   try {
     const res = await api("server", { account_id: accId, server_id: srvId });
     if (res && res.server) {
-      populateServerModalData(res.server, res.floating_ips || [], res.primary_ips || [], res.linode_networking);
+      populateServerModalData(res.server, res.floating_ips || [], res.primary_ips || [], res.linode_networking, res.upcloud_networking);
     }
   } catch (err) {
     if (!cachedSrv) {
@@ -4562,7 +5475,7 @@ async function openServerDetailsModal(accId, srvId) {
 
 function refreshCurrentServerDetailsModal() {
   if (currentServerModalAccId && currentServerModalSrvId) {
-    openServerDetailsModal(currentServerModalAccId, currentServerModalSrvId);
+    openServerDetailsModal(currentServerModalAccId, currentServerModalSrvId, true);
   }
 }
 
@@ -4700,6 +5613,8 @@ function openAllocateFipForServerModal() {
   const s = currentServerModal.server;
   document.getElementById("server-alloc-srv-name").textContent = s.name || s.label || s.id;
   const ipv6Opt = document.getElementById("server-alloc-opt-ipv6");
+  const upcloudPolicy = document.getElementById("server-alloc-upcloud-policy-wrap");
+  if (upcloudPolicy) upcloudPolicy.classList.toggle("hidden", s.provider !== "upcloud");
   if (s.provider === "hetzner") {
     if (ipv6Opt) ipv6Opt.style.display = "";
   } else {
@@ -4719,17 +5634,24 @@ function openAllocateFipForServerModal() {
   if (footer) footer.style.display = "";
   if (submitBtn) {
     submitBtn.disabled = false;
-    submitBtn.innerHTML = "⚡ Allocate & Attach";
+    submitBtn.innerHTML = "Allocate & Attach";
   }
   if (cancelBtn) cancelBtn.disabled = false;
 
   openModal("modal-server-alloc-ip");
 }
 
-async function submitAllocateFipForServer(e) {
+async function submitAllocateFipForServer(e, confirmed = false) {
   if (e) e.preventDefault();
   if (!currentServerModalAccId || !currentServerModalSrvId) return;
   const ipType = document.getElementById("server-alloc-ip-type").value;
+  if (!confirmed) {
+    const policy = currentServerModal.server.provider === "upcloud"
+      ? document.getElementById("server-alloc-upcloud-policy").value : "provider default";
+    confirmAction(`Allocate and attach a ${ipType} Floating IP with release policy ${policy}?`,
+      "CREATE_FLOATING_IP", () => submitAllocateFipForServer(null, true));
+    return;
+  }
 
   const submitBtn = document.getElementById("btn-submit-server-alloc");
   const cancelBtn = document.getElementById("btn-cancel-server-alloc");
@@ -4746,7 +5668,7 @@ async function submitAllocateFipForServer(e) {
   if (cancelBtn) cancelBtn.disabled = true;
   if (formFields) formFields.style.display = "none";
   if (progressBox) progressBox.style.display = "";
-  if (progressMsg) progressMsg.textContent = "🌐 Contacting cloud provider...";
+  if (progressMsg) progressMsg.textContent = "Contacting cloud provider...";
 
   const progressTimer = setTimeout(() => {
     if (progressMsg) progressMsg.textContent = "Configuring floating IP routing...";
@@ -4755,14 +5677,16 @@ async function submitAllocateFipForServer(e) {
   try {
     const res = await api("create_floating_ip", {
       account_id: currentServerModalAccId,
-      server_id: currentServerModalSrvId,
+      server_id: String(currentServerModalSrvId),
       ip_type: ipType,
+      zone: currentServerModal.server.provider === "upcloud" ? currentServerModal.server.region : undefined,
+      release_policy: currentServerModal.server.provider === "upcloud" ? document.getElementById("server-alloc-upcloud-policy").value : undefined,
       confirm: "CREATE_FLOATING_IP"
     });
     clearTimeout(progressTimer);
 
     const fip = res.floating_ip || {};
-    const fipVal = fip.ip || fip.ip_address || fip.subnet || fip.network || 'Allocated IP';
+    const fipVal = ipAddress(fip) || 'Allocated IP';
     const isV6 = (fip.type === 'ipv6' || ipType === 'ipv6');
     const osCmd = isV6 ? `ip -6 addr add ${fipVal}/64 dev eth0` : `ip addr add ${fipVal}/32 dev eth0`;
     const s = currentServerModal ? currentServerModal.server : null;
@@ -4778,7 +5702,7 @@ async function submitAllocateFipForServer(e) {
       successBox.style.display = "";
       successBox.innerHTML = `
         <div class="p-4 text-center">
-          <div class="inline-flex items-center justify-center w-12 h-12 rounded-full mb-2" style="background: rgba(16, 185, 129, 0.15); font-size: 1.5rem;">✅</div>
+          <div class="inline-flex items-center justify-center w-12 h-12 rounded-full mb-2" style="background: rgba(16, 185, 129, 0.15); color: var(--success);">${icon('check')}</div>
           <h4 class="text-base font-bold text-primary">Floating IP Allocated & Attached!</h4>
           <p class="text-xs text-secondary mt-1">Successfully attached to <strong class="text-primary">${escapeHtml(srvLabel)}</strong></p>
 
@@ -4787,7 +5711,7 @@ async function submitAllocateFipForServer(e) {
               <div class="text-xs text-secondary font-medium">New Floating IP</div>
               <code class="font-mono text-lg font-bold text-primary">${escapeHtml(fipVal)}</code>
             </div>
-            <button type="button" class="btn btn-sm btn-secondary" onclick="copyText('${escapeHtml(fipVal)}')">📋 Copy IP</button>
+            <button type="button" class="btn btn-sm btn-secondary" onclick="copyText('${escapeHtml(fipVal)}')">Copy IP</button>
           </div>
 
           <div class="p-3 bg-surface rounded-md border border-subtle text-left mb-4">
@@ -4801,7 +5725,7 @@ async function submitAllocateFipForServer(e) {
 
           <div class="flex items-center justify-center gap-2 pt-2">
             <button type="button" class="btn btn-secondary btn-sm" onclick="closeModal('modal-server-alloc-ip')">Close</button>
-            <button type="button" class="btn btn-primary btn-sm" onclick="closeModal('modal-server-alloc-ip'); refreshCurrentServerDetailsModal();">🖥️ View Server Details</button>
+            <button type="button" class="btn btn-primary btn-sm" onclick="closeModal('modal-server-alloc-ip'); refreshCurrentServerDetailsModal();">View Server Details</button>
           </div>
         </div>
       `;
@@ -4813,7 +5737,7 @@ async function submitAllocateFipForServer(e) {
     if (formFields) formFields.style.display = "";
     if (submitBtn) {
       submitBtn.disabled = false;
-      submitBtn.innerHTML = "⚡ Allocate & Attach";
+      submitBtn.innerHTML = "Allocate & Attach";
     }
     if (cancelBtn) cancelBtn.disabled = false;
   }
@@ -4822,6 +5746,10 @@ async function submitAllocateFipForServer(e) {
 function openAttachExistingFipForServerModal() {
   if (!currentServerModal || !currentServerModal.server) return;
   const s = currentServerModal.server;
+  if (s.provider === "upcloud" && !isUpcloudStopped(s)) {
+    showToast("Stop this UpCloud server before attaching an IP.", "info");
+    return;
+  }
   document.getElementById("server-attach-existing-srv-name").textContent = s.name || s.label || s.id;
 
   // Filter floating IPs belonging to this account that are unassigned
@@ -4837,19 +5765,25 @@ function openAttachExistingFipForServerModal() {
   openModal("modal-server-attach-existing-ip");
 }
 
-async function submitAttachExistingFipForServer(e) {
+async function submitAttachExistingFipForServer(e, confirmed = false) {
   if (e) e.preventDefault();
   if (!currentServerModalAccId || !currentServerModalSrvId) return;
   const fipId = document.getElementById("server-attach-existing-select").value;
   if (!fipId) return;
+  if (!confirmed) {
+    confirmAction(`Attach Floating IP ${fipId} to this server?`, "ASSIGN_FLOATING_IP",
+      () => submitAttachExistingFipForServer(null, true));
+    return;
+  }
   const btn = document.getElementById("btn-submit-server-attach-existing");
 
   await runWithButtonLoading(btn, async () => {
     try {
       await api("assign_floating_ip", {
         account_id: currentServerModalAccId,
-        server_id: currentServerModalSrvId,
-        floating_id: fipId
+        server_id: String(currentServerModalSrvId),
+        floating_id: fipId,
+        confirm: "ASSIGN_FLOATING_IP"
       });
       showToast("Floating IP successfully attached to instance!", "success");
       closeModal("modal-server-attach-existing-ip");
@@ -4862,9 +5796,9 @@ async function submitAttachExistingFipForServer(e) {
 }
 
 async function unassignFloatingIpFromModal(accId, fipId, fipIp) {
-  confirmAction(`Detach floating IP ${fipIp} from this server?`, "DETACH", async () => {
+  confirmAction(`Detach floating IP ${fipIp} from this server?`, "UNASSIGN_FLOATING_IP", async () => {
     try {
-      await api("unassign_floating_ip", { account_id: accId, floating_id: fipId });
+      await api("unassign_floating_ip", { account_id: accId, floating_id: fipId, confirm: "UNASSIGN_FLOATING_IP" });
       showToast("Floating IP detached.", "success");
       if (state.selectedServerModalFips) {
         state.selectedServerModalFips.delete(String(fipId));
@@ -4999,7 +5933,7 @@ async function detachSelectedFipsFromModal(btn) {
   const confirmed = await confirmAction({
     title: `Detach ${count} Floating IPs?`,
     message: `Detach ${count} floating IP${count > 1 ? 's' : ''} (${escapeHtml(ipList)}) from this server? They will remain available in your cloud account pool.`,
-    expectedWord: "DETACH",
+    expectedWord: "UNASSIGN_FLOATING_IP",
     confirmText: "Detach IPs",
     isDanger: false
   });
@@ -5013,7 +5947,7 @@ async function detachSelectedFipsFromModal(btn) {
     for (let i = 0; i < items.length; i++) {
       const item = items[i];
       try {
-        await api("unassign_floating_ip", { account_id: item.accId, floating_id: item.id });
+        await api("unassign_floating_ip", { account_id: item.accId, floating_id: item.id, confirm: "UNASSIGN_FLOATING_IP" });
         successCount++;
         state.selectedServerModalFips.delete(String(item.id));
       } catch (err) {
@@ -5182,10 +6116,13 @@ function initForms() {
     const accId = deployAccSel.value;
     if (!accId) {
       resetDeploySelectors();
+      updateDeployContextBanner(state.deploySelectedProvider, null);
       return;
     }
 
     const acc = state.accounts.find(a => a.id === parseInt(accId));
+    updateDeployContextBanner(acc ? acc.provider : state.deploySelectedProvider, accId);
+
     const hetznerOpts = document.getElementById("deploy-hetzner-options");
     if (hetznerOpts) {
       hetznerOpts.style.display = (acc && acc.provider === "hetzner") ? "block" : "none";
@@ -5202,8 +6139,15 @@ function initForms() {
         regions.map(r => `<option value="${r.id}">${escapeHtml(r.label || r.id)}</option>`).join("");
       regSel.disabled = false;
       const acc = state.accounts.find(a => a.id === parseInt(accId));
+      let targetReg = null;
       if (acc && acc.region && regions.some(r => r.id === acc.region)) {
-        regSel.value = acc.region;
+        targetReg = acc.region;
+      } else if (regions.length > 0) {
+        const pop = regions.find(r => ["fsn1", "nbg1", "hel1", "fra", "ams", "ewr", "ord", "fra1"].includes(String(r.id).toLowerCase()));
+        targetReg = pop ? pop.id : regions[0].id;
+      }
+      if (targetReg) {
+        regSel.value = targetReg;
         regSel.dispatchEvent(new Event("change"));
       }
     } else {
@@ -5211,31 +6155,50 @@ function initForms() {
       regSel.innerHTML = `<option value="">Loading regions...</option>`;
       try {
         const regions = await getCachedRegions(accId);
-        regSel.innerHTML = `<option value="">Choose region...</option>` +
-          regions.map(r => `<option value="${r.id}">${escapeHtml(r.label || r.id)}</option>`).join("");
-        regSel.disabled = false;
-        const acc = state.accounts.find(a => a.id === parseInt(accId));
-        if (acc && acc.region && regions.some(r => r.id === acc.region)) {
-          regSel.value = acc.region;
-          regSel.dispatchEvent(new Event("change"));
+        if (deployAccSel.value === accId) {
+          regSel.innerHTML = `<option value="">Choose region...</option>` +
+            regions.map(r => `<option value="${r.id}">${escapeHtml(r.label || r.id)}</option>`).join("");
+          regSel.disabled = false;
+          const acc = state.accounts.find(a => a.id === parseInt(accId));
+          let targetReg = null;
+          if (acc && acc.region && regions.some(r => r.id === acc.region)) {
+            targetReg = acc.region;
+          } else if (regions.length > 0) {
+            const pop = regions.find(r => ["fsn1", "nbg1", "hel1", "fra", "ams", "ewr", "ord", "fra1"].includes(String(r.id).toLowerCase()));
+            targetReg = pop ? pop.id : regions[0].id;
+          }
+          if (targetReg) {
+            regSel.value = targetReg;
+            regSel.dispatchEvent(new Event("change"));
+          }
         }
       } catch (e) {
         regSel.innerHTML = `<option value="">Failed loading regions</option>`;
       }
     }
 
-    // Instant population if images cached
-    if (state.imagesCache[accId]) {
+    // UpCloud templates are zone-specific, so wait for a selected zone before
+    // requesting or displaying their catalog.
+    const selectedAccount = state.accounts.find(a => String(a.id) === String(accId));
+    const isUpcloud = selectedAccount?.provider === "upcloud";
+    if (isUpcloud) {
+      imgSel.innerHTML = `<option value="">Choose zone first...</option>`;
+      imgSel.disabled = true;
+    } else if (state.imagesCache[accId]) {
       const images = state.imagesCache[accId];
       imgSel.innerHTML = `<option value="">Choose image...</option>` +
         images.map(i => `<option value="${i.id}">${escapeHtml(i.label || i.id)}</option>`).join("");
       imgSel.disabled = false;
-    } else {
+      const defImg = pickDefaultImage(images);
+      if (defImg && imgSel.options.length > 1) imgSel.value = defImg;
+    } else if (!isUpcloud) {
       getCachedImages(accId).then(images => {
         if (deployAccSel.value === accId) {
           imgSel.innerHTML = `<option value="">Choose image...</option>` +
             images.map(i => `<option value="${i.id}">${escapeHtml(i.label || i.id)}</option>`).join("");
           imgSel.disabled = false;
+          const defImg = pickDefaultImage(images);
+          if (defImg && imgSel.options.length > 1) imgSel.value = defImg;
         }
       }).catch(() => {});
     }
@@ -5251,6 +6214,7 @@ function initForms() {
     const planSel = document.getElementById("deploy-plan-select");
     const imgSel = document.getElementById("deploy-image-select");
     const cacheKey = `${accId}:${region}`;
+    const selectedAccount = state.accounts.find(a => String(a.id) === String(accId));
 
     // If cached plans exist, populate IMMEDIATELY (zero delay/wait!)
     if (state.plansCache[cacheKey]) {
@@ -5258,6 +6222,8 @@ function initForms() {
       planSel.innerHTML = `<option value="">Choose plan...</option>` +
         plans.map(p => `<option value="${p.id}">${escapeHtml(p.label || p.id)}</option>`).join("");
       planSel.disabled = false;
+      const defPlan = pickDefaultPlan(plans, selectedAccount?.provider);
+      if (defPlan) planSel.value = defPlan;
     } else {
       planSel.disabled = true;
       planSel.innerHTML = `<option value="">Loading plans...</option>`;
@@ -5267,6 +6233,8 @@ function initForms() {
           planSel.innerHTML = `<option value="">Choose plan...</option>` +
             plans.map(p => `<option value="${p.id}">${escapeHtml(p.label || p.id)}</option>`).join("");
           planSel.disabled = false;
+          const defPlan = pickDefaultPlan(plans, selectedAccount?.provider);
+          if (defPlan) planSel.value = defPlan;
         }
       } catch (e) {
         showToast("Error loading plans", "error");
@@ -5275,19 +6243,27 @@ function initForms() {
     }
 
     // Ensure images are populated
-    if (state.imagesCache[accId]) {
-      const images = state.imagesCache[accId];
+    const isUpcloud = selectedAccount?.provider === "upcloud";
+    const imageCacheKey = isUpcloud ? `${accId}:${region}` : accId;
+    if (state.imagesCache[imageCacheKey]) {
+      const images = state.imagesCache[imageCacheKey];
       imgSel.innerHTML = `<option value="">Choose image...</option>` +
         images.map(i => `<option value="${i.id}">${escapeHtml(i.label || i.id)}</option>`).join("");
       imgSel.disabled = false;
-    } else if (imgSel.options.length <= 1) {
+      const defImg = pickDefaultImage(images);
+      if (defImg) imgSel.value = defImg;
+    } else if (isUpcloud || imgSel.options.length <= 1) {
       imgSel.disabled = true;
-      imgSel.innerHTML = `<option value="">Loading OS images...</option>`;
+      imgSel.innerHTML = `<option value="">${isUpcloud ? "Loading zone-compatible templates..." : "Loading OS images..."}</option>`;
       try {
-        const images = await getCachedImages(accId);
-        imgSel.innerHTML = `<option value="">Choose image...</option>` +
-          images.map(i => `<option value="${i.id}">${escapeHtml(i.label || i.id)}</option>`).join("");
-        imgSel.disabled = false;
+        const images = await getCachedImages(accId, isUpcloud ? region : null);
+        if (deployRegSel.value === region && String(deployAccSel.value) === String(accId)) {
+          imgSel.innerHTML = `<option value="">Choose image...</option>` +
+            images.map(i => `<option value="${i.id}">${escapeHtml(i.label || i.id)}</option>`).join("");
+          imgSel.disabled = false;
+          const defImg = pickDefaultImage(images);
+          if (defImg) imgSel.value = defImg;
+        }
       } catch (e) {
         imgSel.innerHTML = `<option value="">Failed loading images</option>`;
       }
@@ -5367,12 +6343,22 @@ function initForms() {
   });
 
   // Allocate IP submit
+  let allocIpConfirmed = false;
   document.getElementById("form-alloc-ip").addEventListener("submit", async (e) => {
     e.preventDefault();
     const accId = parseInt(document.getElementById("alloc-account-select").value);
     const ipType = document.getElementById("alloc-type-select").value;
     const srvId = document.getElementById("alloc-server-select").value || null;
     const loc = document.getElementById("alloc-location-select").value || "fsn1";
+    if (!allocIpConfirmed) {
+      const form = document.getElementById("form-alloc-ip");
+      const account = state.accounts.find(a => Number(a.id) === accId);
+      const provider = account?.provider || "cloud";
+      confirmAction(`Allocate a ${ipType} Floating IP${srvId ? ` and attach it to server ${srvId}` : ""} on ${provider}?`,
+        "CREATE_FLOATING_IP", () => { allocIpConfirmed = true; form.requestSubmit(); });
+      return;
+    }
+    allocIpConfirmed = false;
 
     const submitBtn = document.getElementById("btn-submit-alloc-ip");
     const cancelBtn = document.getElementById("btn-cancel-alloc-ip");
@@ -5389,7 +6375,7 @@ function initForms() {
     if (cancelBtn) cancelBtn.disabled = true;
     if (formFields) formFields.style.display = "none";
     if (progressBox) progressBox.style.display = "";
-    if (progressMsg) progressMsg.textContent = "🌐 Contacting cloud provider...";
+    if (progressMsg) progressMsg.textContent = "Contacting cloud provider...";
 
     const progressTimer = setTimeout(() => {
       if (progressMsg) progressMsg.textContent = "Configuring floating IP routing...";
@@ -5421,7 +6407,7 @@ function initForms() {
         successBox.style.display = "";
         successBox.innerHTML = `
           <div class="p-4 text-center">
-            <div class="inline-flex items-center justify-center w-12 h-12 rounded-full mb-2" style="background: rgba(16, 185, 129, 0.15); font-size: 1.5rem;">✅</div>
+            <div class="inline-flex items-center justify-center w-12 h-12 rounded-full mb-2" style="background: rgba(16, 185, 129, 0.15); color: var(--success);">${icon('check')}</div>
             <h4 class="text-base font-bold text-primary">Floating IP Allocated Successfully!</h4>
             <p class="text-xs text-secondary mt-1">
               ${srv ? `Attached directly to <strong class="text-primary">${escapeHtml(srv.name || srv.label || srvId)}</strong>` : `Allocated to <strong class="text-primary">${escapeHtml(acc?.label || 'account')}</strong> pool`}
@@ -5432,7 +6418,7 @@ function initForms() {
                 <div class="text-xs text-secondary font-medium">Allocated Floating IP</div>
                 <code class="font-mono text-lg font-bold text-primary">${escapeHtml(fipVal)}</code>
               </div>
-              <button type="button" class="btn btn-sm btn-secondary" onclick="copyText('${escapeHtml(fipVal)}')">📋 Copy IP</button>
+              <button type="button" class="btn btn-sm btn-secondary" onclick="copyText('${escapeHtml(fipVal)}')">Copy IP</button>
             </div>
 
             ${(srvId || acc?.provider === 'hetzner') ? `
@@ -5448,7 +6434,7 @@ function initForms() {
 
             <div class="flex items-center justify-center gap-2 pt-2">
               <button type="button" class="btn btn-secondary btn-sm" onclick="closeModal('modal-alloc-ip')">Close</button>
-              ${srvId ? `<button type="button" class="btn btn-primary btn-sm" onclick="closeModal('modal-alloc-ip'); openServerDetailsModal(${accId}, '${srvId}');">🖥️ View Server Details</button>` : ''}
+              ${srvId ? `<button type="button" class="btn btn-primary btn-sm" onclick="closeModal('modal-alloc-ip'); openServerDetailsModal(${accId}, '${srvId}');">View Server Details</button>` : ''}
             </div>
           </div>
         `;
@@ -5467,19 +6453,28 @@ function initForms() {
   });
 
   // Attach Floating IP submit
+  let attachFipConfirmed = false;
   document.getElementById("form-attach-fip").addEventListener("submit", async (e) => {
     e.preventDefault();
     const fipId = document.getElementById("attach-fip-id").value;
     const accId = parseInt(document.getElementById("attach-fip-acc-id").value);
     const serverId = document.getElementById("attach-target-server-select").value;
     const submitBtn = document.getElementById("btn-submit-attach-fip");
+    if (!attachFipConfirmed) {
+      const form = document.getElementById("form-attach-fip");
+      confirmAction(`Attach Floating IP ${fipId} to server ${serverId}?`, "ASSIGN_FLOATING_IP",
+        () => { attachFipConfirmed = true; form.requestSubmit(); });
+      return;
+    }
+    attachFipConfirmed = false;
 
     await runWithButtonLoading(submitBtn, async () => {
       try {
         await api("assign_floating_ip", {
           account_id: accId,
           floating_id: fipId,
-          server_id: serverId
+          server_id: String(serverId),
+          confirm: "ASSIGN_FLOATING_IP"
         });
         showToast("Floating IP attached successfully!", "success");
         closeModal("modal-attach-fip");
@@ -5515,11 +6510,22 @@ function initForms() {
   });
 
   // Add Account submit
+  document.getElementById("acc-provider")?.addEventListener("change", updateCloudCredentialHint);
   document.getElementById("form-add-account").addEventListener("submit", async (e) => {
     e.preventDefault();
     const provider = document.getElementById("acc-provider").value;
     const label = document.getElementById("acc-label").value.trim();
-    const token = document.getElementById("acc-token").value.trim();
+    let token = document.getElementById("acc-token").value.trim();
+    if (provider === "cloudferro") {
+      const id = document.getElementById("acc-cloud-id")?.value.trim();
+      const secret = document.getElementById("acc-cloud-secret")?.value.trim();
+      const projectId = document.getElementById("acc-cloud-project")?.value.trim();
+      if (!id || !secret || !projectId) {
+        showToast("Enter the CloudFerro credential ID, secret, and project ID.", "error");
+        return;
+      }
+      token = JSON.stringify({ id, secret, project_id: projectId });
+    }
     const regionEl = document.getElementById("acc-region");
     const region = regionEl ? normalizeCountryCode(regionEl.value) : "";
 
@@ -5528,7 +6534,11 @@ function initForms() {
     let proxyProviderId = null;
 
     if (proxyType === "custom") {
-      proxy = document.getElementById("acc-proxy")?.value.trim() || null;
+      const rawProxy = document.getElementById("acc-proxy")?.value || "";
+      if (rawProxy.trim()) {
+        try { proxy = normalizeProxyInput(rawProxy).value; }
+        catch (err) { showToast(err.message, "error"); document.getElementById("acc-proxy")?.focus(); return; }
+      }
     } else if (proxyType === "pool") {
       if (!region) {
         showToast("Account Region is required to allocate a proxy from providers.", "error");
@@ -5541,7 +6551,11 @@ function initForms() {
     const submitBtn = document.getElementById("btn-submit-add-acc");
     await runWithButtonLoading(submitBtn, async () => {
       try {
+        const note = (document.getElementById("acc-note")?.value || "").trim();
         const payload = { provider, label, token, region };
+        if (note) {
+          payload.note = note;
+        }
         if (proxyType === "custom") {
           payload.proxy = proxy;
         } else if (proxyType === "pool") {
@@ -5575,7 +6589,7 @@ function initForms() {
       if (!code || !accId) return;
       if (resEl) {
         resEl.className = "mt-3 p-3 bg-card border rounded text-xs text-secondary";
-        resEl.innerHTML = "⏳ Applying promo code to Linode account...";
+        resEl.innerHTML = "Applying promo code to Linode account...";
       }
 
       await runWithButtonLoading(btn, async () => {
@@ -5585,22 +6599,22 @@ function initForms() {
           const credit = p.credit_remaining || p.credit_monthly_cap || "Applied";
           const summary = p.summary || p.description || "Promotional credit added successfully!";
           const expire = p.expire_dt || "—";
-          showToast(`🎉 Promo code applied! Credit: $${credit}`, "success");
+          showToast(`Promo code applied! Credit: $${credit}`, "success");
           if (resEl) {
             resEl.className = "mt-3 p-3 bg-card border border-success rounded text-xs";
             resEl.innerHTML = `
-              <div class="text-success font-bold mb-1">✅ Promo Code Applied Successfully!</div>
+              <div class="text-success font-bold mb-1">Promo Code Applied Successfully!</div>
               <div><strong>Credit:</strong> $${escapeHtml(String(credit))}</div>
               <div><strong>Summary:</strong> ${escapeHtml(String(summary))}</div>
               <div><strong>Expires:</strong> <code>${escapeHtml(String(expire))}</code></div>
             `;
           }
-          refreshSingleAccountBilling(accId);
+          loadAll();
         } catch (err) {
           showToast(`Failed: ${err.message}`, "error");
           if (resEl) {
             resEl.className = "mt-3 p-3 bg-card border border-danger rounded text-xs text-danger";
-            resEl.innerHTML = `❌ <strong>Error:</strong> ${escapeHtml(err.message)}`;
+            resEl.innerHTML = `<strong>Error:</strong> ${escapeHtml(err.message)}`;
           }
         }
       }, "Applying Promo...");
@@ -5640,7 +6654,7 @@ function initForms() {
           renderAccountsManagement();
           renderProxyManagement();
           renderOverview();
-          refreshSingleAccountBilling(accId);
+          loadAll();
         } catch (err) {
           showToast(err.message, "error");
         }
@@ -5675,7 +6689,12 @@ function initForms() {
     formCustomProxy.addEventListener("submit", async (e) => {
       e.preventDefault();
       const accId = parseInt(document.getElementById("edit-proxy-account-id").value);
-      const proxyVal = document.getElementById("custom-proxy-input").value.trim();
+      const rawProxyVal = document.getElementById("custom-proxy-input").value;
+      let proxyVal = "";
+      if (rawProxyVal.trim()) {
+        try { proxyVal = normalizeProxyInput(rawProxyVal).value; }
+        catch (err) { showToast(err.message, "error"); document.getElementById("custom-proxy-input")?.focus(); return; }
+      }
       const family = document.getElementById("custom-proxy-family").value;
       const regionVal = normalizeCountryCode(document.getElementById("custom-proxy-region").value);
       const btn = document.getElementById("btn-submit-custom-proxy");
@@ -5697,7 +6716,7 @@ function initForms() {
           renderAccountsManagement();
           renderProxyManagement();
           renderOverview();
-          refreshSingleAccountBilling(accId);
+          loadAll();
         } catch (err) {
           showToast(err.message, "error");
         }
@@ -5709,7 +6728,14 @@ function initForms() {
   const btnVerifyCustom = document.getElementById("btn-verify-custom-proxy");
   if (btnVerifyCustom) {
     btnVerifyCustom.addEventListener("click", async () => {
-      const proxyVal = document.getElementById("custom-proxy-input").value.trim();
+      const rawProxyVal = document.getElementById("custom-proxy-input").value;
+      let proxyVal = "";
+      try { proxyVal = normalizeProxyInput(rawProxyVal).value; }
+      catch (err) {
+        updateProxyInputPreview("custom-proxy-input", "custom-proxy-format-status");
+        if (resBox) resBox.innerHTML = `<span class="text-warning">${escapeHtml(err.message)}</span>`;
+        return;
+      }
       const resBox = document.getElementById("custom-proxy-test-result");
       if (!proxyVal) {
         if (resBox) resBox.innerHTML = `<span class="text-warning">Please enter a proxy string to test.</span>`;
@@ -5722,22 +6748,22 @@ function initForms() {
 
       await runWithButtonLoading(btnVerifyCustom, async () => {
         try {
-          const res = await api("test_proxy", { proxy: proxyVal });
+          const res = await api("test_proxy", { proxy: proxyVal }, { retryMode: "read" });
           if (res.status === "ok") {
             if (resBox) {
               resBox.className = "text-xs font-mono text-success mt-2";
-              resBox.textContent = `✅ Connection successful! Egress IP: ${res.ip} (Latency: ${res.latency_ms}ms)`;
+              resBox.textContent = `Connection successful! Egress IP: ${res.ip} (Latency: ${res.latency_ms}ms)`;
             }
           } else {
             if (resBox) {
               resBox.className = "text-xs font-mono text-danger mt-2";
-              resBox.textContent = `❌ Verification failed: ${res.error}`;
+              resBox.textContent = `Verification failed: ${res.error}`;
             }
           }
         } catch (err) {
           if (resBox) {
             resBox.className = "text-xs font-mono text-danger mt-2";
-            resBox.textContent = `❌ Error: ${err.message}`;
+            resBox.textContent = `Error: ${err.message}`;
           }
         }
       }, "Testing...");
@@ -5761,7 +6787,7 @@ function initForms() {
           renderAccountsManagement();
           renderProxyManagement();
           renderOverview();
-          refreshSingleAccountBilling(accId);
+          loadAll();
         } catch (err) {
           showToast(err.message, "error");
         }
@@ -5795,6 +6821,68 @@ function initForms() {
     });
   }
 
+  const formEditAccount = document.getElementById("form-edit-account");
+  if (formEditAccount) {
+    formEditAccount.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const accId = Number(document.getElementById("edit-account-id").value);
+      const tokenInput = document.getElementById("edit-account-token");
+      const payload = {
+        account_id: accId,
+        label: document.getElementById("edit-account-name").value.trim()
+      };
+      if (tokenInput.value.trim()) payload.token = tokenInput.value.trim();
+      await runWithButtonLoading(document.getElementById("btn-save-edit-account"), async () => {
+        try {
+          const res = await api("update_account", payload);
+          const idx = state.accounts.findIndex(a => a.id === accId);
+          if (idx >= 0 && res.account) state.accounts[idx] = res.account;
+          tokenInput.value = "";
+          closeModal("modal-edit-account");
+          renderAccountsManagement();
+          showToast("Account saved.", "success");
+          loadAll();
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      }, payload.token ? "Checking token..." : "Saving...");
+    });
+  }
+
+  // Handle Edit Account Note Save
+  const formEditNote = document.getElementById("form-edit-account-note");
+  if (formEditNote) {
+    formEditNote.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const accId = parseInt(document.getElementById("edit-note-account-id").value);
+      const noteVal = (document.getElementById("edit-note-text").value || "").trim();
+      const btn = document.getElementById("btn-save-account-note");
+
+      await runWithButtonLoading(btn, async () => {
+        try {
+          const res = await api("set_account_note", { account_id: accId, note: noteVal });
+          showToast("Account note saved!", "success");
+          closeModal("modal-edit-note");
+          const accIdx = state.accounts.findIndex(a => a.id === accId);
+          if (accIdx >= 0 && res.account) {
+            state.accounts[accIdx] = res.account;
+          } else {
+            const acc = state.accounts.find(a => a.id === accId);
+            if (acc) acc.note = noteVal;
+          }
+          renderAccountsManagement();
+          renderHetznerHub();
+          renderVultrHub();
+          renderLinodeHub();
+          renderUpcloudHub();
+          renderCloudferroHub();
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      }, "Saving Note...");
+    });
+  }
+
   // Add Proxy Provider submit
   const formAddProxyProv = document.getElementById("form-add-proxy-provider");
   if (formAddProxyProv) {
@@ -5815,14 +6903,15 @@ function initForms() {
           showToast("Please enter proxy host or gateway", "error");
           return;
         }
-        if (!user || !user.includes("{country}") || !user.includes("{session}")) {
-          showToast("Username pattern must contain both {country} and {session} tokens", "error");
+        const portBased = document.getElementById('proxy-provider-identity-kind').value === 'port';
+        if (!user || !user.includes("{country}") || (!portBased && !user.includes("{session}")) || (portBased && user.includes('{session}'))) {
+          showToast(portBased ? 'Use your login followed by __cr.{country}; ports are supplied separately.' : "Username pattern must contain both {country} and {session} tokens", "error");
           return;
         }
         template = {
           scheme,
           host,
-          port: parseInt(port, 10),
+          port: portBased ? '{port}' : parseInt(port, 10),
           username: user,
           password: pass,
           auth: !!(user || pass)
@@ -5839,7 +6928,7 @@ function initForms() {
           showToast("Please paste sample proxy lines", "error");
           return;
         }
-        template = rawSample.split("\n")[0].trim();
+        template = rawSample;
       }
 
       const sessions = document.getElementById("proxy-provider-sessions").value.trim();
@@ -5853,7 +6942,8 @@ function initForms() {
             template,
             session_ids: sessions,
             scheme,
-            family
+            family,
+            usage_limit_gb: Number(document.getElementById('proxy-provider-usage-limit').value)
           });
           showToast(`Proxy provider "${label}" created successfully!`, "success");
           closeModal("modal-add-proxy-provider");
@@ -5881,8 +6971,16 @@ function initForms() {
       const details = document.getElementById("test-proxy-details");
       const btn = document.getElementById("btn-run-proxy-test");
 
-      if (!targetAccId && scheme !== "auto" && !raw.includes("://")) {
-        raw = `${scheme}://${raw}`;
+      if (!targetAccId) {
+        try {
+          if (scheme !== "auto" && !raw.includes("://")) raw = `${scheme}://${raw}`;
+          raw = normalizeProxyInput(raw).value;
+          updateProxyInputPreview("test-proxy-string-input", "test-proxy-format-status");
+        } catch (err) {
+          if (details) details.textContent = err.message;
+          updateProxyInputPreview("test-proxy-string-input", "test-proxy-format-status");
+          return;
+        }
       }
 
       if (badge) { badge.className = "badge"; badge.textContent = "Testing..."; }
@@ -5891,7 +6989,7 @@ function initForms() {
       await runWithButtonLoading(btn, async () => {
         try {
           const payload = targetAccId ? { account_id: parseInt(targetAccId, 10) } : { proxy: raw };
-          const res = await api("test_proxy", payload);
+          const res = await api("test_proxy", payload, { retryMode: "read" });
           if (res.status === "ok") {
             if (badge) { badge.className = "badge badge-status-running"; badge.textContent = "Connected"; }
             if (details) {
@@ -5921,7 +7019,9 @@ function initForms() {
 
       await runWithButtonLoading(btn, async () => {
         try {
-          const payload = { provider_id: pid, label };
+          const payload = { provider_id: pid, label,
+            usage_limit_gb: Number(document.getElementById('edit-proxy-provider-usage-limit').value),
+            reset_usage: document.getElementById('edit-proxy-provider-reset-usage').checked };
           if (template) payload.template = template;
           await api("update_proxy_provider", payload);
           showToast("Proxy provider updated successfully!", "success");
@@ -6017,6 +7117,17 @@ function initForms() {
     });
   }
 
+  const customProxyInput = document.getElementById("custom-proxy-input");
+  if (customProxyInput) {
+    customProxyInput.addEventListener("input", () => updateProxyInputPreview("custom-proxy-input", "custom-proxy-format-status"));
+    customProxyInput.addEventListener("blur", () => updateProxyInputPreview("custom-proxy-input", "custom-proxy-format-status"));
+  }
+
+  const testProxyInput = document.getElementById("test-proxy-string-input");
+  if (testProxyInput) {
+    testProxyInput.addEventListener("input", () => updateProxyInputPreview("test-proxy-string-input", "test-proxy-format-status"));
+  }
+
   const accRegInput = document.getElementById("acc-region");
   if (accRegInput) {
     accRegInput.addEventListener("input", (e) => {
@@ -6062,7 +7173,7 @@ function initForms() {
       await runWithButtonLoading(btn, async () => {
         try {
           const res = await api("add_proxy_sessions", { provider_id: pid, raw_text: rawText });
-          showToast(`🎉 Added ${res.added} session(s) to pool! (Total: ${res.total_sessions})`, "success");
+          showToast(`Added ${res.added} session(s) to pool! (Total: ${res.total_sessions})`, "success");
           closeModal("modal-add-proxy-sessions");
           const provRes = await api("proxy_providers");
           state.proxyProviders = provRes.providers || [];
@@ -6156,18 +7267,17 @@ async function deleteAccount(accId) {
 async function unassignFloatingIp(accId, fipId, btn = null) {
   const action = async () => {
     try {
-      await api("unassign_floating_ip", { account_id: accId, floating_id: fipId });
+      await api("unassign_floating_ip", { account_id: accId, floating_id: fipId, confirm: "UNASSIGN_FLOATING_IP" });
       showToast("Floating IP unassigned.", "success");
       loadAll();
     } catch (err) {
       showToast(err.message, "error");
     }
   };
-  if (btn) {
-    await runWithButtonLoading(btn, action);
-  } else {
-    await action();
-  }
+  confirmAction(`Detach floating IP ${fipId}? It will remain allocated.`, "UNASSIGN_FLOATING_IP", async () => {
+    if (btn) await runWithButtonLoading(btn, action);
+    else await action();
+  });
 }
 window.unassignFloatingIp = unassignFloatingIp;
 
@@ -6223,118 +7333,51 @@ async function deleteDnsRecord(zoneId, recordId) {
 
 // ==================== UTILS ====================
 function confirmAction(descOrOptions, expectedWord, onConfirm) {
+  if (confirmAction.cancelPending) confirmAction.cancelPending();
+  const opts = typeof descOrOptions === "object" && descOrOptions !== null
+    ? descOrOptions : { message: descOrOptions };
   const modal = document.getElementById("modal-confirm-dialog");
   const titleEl = document.getElementById("confirm-dialog-title");
   const descEl = document.getElementById("confirm-dialog-desc");
-  const typedContainer = document.getElementById("confirm-typed-container");
-  const typedLabel = document.getElementById("confirm-typed-label");
-  const typedInput = document.getElementById("confirm-typed-input");
   const submitBtn = document.getElementById("confirm-dialog-submit-btn");
-
-  // Mode 1: Options object returning Promise
-  if (typeof descOrOptions === "object" && descOrOptions !== null) {
-    const opts = descOrOptions;
-    const title = opts.title || "Confirm Action";
-    const desc = opts.message || opts.desc || "Are you sure you want to proceed?";
-    const word = opts.expectedWord || opts.expected || "";
-    const isDanger = opts.isDanger !== false;
-    const confirmText = opts.confirmText || (isDanger ? "Confirm" : "Proceed");
-
-    if (titleEl) titleEl.textContent = title;
-    if (descEl) descEl.textContent = desc;
-    if (submitBtn) {
-      submitBtn.textContent = confirmText;
-      submitBtn.className = isDanger ? "btn btn-danger" : "btn btn-primary";
-    }
-
-    if (word) {
-      if (typedContainer) typedContainer.style.display = "block";
-      if (typedLabel) typedLabel.textContent = `Type "${word}" to verify:`;
-      if (typedInput) typedInput.value = "";
-    } else {
-      if (typedContainer) typedContainer.style.display = "none";
-    }
-
-    return new Promise((resolve) => {
-      let settled = false;
-
-      const cleanup = () => {
-        if (submitBtn) submitBtn.onclick = null;
-        if (modal) {
-          modal.removeEventListener("click", backdropHandler);
-          modal.querySelectorAll("[data-close='modal-confirm-dialog']").forEach(b => {
-            b.removeEventListener("click", cancelHandler);
-          });
-        }
-      };
-
-      const finish = (result) => {
-        if (settled) return;
-        settled = true;
-        cleanup();
-        closeModal("modal-confirm-dialog");
-        resolve(result);
-      };
-
-      const handler = () => {
-        if (word && typedInput && typedInput.value.trim() !== word) {
-          showToast(`Verification mismatch. You must type "${word}".`, "error");
-          return;
-        }
-        finish(true);
-      };
-
-      const cancelHandler = () => finish(false);
-      const backdropHandler = (e) => {
-        if (e.target === modal) finish(false);
-      };
-
-      if (submitBtn) submitBtn.onclick = handler;
-      if (modal) {
-        modal.addEventListener("click", backdropHandler);
-        modal.querySelectorAll("[data-close='modal-confirm-dialog']").forEach(b => {
-          b.addEventListener("click", cancelHandler);
-        });
-      }
-
-      openModal("modal-confirm-dialog");
-      if (word && typedInput) {
-        setTimeout(() => typedInput.focus(), 100);
-      }
-    });
-  }
-
-  // Mode 2: Legacy callback signature confirmAction(desc, expectedWord, onConfirm)
-  const desc = descOrOptions;
-  if (titleEl) titleEl.textContent = "Confirm Action";
-  if (descEl) descEl.textContent = desc;
-  if (typedContainer) typedContainer.style.display = "block";
-  if (typedLabel) typedLabel.textContent = `Type "${expectedWord}" to verify:`;
-  if (typedInput) typedInput.value = "";
+  if (titleEl) titleEl.textContent = opts.title || "Confirm Action";
+  if (descEl) descEl.textContent = opts.message || opts.desc || "Are you sure you want to proceed?";
   if (submitBtn) {
-    submitBtn.textContent = "Confirm";
-    submitBtn.className = "btn btn-danger";
+    submitBtn.textContent = "Yes";
+    submitBtn.className = opts.isDanger === false ? "btn btn-primary" : "btn btn-danger";
   }
 
-  const handler = async () => {
-    if (typedInput.value.trim() !== expectedWord) {
-      showToast(`Verification mismatch. You must type "${expectedWord}".`, "error");
-      return;
-    }
-    await runWithButtonLoading(submitBtn, async () => {
-      try {
-        await onConfirm();
-        submitBtn.onclick = null;
-        closeModal("modal-confirm-dialog");
-      } catch (err) {
-        // Error already handled in onConfirm callback
+  return new Promise(resolve => {
+    let settled = false;
+    const cancelButtons = modal ? modal.querySelectorAll("[data-close='modal-confirm-dialog']") : [];
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      if (submitBtn) submitBtn.onclick = null;
+      if (modal) modal.removeEventListener("click", backdropHandler);
+      cancelButtons.forEach(button => button.removeEventListener("click", cancelHandler));
+      document.removeEventListener("keydown", keyHandler);
+      confirmAction.cancelPending = null;
+      closeModal("modal-confirm-dialog");
+      resolve(result);
+    };
+    const cancelHandler = () => finish(false);
+    const backdropHandler = event => { if (event.target === modal) finish(false); };
+    const keyHandler = event => { if (event.key === "Escape") finish(false); };
+    confirmAction.cancelPending = cancelHandler;
+    if (submitBtn) submitBtn.onclick = async () => {
+      if (settled) return;
+      finish(true);
+      if (typeof onConfirm === "function") {
+        try { await onConfirm(); }
+        catch (error) { showToast(error.message || "Action failed", "error"); }
       }
-    }, "Executing...");
-  };
-
-  submitBtn.onclick = handler;
-  openModal("modal-confirm-dialog");
-  setTimeout(() => typedInput.focus(), 100);
+    };
+    cancelButtons.forEach(button => button.addEventListener("click", cancelHandler));
+    if (modal) modal.addEventListener("click", backdropHandler);
+    document.addEventListener("keydown", keyHandler);
+    openModal("modal-confirm-dialog");
+  });
 }
 
 function copyText(str) {

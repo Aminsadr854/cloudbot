@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     proxy_family TEXT NOT NULL DEFAULT 'default', -- default | ipv4 | ipv6
     auto_backup  TEXT NOT NULL DEFAULT 'disabled', -- disabled | enabled
     region       TEXT NOT NULL DEFAULT '',        -- ISO country code e.g. 'DE', 'US'
+    note         TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tunnels (
@@ -83,12 +84,38 @@ CREATE TABLE IF NOT EXISTS data_cache (
     v          TEXT NOT NULL,
     updated_at REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sync_requests (
+    account_id INTEGER PRIMARY KEY,
+    revision TEXT NOT NULL
+);
+CREATE TRIGGER IF NOT EXISTS sync_account_insert AFTER INSERT ON accounts BEGIN
+    INSERT OR REPLACE INTO sync_requests VALUES (NEW.id, lower(hex(randomblob(16))));
+END;
+CREATE TRIGGER IF NOT EXISTS sync_account_update AFTER UPDATE ON accounts BEGIN
+    INSERT OR REPLACE INTO sync_requests VALUES (NEW.id, lower(hex(randomblob(16))));
+END;
+CREATE TRIGGER IF NOT EXISTS sync_account_delete AFTER DELETE ON accounts BEGIN
+    INSERT OR REPLACE INTO sync_requests VALUES (0, lower(hex(randomblob(16))));
+END;
 CREATE TABLE IF NOT EXISTS login_otps (
     otp         TEXT PRIMARY KEY,
     user_id     INTEGER NOT NULL,
     expires_at  REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_login_otps_exp ON login_otps(expires_at);
+CREATE TABLE IF NOT EXISTS activity_logs (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         REAL NOT NULL,
+    action     TEXT NOT NULL,
+    provider   TEXT NOT NULL DEFAULT '',
+    target     TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'success',
+    details    TEXT NOT NULL DEFAULT '',
+    error      TEXT NOT NULL DEFAULT '',
+    source     TEXT NOT NULL DEFAULT 'web'
+);
+CREATE INDEX IF NOT EXISTS idx_activity_logs_ts ON activity_logs(ts DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_logs_action ON activity_logs(action);
 """
 
 
@@ -111,6 +138,13 @@ class Store(ProxyPoolStore):
         self.con = sqlite3.connect(self.db_path, check_same_thread=False)
         self.con.row_factory = sqlite3.Row
         self.con.executescript(SCHEMA + POOL_SCHEMA)
+        proxy_columns = {r['name'] for r in self.con.execute('PRAGMA table_info(proxy_providers)')}
+        for name, definition in (('usage_limit_bytes', 'INTEGER NOT NULL DEFAULT 0'),
+                                 ('usage_bytes', 'INTEGER NOT NULL DEFAULT 0'),
+                                 ('usage_reset_at', 'REAL NOT NULL DEFAULT 0')):
+            if name not in proxy_columns:
+                self.con.execute(f'ALTER TABLE proxy_providers ADD COLUMN {name} {definition}')
+        self.con.commit()
         # Existing installations predate the per-proxy IP-family preference.
         # SQLite's CREATE TABLE IF NOT EXISTS does not add columns, so migrate
         # them in place without touching their encrypted credentials.
@@ -128,6 +162,9 @@ class Store(ProxyPoolStore):
         if "region" not in columns:
             self.con.execute("ALTER TABLE accounts ADD COLUMN region TEXT NOT NULL DEFAULT ''")
             self.con.commit()
+        if "note" not in columns:
+            self.con.execute("ALTER TABLE accounts ADD COLUMN note TEXT NOT NULL DEFAULT ''")
+            self.con.commit()
         self.con.execute("CREATE TABLE IF NOT EXISTS data_cache (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at REAL NOT NULL)")
         self.con.commit()
         with self.proxy_transaction():
@@ -142,7 +179,7 @@ class Store(ProxyPoolStore):
             pass
 
     # ---- accounts ------------------------------------------------------
-    def add_account(self, label, provider, token, proxy=None, proxy_family="default", auto_backup="disabled", proxy_request=None, region=""):
+    def add_account(self, label, provider, token, proxy=None, proxy_family="default", auto_backup="disabled", proxy_request=None, region="", note=""):
         proxy_family = "default"
         with self.proxy_transaction():
             if proxy_request:
@@ -150,16 +187,21 @@ class Store(ProxyPoolStore):
             else:
                 self._guard_proxy(proxy)
             cur = self.con.execute(
-                "INSERT INTO accounts (label, provider, token, proxy, proxy_family, auto_backup, region, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?)",
+                "INSERT INTO accounts (label, provider, token, proxy, proxy_family, auto_backup, region, note, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?)",
                 (label, provider, self.f.encrypt(token.encode()),
                  self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, auto_backup,
-                 str(region or "").strip().upper(), int(time.time())))
+                 str(region or "").strip().upper(), str(note or "").strip(), int(time.time())))
             acc_id = cur.lastrowid
             if proxy_request:
                 self.con.execute('DELETE FROM proxy_claims WHERE request_token=?', (proxy_request,))
             self._sync_proxy_claims()
         return acc_id
+
+    def set_account_note(self, acc_id, note):
+        """Set or update an account's note/memo."""
+        self.con.execute("UPDATE accounts SET note = ? WHERE id = ?", (str(note or "").strip(), acc_id))
+        self.con.commit()
 
     def delete_account(self, acc_id):
         with self.proxy_transaction():
@@ -172,6 +214,15 @@ class Store(ProxyPoolStore):
         """Rename an account without rewriting its encrypted credentials."""
         self.con.execute("UPDATE accounts SET label = ? WHERE id = ?", (label, acc_id))
         self.con.commit()
+
+    def update_account(self, acc_id, label, token=None):
+        """Save a label and an optional verified token atomically."""
+        with self.con:
+            if token is None:
+                self.con.execute("UPDATE accounts SET label = ? WHERE id = ?", (label, acc_id))
+            else:
+                self.con.execute("UPDATE accounts SET label = ?, token = ? WHERE id = ?",
+                                 (label, self.f.encrypt(token.encode()), acc_id))
 
     def set_proxy(self, acc_id, proxy, proxy_family="default", proxy_request=None):
         """Set, change, or clear (proxy=None) an account's proxy preference."""
@@ -207,6 +258,7 @@ class Store(ProxyPoolStore):
             "proxy_family": r["proxy_family"] if "proxy_family" in r.keys() else "default",
             "auto_backup": r["auto_backup"] if "auto_backup" in r.keys() else "disabled",
             "region": (r["region"] if "region" in r.keys() and r["region"] else ""),
+            "note": (r["note"] if "note" in r.keys() and r["note"] else ""),
             "created_at": r["created_at"],
             "proxy_revision": r["proxy_revision"],
         }
@@ -1164,6 +1216,21 @@ class Store(ProxyPoolStore):
             return int(user_id)
 
     # ---- data cache ----------------------------------------------------
+    def request_sync(self, account_id=None):
+        self.con.execute("INSERT OR REPLACE INTO sync_requests VALUES (?, lower(hex(randomblob(16))))",
+                         (int(account_id or 0),))
+        self.con.commit()
+
+    def pending_sync(self):
+        return {row['account_id']: row['revision'] for row in
+                self.con.execute("SELECT account_id, revision FROM sync_requests")}
+
+    def acknowledge_sync(self, requests):
+        # A mutation arriving during a sync must survive its acknowledgement.
+        self.con.executemany("DELETE FROM sync_requests WHERE account_id=? AND revision=?",
+                             requests.items())
+        self.con.commit()
+
     def get_cache(self, k: str, default=None):
         try:
             row = self.con.execute("SELECT v FROM data_cache WHERE k = ?", (k,)).fetchone()
@@ -1191,6 +1258,62 @@ class Store(ProxyPoolStore):
             self.con.commit()
         except Exception as e:
             log.warning("Failed deleting cache for %s: %s", k, e)
+
+    # ---- activity logs -------------------------------------------------
+    def record_activity(self, action: str, provider: str = "", target: str = "",
+                        status: str = "success", details: str = "", error: str = "",
+                        source: str = "web", ts: Optional[float] = None) -> int:
+        """Record an operational audit event in activity_logs."""
+        now = ts if ts is not None else time.time()
+        try:
+            with self.con:
+                cur = self.con.execute(
+                    "INSERT INTO activity_logs (ts, action, provider, target, status, details, error, source)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (now, str(action or "").strip(), str(provider or "").strip().lower(),
+                     str(target or "").strip(), str(status or "success").strip().lower(),
+                     str(details or "").strip(), str(error or "").strip(), str(source or "web").strip().lower())
+                )
+                self.con.execute(
+                    "DELETE FROM activity_logs WHERE id NOT IN "
+                    "(SELECT id FROM activity_logs ORDER BY ts DESC LIMIT 2000)"
+                )
+                return cur.lastrowid
+        except Exception as exc:
+            log.warning("Failed recording activity log %s: %s", action, exc)
+            return 0
+
+    def get_activity_logs(self, limit: int = 100, action: Optional[str] = None,
+                          provider: Optional[str] = None, status: Optional[str] = None):
+        """Retrieve recent activity logs, newest first."""
+        query = "SELECT id, ts, action, provider, target, status, details, error, source FROM activity_logs WHERE 1=1"
+        params = []
+        if action:
+            query += " AND action = ?"
+            params.append(str(action).strip())
+        if provider:
+            query += " AND provider = ?"
+            params.append(str(provider).strip().lower())
+        if status:
+            query += " AND status = ?"
+            params.append(str(status).strip().lower())
+        query += " ORDER BY ts DESC LIMIT ?"
+        params.append(max(1, min(int(limit or 100), 500)))
+        rows = self.con.execute(query, tuple(params)).fetchall()
+        return [
+            {
+                "id": r["id"],
+                "ts": r["ts"],
+                "action": r["action"],
+                "provider": r["provider"],
+                "target": r["target"],
+                "status": r["status"],
+                "details": r["details"],
+                "error": r["error"],
+                "source": r["source"],
+            }
+            for r in rows
+        ]
 
 
 def compute_ssh_fingerprint(public_key: str) -> str:

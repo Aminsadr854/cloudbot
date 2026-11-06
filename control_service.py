@@ -12,8 +12,9 @@ import secrets
 import time
 
 import aiohttp
+from proxy_usage import ProxyUsage, TrafficLimitExceeded
 from cloudflare import Cloudflare
-from providers import Provider, region_country, country_code, country_flag, proxy_url
+from providers import Provider, region_country, country_code, country_flag, proxy_url, is_proxy_failure, account_suspension
 
 log = logging.getLogger("cloudbot.control_service")
 
@@ -43,9 +44,21 @@ def _normalize_country(value):
         return aliases.get(clean, clean)
 
 
+def _normalize_proxy_value(value):
+    """Validate and canonicalize a proxy before it reaches encrypted storage."""
+    if value is None or not str(value).strip():
+        return None
+    try:
+        return proxy_url(str(value).strip())
+    except Exception as exc:
+        raise InputError(f"Invalid proxy: {exc}") from None
+
+
 OPERATIONS = {
+    "sync_status": "Read automatic inventory sync status without calling providers",
     "accounts": "List configured cloud accounts without credentials",
     "account_info": "Read a provider account's billing and access details",
+    "resource_limits": "Read provider resource limits, quotas, and current usage",
     "servers": "List servers in one cloud account",
     "server": "Read one server and its attached floating IPs",
     "regions": "List available server regions",
@@ -58,7 +71,7 @@ OPERATIONS = {
     "dns_record": "Read a Cloudflare A record by fully qualified name",
     "create_server": "Create one server; confirm CREATE_SERVER",
     "power_server": "Start, halt, or reboot a Vultr server; confirm the action in uppercase",
-    "create_floating_ip": "Create and attach a Vultr IPv4 or Hetzner IPv4/IPv6; confirm CREATE_FLOATING_IP",
+    "create_floating_ip": "Create and attach a Vultr, Hetzner, UpCloud, or CloudFerro address; confirm CREATE_FLOATING_IP",
     "delete_floating_ip": "Delete an attached floating IP; confirm DELETE_FLOATING_IP",
     "upsert_dns": "Create or repoint a Cloudflare A record; confirm UPSERT_DNS",
     # Extended operations for Hosting Dashboard:
@@ -67,6 +80,10 @@ OPERATIONS = {
     "assign_floating_ip": "Assign an existing floating IP to a server",
     "unassign_floating_ip": "Unassign/detach a floating IP from its server",
     "update_floating_ip": "Update floating IP reverse DNS PTR or label",
+    "upcloud_networking": "Read UpCloud server interfaces and IP addresses",
+    "upcloud_add_interface_ip": "Add an IP to an UpCloud network interface; confirm ADD_INTERFACE_IP",
+    "upcloud_remove_interface_ip": "Remove an IP from an UpCloud network interface; confirm REMOVE_INTERFACE_IP",
+    "upcloud_delete_ip": "Delete an UpCloud IP address; confirm DELETE_FLOATING_IP",
     "delete_server": "Delete a cloud server; confirm DELETE_SERVER",
     "server_password": "Reveal stored root password for a server; confirm SHOW_PASSWORD",
     "ssh_keys": "List saved SSH keys",
@@ -100,12 +117,26 @@ OPERATIONS = {
     "parse_proxy_sessions": "Parse and extract session IDs from bulk proxy lines",
     "allocate_account_proxy": "Allocate and bind an available proxy from a rotating provider pool for an account",
     "set_account_region": "Set or update an account's geographical region code",
+    "set_account_note": "Set or update the note or memo for a cloud provider account",
+    "update_account": "Rename an account and optionally verify and replace its API token",
     "proxy_availability": "Check available unallocated sessions for a provider in a specific country",
     "set_server_password": "Save or update stored root password for a server",
     "reset_server_password": "Reset root password on Hetzner and reboot; confirm RESET_PASSWORD",
     "toggle_vultr_backups": "Enable or disable auto-backups for a Vultr server",
     "swap_linode_ips": "Swap IPv4 addresses between two Linodes in the same region; confirm SWAP_LINODE_IPS",
+    "activity_logs": "List operational activity and audit history (what happened)",
+    "system_logs": "Read live system and service journal logs (what is happening)",
 }
+
+READ_OPERATIONS = frozenset({
+    'sync_status', 'accounts', 'account_info', 'resource_limits', 'servers', 'server',
+    'regions', 'plans', 'images', 'floating_ips', 'watch_status', 'tunnels',
+    'dns_zones', 'dns_record', 'all_servers', 'all_floating_ips', 'server_password',
+    'ssh_keys', 'check_all_accounts', 'hetzner_primary_ips', 'dns_records',
+    'proxy_pool', 'test_account', 'test_proxy', 'proxy_providers', 'proxy_sessions',
+    'parse_proxy_sessions', 'proxy_availability', 'upcloud_networking',
+    'activity_logs', 'system_logs',
+})
 
 
 def _extract_session_ids_from_text(raw_text, template_username=None):
@@ -113,9 +144,21 @@ def _extract_session_ids_from_text(raw_text, template_username=None):
         return []
     if isinstance(raw_text, list):
         raw_text = "\n".join(str(x) for x in raw_text)
-    lines = [line.strip() for line in str(raw_text).splitlines() if line.strip()]
-    found = []
+    if 'gw.dataimpulse.com' in str(raw_text):
+        from proxy_pool import import_format
+        try:
+            return import_format(raw_text)[1]
+        except ValueError:
+            return []
 
+    # 1. Range pattern e.g. "1-50"
+    m_range = re.fullmatch(r'(\d+)\s*-\s*(\d+)', str(raw_text).strip())
+    if m_range:
+        s_n, e_n = int(m_range.group(1)), int(m_range.group(2))
+        if 0 <= s_n <= e_n and (e_n - s_n) <= 2000:
+            return [str(i) for i in range(s_n, e_n + 1)]
+
+    # 2. Template regex if provider username pattern provided
     tpl_regex = None
     if template_username and "{session}" in template_username:
         pattern = re.escape(template_username)
@@ -126,60 +169,96 @@ def _extract_session_ids_from_text(raw_text, template_username=None):
         except Exception:
             tpl_regex = None
 
-    for line in lines:
-        # Step 1: Skip standalone numbering lines (e.g. "1", "2", "3.", "4)", "#5")
-        if re.fullmatch(r'#?\d+[.):]?\s*', line):
+    # 3. Normalize into candidate items (support newlines, semicolons, commas)
+    normalized = str(raw_text).replace('\r\n', '\n').replace('\r', '\n').replace(';', '\n')
+    raw_lines = normalized.split('\n')
+    items = []
+    for line in raw_lines:
+        line = line.strip()
+        if not line:
+            continue
+        if ',' in line:
+            parts = line.split(',')
+            for p in parts:
+                p = p.strip()
+                if p:
+                    items.append(p)
+        else:
+            items.append(line)
+
+    found = []
+    stopwords = {'http', 'https', 'socks4', 'socks5', 'sample', 'proxy', 'swiftproxy', 'webshare', 'true', 'false', 'none', 'null'}
+
+    for item in items:
+        # Strip comments starting with # or // (avoid stripping :// in URLs)
+        item = re.sub(r'(?<!:)(?<!/)//.*$|#.*$', '', item).strip()
+        # Skip standalone numbering lines (e.g. "1", "2.", "[3]", "#4")
+        if re.fullmatch(r'#?\[?\d+\]?[.):]?\s*', item):
+            continue
+        # Strip leading numbers on a proxy line
+        item = re.sub(r'^\s*#?\[?\d+\]?[.):\s]+\s*(?=[a-zA-Z0-9]+://|[a-zA-Z0-9.-]+:\d+|[a-zA-Z0-9_-]+)', '', item).strip()
+        # Strip surrounding quotes
+        item = item.strip('\"\'')
+        if not item:
             continue
 
-        # Step 2: Strip leading numbering prefix on a proxy line, e.g. "1. host:port:..." or "1 niceproxy.io:..."
-        clean_line = re.sub(r'^\s*#?\d+[.):\s]+\s*(?=[a-zA-Z0-9]+://|[a-zA-Z0-9.-]+:\d+)', '', line)
+        # If it has spaces and no proxy delimiters (':', '@', '://'), it is commentary/prose - skip it
+        if ' ' in item and not any(c in item for c in (':', '@', '://')):
+            continue
 
-        # Step 3: Extract username candidate
+        # Take first token if inline note attached to proxy
+        first_token = item.split()[0] if ' ' in item else item
+
+        # Extract user candidate
         user_candidate = None
-        if "@" in clean_line:
-            parts = clean_line.split("@")
-            before_at = parts[0].split("://")[-1] if "://" in parts[0] else parts[0]
-            if ":" in before_at and not re.search(r'^\d+$', before_at.split(":")[-1]):
-                user_candidate = before_at.split(":")[0]
-            elif len(parts) > 1 and ":" in parts[1]:
-                user_candidate = parts[1].split(":")[0]
-        elif ":" in clean_line:
-            parts = clean_line.split(":")
+        target = first_token
+        if '@' in target:
+            auth_part = target.split('@')[0]
+            if '://' in auth_part:
+                auth_part = auth_part.split('://', 1)[1]
+            if ':' in auth_part:
+                user_candidate = auth_part.split(':', 1)[0]
+            else:
+                user_candidate = auth_part
+        elif target.count(':') >= 2:
+            parts = target.split(':')
             if len(parts) >= 4:
                 user_candidate = parts[2]
             elif len(parts) == 3:
-                user_candidate = parts[1]
+                user_candidate = parts[2] if parts[1].isdigit() else parts[1]
 
-        target_text = user_candidate if user_candidate else clean_line
+        target_text = user_candidate or target
 
-        # Step 4: If provider template regex is available, test against candidate and line
+        # Step A: Template regex match
         if tpl_regex:
-            m = tpl_regex.search(target_text) or tpl_regex.search(clean_line)
+            m = tpl_regex.search(target_text) or tpl_regex.search(target)
             if m:
                 found.append(m.group("session"))
                 continue
 
-        # Step 5: Heuristic search for sid/ssid/session patterns
-        m = re.search(r'(?:ssid|sid|session)[_-]([a-zA-Z0-9_-]+?)(?:_(?:time|life|sst)|-(?:sst|time)|[:@/\s]|$)', target_text, re.IGNORECASE)
+        # Step B: SwiftProxy and standard sid / ssid heuristic
+        m = re.search(r'(?:ssid|sid|session)[_:= -]([a-zA-Z0-9_-]+?)(?:_(?:time|life|sst)|-(?:sst|time|life)|[:@/\s,;]|$)', target_text, re.IGNORECASE)
         if not m:
-            m = re.search(r'(?:ssid|sid|session)[_-]([a-zA-Z0-9_-]+)', target_text, re.IGNORECASE)
+            m = re.search(r'(?:ssid|sid|session)[_:= -]([a-zA-Z0-9_-]+)', target_text, re.IGNORECASE)
         if m:
-            found.append(m.group(1))
-            continue
-
-        # Step 6: User candidate with country tag
-        if user_candidate and user_candidate != clean_line:
-            m = re.search(r'country[_-][A-Za-z]{2}[_-]([a-zA-Z0-9_-]+)', user_candidate, re.IGNORECASE)
-            if m:
-                found.append(m.group(1))
+            sid = m.group(1).strip('_-')
+            if sid:
+                found.append(sid)
                 continue
-            found.append(user_candidate)
-            continue
 
-        # Step 7: Single clean token
-        token = re.sub(r'[^a-zA-Z0-9_\-]', '', clean_line)
-        if token:
-            found.append(token)
+        # Step C: Country / zone tag heuristic
+        if user_candidate and user_candidate != target:
+            mc = re.search(r'(?:country|zone|region)[_-][A-Za-z]{2}[_-]([a-zA-Z0-9_-]+)', user_candidate, re.IGNORECASE)
+            if mc:
+                sid = mc.group(1).strip('_-')
+                if sid:
+                    found.append(sid)
+                    continue
+
+        # Step D: Raw session token (single identifier without host/colons/slashes/spaces)
+        if ' ' not in target and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', target):
+            if target.lower() not in stopwords and (not target.isdigit() or len(target) >= 2):
+                found.append(target)
 
     seen = set()
     return [x for x in found if not (x in seen or seen.add(x))]
@@ -238,6 +317,7 @@ def _account_public(account, store=None):
         "proxy_family": account.get("proxy_family") or "default",
         "auto_backup": account.get("auto_backup") or "disabled",
         "region": region,
+        "note": account.get("note") or "",
         "binding": binding_info,
         "created_at": account.get("created_at"),
         "has_proxy": bool(proxy_val),
@@ -259,6 +339,13 @@ async def _floating(provider, server_id):
         return await provider.vultr_floating_ips(server_id)
     if provider.provider == "hetzner":
         return await provider.hetzner_floating_ips(server_id)
+    if provider.provider == "upcloud":
+        # UpCloud's account IP inventory also includes primary addresses;
+        # this operation is intentionally limited to floating addresses.
+        return [row for row in await provider.upcloud_ip_addresses(server_id)
+                if row.get("floating")]
+    if provider.provider == "cloudferro":
+        return await provider.cloudferro_floating_ips(server_id)
     return []
 
 
@@ -292,11 +379,95 @@ def _set_cache(store, k, val):
 
 def _delete_cache(store, k):
     if hasattr(store, "delete_cache"):
+        if k in {'all_servers', 'all_floating_ips', 'all_billing'} or k.startswith('primary_ips:'):
+            saved = _get_cache(store, k)
+            if saved is not None:
+                _set_cache(store, 'saved:' + k, saved)
         store.delete_cache(k)
 
 
+def _record_activity(store, action, provider="", target="", status="success", details="", error="", source="web"):
+    if hasattr(store, "record_activity"):
+        try:
+            store.record_activity(action, provider=provider, target=target, status=status, details=details, error=error, source=source)
+        except Exception:
+            pass
+
+
+def _snapshot_cache(store, key):
+    value = _get_cache(store, key)
+    return value if value is not None else _get_cache(store, 'saved:' + key)
+
+
+def _scope_accounts(store, args):
+    accounts = store.accounts()
+    if args.get('account_id') is not None:
+        account = _account(store, args)
+        accounts = [account]
+    if args.get('provider'):
+        name = str(args['provider']).lower()
+        if name not in {'hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro'}:
+            raise InputError('unknown cloud provider')
+        accounts = [a for a in accounts if a['provider'] == name]
+    return accounts
+
+
+def _row_account(row, field):
+    return str((row.get('account') or {}).get('id') if field == 'accounts' else row.get('account_id'))
+
+
+def _scoped_snapshot(snapshot, field, accounts):
+    snapshot = snapshot or {}
+    ids = {str(a['id']) for a in accounts}
+    return {**snapshot, field: [r for r in snapshot.get(field, []) if _row_account(r, field) in ids],
+            'account_errors': {k: v for k, v in snapshot.get('account_errors', {}).items() if str(k) in ids}}
+
+
+def _save_scoped_snapshot(store, key, field, result, accounts):
+    old = _snapshot_cache(store, key) or {}
+    target = {str(a['id']) for a in accounts}
+    active = {str(a['id']) for a in store.accounts()}
+    failed = set(result.get('account_errors', {}))
+    retained_failures = failed - {_row_account(r, field) for r in result[field]}
+    rows = [r for r in old.get(field, []) if _row_account(r, field) in active and
+            (_row_account(r, field) not in target or _row_account(r, field) in retained_failures)]
+    rows += result[field]
+    errors = {k: v for k, v in old.get('account_errors', {}).items() if str(k) in active and str(k) not in target}
+    errors.update(result.get('account_errors', {}))
+    combined = {**result, field: rows, 'account_errors': errors}
+    _set_cache(store, key, combined)
+    return _scoped_snapshot(combined, field, accounts)
+
+
+def _safe_error(exc, account=None):
+    """Return a provider error with account credentials removed."""
+    message = str(exc)
+    if account:
+        for key in ("token", "proxy", "proxy_request"):
+            value = account.get(key)
+            if value:
+                message = message.replace(str(value), "[redacted]")
+    return message
+
+
 async def execute(operation, args, store):
+    result = await _execute(operation, args, store)
+    if operation not in READ_OPERATIONS and hasattr(store, 'request_sync'):
+        # The shared SQLite queue also reaches the worker from MCP and Telegram.
+        account_id = args.get('account_id')
+        if operation == 'add_account':
+            account_id = result.get('id')
+        if operation == 'delete_account':
+            account_id = None
+        store.request_sync(account_id)
+    return result
+
+
+async def _execute(operation, args, store):
     """Execute one documented operation with validated, JSON-safe arguments."""
+    if operation == 'sync_status':
+        return {**(_get_cache(store, 'sync_state') or {}),
+                'pending': bool(store.pending_sync()) if hasattr(store, 'pending_sync') else False}
     if operation not in OPERATIONS:
         raise InputError("unknown operation")
     if not isinstance(args, dict):
@@ -309,23 +480,25 @@ async def execute(operation, args, store):
     if operation == "add_account":
         label = _required(args, "label")
         provider_name = _required(args, "provider").lower()
-        if provider_name not in ("linode", "vultr", "hetzner"):
-            raise InputError("provider must be linode, vultr, or hetzner")
+        if provider_name not in ("linode", "vultr", "hetzner", "upcloud", "cloudferro"):
+            raise InputError("provider must be linode, vultr, hetzner, upcloud, or cloudferro")
         token = _required(args, "token")
-        proxy = args.get("proxy") or None
+        proxy = _normalize_proxy_value(args.get("proxy"))
         proxy_family = args.get("proxy_family") or "default"
         auto_backup = args.get("auto_backup") or "disabled"
         region = _normalize_country(args.get("region"))
+        note = str(args.get("note") or "").strip()
         proxy_provider_id = args.get("proxy_provider_id")
         if proxy_provider_id and not region:
             raise InputError("Account country / region is required to allocate from proxy providers")
 
-        if hasattr(store, "add_account") and "region" in store.add_account.__code__.co_varnames:
-            acc_id = store.add_account(label, provider_name, token, proxy=proxy,
-                                       proxy_family=proxy_family, auto_backup=auto_backup, region=region)
-        else:
-            acc_id = store.add_account(label, provider_name, token, proxy=proxy,
-                                       proxy_family=proxy_family, auto_backup=auto_backup)
+        add_params = store.add_account.__code__.co_varnames if hasattr(store, "add_account") else ()
+        kwargs = {"proxy": proxy, "proxy_family": proxy_family, "auto_backup": auto_backup}
+        if "region" in add_params:
+            kwargs["region"] = region
+        if "note" in add_params:
+            kwargs["note"] = note
+        acc_id = store.add_account(label, provider_name, token, **kwargs)
 
         allocated_info = None
         if proxy_provider_id:
@@ -357,13 +530,14 @@ async def execute(operation, args, store):
         _delete_cache(store, "all_servers")
         _delete_cache(store, "all_floating_ips")
         _delete_cache(store, "all_billing")
-        resp = {"id": acc_id, "label": label, "provider": provider_name, "region": region}
+        resp = {"id": acc_id, "label": label, "provider": provider_name, "region": region, "note": note}
         if allocated_info:
             resp["allocated_proxy"] = {
                 "country": allocated_info.get("country", region),
                 "session": allocated_info.get("session"),
-                "proxy": allocated_info.get("proxy"),
+                "proxy_masked": "configured",
             }
+        _record_activity(store, "ADD_ACCOUNT", provider=provider_name, target=label, status="success", details=f"Region: {region or 'none'}")
         return resp
 
     if operation == "delete_account":
@@ -374,39 +548,44 @@ async def execute(operation, args, store):
         _delete_cache(store, "all_floating_ips")
         _delete_cache(store, "all_billing")
         _delete_cache(store, f"primary_ips:{account_id}")
+        _record_activity(store, "DELETE_ACCOUNT", provider="", target=str(account_id), status="success" if n > 0 else "failed", details=f"Deleted account ID {account_id}")
         return {"deleted": n > 0, "account_id": account_id}
 
     if operation == "check_all_accounts":
+        accs = _scope_accounts(store, args)
         force_refresh = bool(args.get("refresh") or args.get("force"))
         if not force_refresh:
-            cached = _get_cache(store, "all_billing")
+            cached = _snapshot_cache(store, 'all_billing') if args.get('cached_only') else _get_cache(store, 'all_billing')
             if cached is not None and isinstance(cached, dict) and "accounts" in cached:
-                return cached
-
-        accs = store.accounts()
+                return _scoped_snapshot(cached, 'accounts', accs) if args.get('cached_only') or args.get('provider') or args.get('account_id') else cached
+        if args.get('cached_only'):
+            return _scoped_snapshot({}, 'accounts', accs)
 
         async def _check_one(acc):
             try:
                 p = Provider(acc)
                 info = await p.account_info()
                 ident = await p.whoami()
-                return {
+                item = {
                     "account": _account_public(acc, store),
                     "status": "ok",
                     "info": info,
                     "identity": ident,
                 }
+                if acc["provider"] == "cloudferro":
+                    item["limits"] = await p.cloudferro_resource_limits()
+                item.update(account_suspension(await p.list_servers(), info))
+                return item
             except Exception as exc:
                 return {
                     "account": _account_public(acc, store),
                     "status": "error",
-                    "error": str(exc),
+                    "error": _safe_error(exc, acc),
                 }
 
         results = await asyncio.gather(*[_check_one(a) for a in accs], return_exceptions=True)
         res = {"accounts": [r for r in results if isinstance(r, dict)], "cached_at": time.time()}
-        _set_cache(store, "all_billing", res)
-        return res
+        return _save_scoped_snapshot(store, 'all_billing', 'accounts', res, accs)
 
     if operation == "test_account":
         account = _account(store, args)
@@ -415,6 +594,7 @@ async def execute(operation, args, store):
         try:
             ident = await p.whoami()
             info = await p.account_info()
+            health = account_suspension(await p.list_servers(), info)
             latency_ms = round((time.time() - start_t) * 1000, 1)
             return {
                 "status": "ok",
@@ -422,12 +602,13 @@ async def execute(operation, args, store):
                 "identity": ident,
                 "info": info,
                 "latency_ms": latency_ms,
+                **health,
             }
         except Exception as exc:
             return {
                 "status": "error",
                 "account": _account_public(account, store),
-                "error": str(exc),
+                "error": _safe_error(exc, account),
             }
 
     if operation == "set_account_region":
@@ -436,6 +617,40 @@ async def execute(operation, args, store):
         if hasattr(store, "set_account_region"):
             store.set_account_region(account["id"], region)
         _delete_cache(store, "all_billing")
+        _delete_cache(store, "all_servers")
+        _delete_cache(store, "all_floating_ips")
+        updated = store.account(account["id"])
+        return {"updated": True, "account": _account_public(updated, store)}
+
+    if operation == "update_account":
+        account = _account(store, args)
+        label = str(args.get("label", account["label"]) or "").strip()
+        if not label:
+            raise InputError("Account name is required")
+        token = str(args.get("token") or "").strip() or None
+        if token is not None:
+            candidate = {**account, "token": token}
+            try:
+                await Provider(candidate).account_info()
+            except Exception as exc:
+                message = _safe_error(exc, candidate)
+                message = _safe_error(Exception(message), account)
+                raise InputError(f"Replacement API token could not be verified: {message}") from None
+        store.update_account(account["id"], label, token)
+        for key in ("all_billing", "all_servers", "all_floating_ips", f"primary_ips:{account['id']}"):
+            _delete_cache(store, key)
+        _record_activity(store, "UPDATE_ACCOUNT", provider=account["provider"],
+                         target=str(account["id"]), details="API token replaced" if token else "Account renamed")
+        return {"updated": True, "account": _account_public(store.account(account["id"]), store)}
+
+    if operation == "set_account_note":
+        account = _account(store, args)
+        note = str(args.get("note") or "").strip()
+        if hasattr(store, "set_account_note"):
+            store.set_account_note(account["id"], note)
+        _delete_cache(store, "all_billing")
+        _delete_cache(store, "all_servers")
+        _delete_cache(store, "all_floating_ips")
         updated = store.account(account["id"])
         return {"updated": True, "account": _account_public(updated, store)}
 
@@ -451,6 +666,8 @@ async def execute(operation, args, store):
         if hasattr(store, "set_account_region"):
             store.set_account_region(account["id"], res.get("country", country))
         _delete_cache(store, "all_billing")
+        _delete_cache(store, "all_servers")
+        _delete_cache(store, "all_floating_ips")
         updated = store.account(account["id"])
         return {"updated": True, "account": _account_public(updated, store), "allocated": res}
 
@@ -478,16 +695,14 @@ async def execute(operation, args, store):
 
     if operation == "set_account_proxy":
         account = _account(store, args)
-        proxy = args.get("proxy")
+        proxy = _normalize_proxy_value(args.get("proxy"))
         proxy_family = args.get("proxy_family") or "default"
-        if proxy is not None:
-            proxy = str(proxy).strip()
-            if not proxy:
-                proxy = None
         store.set_proxy(account["id"], proxy, proxy_family=proxy_family)
         if "region" in args and hasattr(store, "set_account_region"):
             store.set_account_region(account["id"], _normalize_country(args["region"]))
         _delete_cache(store, "all_billing")
+        _delete_cache(store, "all_servers")
+        _delete_cache(store, "all_floating_ips")
         updated = store.account(account["id"])
         return {"updated": True, "account": _account_public(updated, store)}
 
@@ -510,28 +725,42 @@ async def execute(operation, args, store):
             raise InputError("proxy string or account_id with configured proxy is required")
 
         p_url = proxy_url(raw_proxy)
+        meter = ProxyUsage(p_url)
         start_t = time.time()
-        try:
-            headers = {"User-Agent": "Mozilla/5.0"}
-            is_socks = bool(p_url) and p_url.startswith(("socks5", "socks4"))
-            timeout = aiohttp.ClientTimeout(total=10)
-            if is_socks:
-                try:
-                    from aiohttp_socks import ProxyConnector
-                    conn = ProxyConnector.from_url(p_url)
-                    async with aiohttp.ClientSession(timeout=timeout, connector=conn) as s:
-                        async with s.get("https://api.ipify.org?format=json", headers=headers) as r:
-                            data = await r.json()
-                except ImportError:
-                    raise InputError("aiohttp-socks is required for SOCKS proxy testing")
-            else:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.get("https://api.ipify.org?format=json", proxy=p_url, headers=headers) as r:
-                        data = await r.json()
-            latency_ms = round((time.time() - start_t) * 1000, 1)
-            return {"status": "ok", "ip": data.get("ip"), "latency_ms": latency_ms}
-        except Exception as exc:
-            return {"status": "error", "error": str(exc)}
+        max_attempts = 4
+        last_exc = None
+        for attempt in range(1, max_attempts + 1):
+            meter.ensure_available()
+            try:
+                headers = {"User-Agent": "Mozilla/5.0"}
+                is_socks = bool(p_url) and p_url.startswith(("socks5", "socks4"))
+                timeout = aiohttp.ClientTimeout(total=90, connect=45, sock_read=60)
+                if is_socks:
+                    try:
+                        from aiohttp_socks import ProxyConnector
+                        conn = ProxyConnector.from_url(p_url)
+                        async with aiohttp.ClientSession(timeout=timeout, connector=conn, trace_configs=meter.trace_configs()) as s:
+                            async with s.get("https://api.ipify.org?format=json", headers=headers) as r:
+                                data = await meter.json(r)
+                    except ImportError:
+                        raise InputError("aiohttp-socks is required for SOCKS proxy testing")
+                else:
+                    async with aiohttp.ClientSession(timeout=timeout, trace_configs=meter.trace_configs()) as s:
+                        async with s.get("https://api.ipify.org?format=json", proxy=p_url, headers=headers) as r:
+                            data = await meter.json(r)
+                latency_ms = round((time.time() - start_t) * 1000, 1)
+                return {"status": "ok", "ip": data.get("ip"), "latency_ms": latency_ms}
+            except (InputError, TrafficLimitExceeded):
+                raise
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_attempts:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+                err_str = str(last_exc)
+                if not err_str.lower().startswith("proxy failed"):
+                    err_str = f"Proxy failed: {err_str}"
+                return {"status": "error", "error": err_str}
 
     if operation == "proxy_providers":
         providers_list = store.proxy_providers()
@@ -551,6 +780,10 @@ async def execute(operation, args, store):
             p["active_sessions"] = sum(1 for s in sessions if s.get("enabled", 1))
             p["bound_accounts"] = bindings.get(p["id"], [])
             tpl = p.get("template") or {}
+            p['identity_kind'] = 'port' if tpl.get('port') == '{port}' else 'session'
+            p['usage_limit_gb'] = p.get('usage_limit_bytes', 0) / 1_000_000_000
+            p['usage_gb'] = p.get('usage_bytes', 0) / 1_000_000_000
+            p['usage_exhausted'] = bool(p.get('usage_limit_bytes') and p.get('usage_bytes', 0) >= p['usage_limit_bytes'])
             scheme = tpl.get("scheme", "http")
             host = tpl.get("host", "")
             port = tpl.get("port", "")
@@ -599,10 +832,13 @@ async def execute(operation, args, store):
 
     if operation == "add_proxy_provider":
         label = _required(args, "label")
-        template = _required(args, "template")
+        template = args.get("template")
+        if template is None or isinstance(template, bool) or (isinstance(template, str) and not template.strip()):
+            raise InputError("template is required")
         ids_input = args.get("session_ids") or ""
         from proxy_pool import session_ids, import_format, proxy_string, ProxyPoolError
 
+        extra_ids = []
         if isinstance(template, dict):
             tpl_dict = template
         elif isinstance(template, str):
@@ -611,8 +847,6 @@ async def execute(operation, args, store):
             if "://" not in tpl_str and not tpl_str.startswith(("http://", "https://", "socks4://", "socks5://")):
                 tpl_str = f"{scheme}://{tpl_str}"
             tpl_dict, extra_ids = import_format(tpl_str)
-            if extra_ids and not ids_input:
-                ids_input = extra_ids
         else:
             raise InputError("Invalid template format")
 
@@ -633,16 +867,22 @@ async def execute(operation, args, store):
         else:
             raw_ids = []
 
-        ids = session_ids("\n".join(raw_ids))
+        combined_ids = list(dict.fromkeys(raw_ids + extra_ids))
+        ids = session_ids("\n".join(combined_ids))
         if not ids:
             raise InputError("At least one valid session ID is required")
 
-        pid = store.add_proxy_provider(label, tpl_dict, ids, family=args.get("family", "default"))
+        options = {'family': args.get('family', 'default')}
+        if 'usage_limit_gb' in args:
+            options['usage_limit_gb'] = args['usage_limit_gb']
+        pid = store.add_proxy_provider(label, tpl_dict, ids, **options)
         return {"id": pid, "label": label, "sessions_count": len(ids)}
 
     if operation == "update_proxy_provider":
         pid = int(_required(args, "provider_id"))
         updated = {}
+        if 'usage_limit_gb' in args or args.get('reset_usage'):
+            store.configure_proxy_usage(pid, limit_gb=args.get('usage_limit_gb'), reset=bool(args.get('reset_usage')))
         if "label" in args and str(args["label"]).strip():
             new_label = str(args["label"]).strip()
             store.manage_proxy_provider(pid, "rename", new_label)
@@ -724,7 +964,58 @@ async def execute(operation, args, store):
                 pass
         raw = args.get("raw_text") or args.get("text") or ""
         extracted = _extract_session_ids_from_text(raw, template_username=tpl_username)
-        return {"session_ids": extracted, "count": len(extracted)}
+        detected_template = None
+        detected_country = None
+        suggested_label = None
+        if 'gw.dataimpulse.com' in str(raw):
+            from proxy_pool import import_format
+            try:
+                detected_template, extracted = import_format(raw)
+                return {'session_ids': extracted, 'count': len(extracted), 'identity_kind': 'port',
+                        'detected_template': detected_template, 'suggested_label': 'DataImpulse'}
+            except ValueError as exc:
+                raise InputError(str(exc)) from None
+        try:
+            from proxy_pool import components, inferred_username
+            for line in str(raw).splitlines():
+                line = line.strip()
+                if not line or line.startswith(('#', '//')):
+                    continue
+                line = line.split()[0].rstrip(',;').strip('\"\'')
+                if ':' in line:
+                    try:
+                        comp = components(line)
+                        inf = inferred_username(comp.get("username", ""))
+                        if inf:
+                            tpl_user, c_code, _ = inf
+                            detected_country = c_code
+                            detected_template = {
+                                "scheme": comp.get("scheme", "http"),
+                                "host": comp.get("host", ""),
+                                "port": comp.get("port", 80),
+                                "username": tpl_user,
+                                "password": comp.get("password", ""),
+                                "auth": comp.get("auth", True),
+                            }
+                            host_str = comp.get("host", "")
+                            if "swiftproxy" in host_str.lower():
+                                suggested_label = f"SwiftProxy Pool ({host_str})"
+                            elif "webshare" in host_str.lower():
+                                suggested_label = f"Webshare Pool ({host_str})"
+                            elif host_str:
+                                suggested_label = f"Proxy Pool ({host_str})"
+                            break
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return {
+            "session_ids": extracted,
+            "count": len(extracted),
+            "detected_template": detected_template,
+            "detected_country": detected_country,
+            "suggested_label": suggested_label,
+        }
 
     if operation == "auto_heal_proxies":
         accs = store.accounts()
@@ -747,10 +1038,15 @@ async def execute(operation, args, store):
             error_reason = ""
             try:
                 p = Provider(acc)
-                await asyncio.wait_for(p.whoami(), timeout=10)
+                await asyncio.wait_for(p.whoami(), timeout=120)
             except Exception as e:
-                is_broken = True
                 error_reason = str(e)
+                if not acc.get("proxy") or not is_proxy_failure(e):
+                    skipped.append({"id": acc["id"], "label": acc["label"],
+                                    "reason": "Account/API error; proxy replacement is not indicated",
+                                    "error": error_reason})
+                    continue
+                is_broken = True
 
             if not is_broken and not args.get("force", False):
                 skipped.append({"id": acc["id"], "label": acc["label"], "reason": "Connection healthy"})
@@ -777,7 +1073,7 @@ async def execute(operation, args, store):
                     updated_acc = store.account(acc["id"])
                     p_new = Provider(updated_acc)
                     start_t = time.time()
-                    ident = await asyncio.wait_for(p_new.whoami(), timeout=12)
+                    ident = await asyncio.wait_for(p_new.whoami(), timeout=120)
                     lat_ms = round((time.time() - start_t) * 1000, 1)
 
                     healed.append({
@@ -793,7 +1089,8 @@ async def execute(operation, args, store):
                     allocated = True
                     break
                 except Exception as alloc_err:
-                    log.warning("Auto-heal failed for account %s on provider %s: %s", acc["id"], pid, alloc_err)
+                    log.warning("Auto-heal failed for account %s on provider %s: %s",
+                                acc["id"], pid, _safe_error(alloc_err, acc))
                     continue
 
             if not allocated:
@@ -847,15 +1144,14 @@ async def execute(operation, args, store):
 
     # ---- All Servers & Floating IPs (Multi-cloud Dashboard) ------------
     if operation == "all_servers":
+        accs = _scope_accounts(store, args)
         force_refresh = bool(args.get("refresh") or args.get("force"))
         if not force_refresh:
-            cached = _get_cache(store, "all_servers")
+            cached = _snapshot_cache(store, 'all_servers') if args.get('cached_only') else _get_cache(store, 'all_servers')
             if cached is not None and isinstance(cached, dict) and "servers" in cached:
-                cached_at = cached.get("cached_at")
-                if cached_at is None or (time.time() - cached_at < 300):
-                    return cached
-
-        accs = store.accounts()
+                return _scoped_snapshot(cached, 'servers', accs) if args.get('cached_only') or args.get('provider') or args.get('account_id') else cached
+        if args.get('cached_only'):
+            return _scoped_snapshot({}, 'servers', accs)
         account_errors = {}
 
         async def _fetch_acc_servers(acc):
@@ -889,6 +1185,26 @@ async def execute(operation, args, store):
                                     })
                     except Exception:
                         pass
+                elif acc["provider"] == "upcloud":
+                    try:
+                        for f in await p.upcloud_ip_addresses():
+                            s_id = str(f.get("server_id") or "")
+                            if s_id and f.get("floating"):
+                                f_map.setdefault(s_id, []).append(f)
+                    except Exception as exc:
+                        # Keep the server row, but surface stale IP inventory
+                        # so callers can retry and understand the partial view.
+                        log.warning("Failed listing UpCloud IPs for account %s: %s",
+                                    acc["id"], _safe_error(exc, acc))
+                        account_errors[str(acc["id"])] = _safe_error(exc, acc)
+                elif acc["provider"] == "cloudferro":
+                    try:
+                        for f in await p.cloudferro_floating_ips():
+                            s_id = str(f.get("server_id") or "")
+                            if s_id:
+                                f_map.setdefault(s_id, []).append(f)
+                    except Exception as exc:
+                        account_errors[str(acc["id"])] = _safe_error(exc, acc)
 
                 enriched = []
                 for s in s_list:
@@ -901,8 +1217,9 @@ async def execute(operation, args, store):
                     enriched.append(sp)
                 return enriched
             except Exception as exc:
-                log.warning("Failed listing servers for account %s: %s", acc["id"], exc)
-                account_errors[str(acc["id"])] = str(exc)
+                log.warning("Failed listing servers for account %s: %s",
+                            acc["id"], _safe_error(exc, acc))
+                account_errors[str(acc["id"])] = _safe_error(exc, acc)
                 return []
 
         gathered = await asyncio.gather(*[_fetch_acc_servers(a) for a in accs], return_exceptions=True)
@@ -911,24 +1228,19 @@ async def execute(operation, args, store):
             if isinstance(g, list):
                 servers.extend(g)
         result = {"servers": servers, "account_errors": account_errors, "cached_at": time.time()}
-        _set_cache(store, "all_servers", result)
-        return result
+        return _save_scoped_snapshot(store, 'all_servers', 'servers', result, accs)
 
     if operation == "all_floating_ips":
-        acc_id = args.get("account_id")
+        accs = _scope_accounts(store, args)
         force_refresh = bool(args.get("refresh") or args.get("force"))
-        if acc_id is None and not force_refresh:
-            cached = _get_cache(store, "all_floating_ips")
+        if not force_refresh:
+            cached = _snapshot_cache(store, 'all_floating_ips') if args.get('cached_only') else _get_cache(store, 'all_floating_ips')
             if cached is not None and isinstance(cached, dict) and "floating_ips" in cached:
-                cached_at = cached.get("cached_at")
-                if cached_at is None or (time.time() - cached_at < 300):
-                    return cached
+                return _scoped_snapshot(cached, 'floating_ips', accs) if args.get('cached_only') or args.get('provider') or args.get('account_id') else cached
+        if args.get('cached_only'):
+            return _scoped_snapshot({}, 'floating_ips', accs)
 
-        if acc_id is not None:
-            accs = [store.account(int(acc_id))]
-            accs = [a for a in accs if a]
-        else:
-            accs = store.accounts()
+        account_errors = {}
 
         async def _fetch_acc_fips(acc):
             rows = []
@@ -973,8 +1285,37 @@ async def execute(operation, args, store):
                             "status": "assigned" if inst_id else "unassigned",
                             "protection": False,
                         })
+                elif acc["provider"] == "upcloud":
+                    for f in await p.upcloud_ip_addresses():
+                        if not f.get("floating"):
+                            continue
+                        srv_id = str(f.get("server_id") or "") or None
+                        rows.append({
+                            **f,
+                            "id": f.get("address"),
+                            "account_id": acc["id"],
+                            "account_label": acc["label"],
+                            "provider": "upcloud",
+                            "ip": f.get("address"),
+                            "type": f.get("family"),
+                            "name": "",
+                            "server_id": srv_id,
+                            "region": f.get("zone"),
+                            "country": region_country("upcloud", f.get("zone")),
+                            "dns_ptr": f.get("ptr"),
+                            "status": "assigned" if srv_id else "unassigned",
+                            "protection": False,
+                        })
+                elif acc["provider"] == "cloudferro":
+                    for f in await p.cloudferro_floating_ips():
+                        rows.append({**f, "account_id": acc["id"], "account_label": acc["label"],
+                                     "provider": "cloudferro", "name": "", "region": "waw3-1",
+                                     "country": "PL", "status": f.get("status", "unassigned"),
+                                     "server_id": f.get("server_id")})
             except Exception as exc:
-                log.warning("Failed listing floating IPs for account %s: %s", acc["id"], exc)
+                log.warning("Failed listing floating IPs for account %s: %s",
+                            acc["id"], _safe_error(exc, acc))
+                account_errors[str(acc["id"])] = _safe_error(exc, acc)
             return rows
 
         gathered = await asyncio.gather(*[_fetch_acc_fips(a) for a in accs], return_exceptions=True)
@@ -982,10 +1323,9 @@ async def execute(operation, args, store):
         for g in gathered:
             if isinstance(g, list):
                 all_fips.extend(g)
-        result = {"floating_ips": all_fips, "cached_at": time.time()}
-        if acc_id is None:
-            _set_cache(store, "all_floating_ips", result)
-        return result
+        result = {"floating_ips": all_fips, "account_errors": account_errors,
+                  "cached_at": time.time()}
+        return _save_scoped_snapshot(store, 'all_floating_ips', 'floating_ips', result, accs)
 
     # ---- Watchdog & Tunnels & Proxy Pool --------------------------------
     if operation == "watch_status":
@@ -1002,12 +1342,99 @@ async def execute(operation, args, store):
                             for row in store.tunnels()]}
 
     if operation == "proxy_pool":
-        providers_list = store.proxy_providers()
-        claims = [dict(c) for c in store.con.execute("SELECT * FROM proxy_claims ORDER BY claimed_at DESC LIMIT 50")]
+        providers_list = []
+        for prov in store.proxy_providers():
+            prov = dict(prov)
+            if isinstance(prov.get("template"), dict):
+                prov["template"] = {k: ("***" if k in ("username", "password") else v)
+                                    for k, v in prov["template"].items()}
+            providers_list.append(prov)
+        claims = [dict(c) for c in store.con.execute("SELECT account_id, provider_id, country, session_id, expires_at FROM proxy_claims ORDER BY rowid DESC LIMIT 50")]
         return {"providers": providers_list, "recent_claims": claims}
+
+    # ---- System and Activity Logs --------------------------------------
+    if operation == "activity_logs":
+        limit = int(args.get("limit") or 100)
+        action = args.get("action")
+        provider_filter = args.get("provider")
+        status_filter = args.get("status")
+        items = store.get_activity_logs(limit=limit, action=action, provider=provider_filter, status=status_filter) if hasattr(store, "get_activity_logs") else []
+        return {"activity_logs": items, "count": len(items)}
+
+    if operation == "system_logs":
+        service = str(args.get("service") or "all").strip().lower()
+        lines = int(args.get("lines") or 150)
+        lines = max(10, min(lines, 500))
+        level_filter = str(args.get("level") or "").strip().lower()
+
+        unit_map = {
+            "all": ["-u", "cloudbot", "-u", "cloudbot-control-api", "-u", "probeapi"],
+            "cloudbot": ["-u", "cloudbot"],
+            "control_api": ["-u", "cloudbot-control-api"],
+            "probeapi": ["-u", "probeapi"],
+        }
+        cmd_units = unit_map.get(service, ["-u", "cloudbot", "-u", "cloudbot-control-api", "-u", "probeapi"])
+        cmd = ["journalctl", *cmd_units, "-n", str(lines), "--no-pager", "-o", "short-iso"]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            raw_text = stdout.decode("utf-8", errors="replace")
+            log_entries = []
+            for line in raw_text.splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split(" ", 3)
+                ts = parts[0] if len(parts) > 0 else ""
+                host = parts[1] if len(parts) > 1 else ""
+                proc_info = parts[2] if len(parts) > 2 else ""
+                msg = parts[3] if len(parts) > 3 else line
+                lower_line = line.lower()
+                lvl = "info"
+                if "error" in lower_line or "exception" in lower_line or "fatal" in lower_line or "critical" in lower_line or "traceback" in lower_line:
+                    lvl = "error"
+                elif "warn" in lower_line or "warning" in lower_line:
+                    lvl = "warning"
+                elif "debug" in lower_line:
+                    lvl = "debug"
+
+                if level_filter and level_filter != "all" and lvl != level_filter:
+                    continue
+
+                log_entries.append({
+                    "raw": line,
+                    "ts": ts,
+                    "host": host,
+                    "process": proc_info,
+                    "message": msg,
+                    "level": lvl,
+                })
+            return {"logs": log_entries, "service": service, "lines_requested": lines, "count": len(log_entries)}
+        except Exception as exc:
+            log.warning("system_logs journalctl read failed: %s", exc)
+            return {
+                "logs": [
+                    {
+                        "raw": f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')} local cloudbot[info]: Journalctl standby ({exc})",
+                        "ts": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                        "host": "localhost",
+                        "process": "cloudbot",
+                        "message": f"Journalctl standby ({exc})",
+                        "level": "info",
+                    }
+                ],
+                "service": service,
+                "lines_requested": lines,
+                "count": 1,
+            }
 
     # ---- Cloudflare DNS ------------------------------------------------
     if operation in {"dns_zones", "dns_record", "dns_records", "upsert_dns", "delete_dns_record"}:
+        if operation == 'dns_zones' and args.get('cached_only'):
+            return _get_cache(store, 'dns_zones', {'zones': []})
         token = store.cf_token()
         if not token:
             if operation == "dns_zones":
@@ -1016,7 +1443,9 @@ async def execute(operation, args, store):
         cf = Cloudflare(token)
 
         if operation == "dns_zones":
-            return {"zones": [{"id": zid, "name": name} for zid, name in await cf.zones()]}
+            result = {"zones": [{"id": zid, "name": name} for zid, name in await cf.zones()]}
+            _set_cache(store, 'dns_zones', result)
+            return result
 
         if operation == "dns_records":
             zone_id = args.get("zone_id")
@@ -1062,13 +1491,75 @@ async def execute(operation, args, store):
         return {"action": action, "zone": zone_name, "record": _dns_public(result)}
 
     # ---- Per-Account Provider Operations -------------------------------
+    if operation == 'hetzner_primary_ips' and args.get('cached_only'):
+        account = _account(store, args)
+        if account['provider'] != 'hetzner':
+            raise InputError('Primary IPs are only supported on Hetzner')
+        return _snapshot_cache(store, f"primary_ips:{account['id']}") or {'primary_ips': []}
+
     account = _account(store, args)
     provider = Provider(account)
     account_id = account["id"]
 
     if operation == "account_info":
-        return {"account": _account_public(account), "info": await provider.account_info(),
-                "identity": await provider.whoami()}
+        result = {"account": _account_public(account), "info": await provider.account_info(),
+                  "identity": await provider.whoami()}
+        if account["provider"] == "cloudferro":
+            result["limits"] = await provider.cloudferro_resource_limits()
+        return result
+
+    if operation == "resource_limits":
+        if account["provider"] != "cloudferro":
+            raise InputError("resource_limits is currently supported for CloudFerro")
+        return await provider.cloudferro_resource_limits()
+
+    # UpCloud exposes interface operations that have no equivalent in the
+    # other adapters. Keep these names explicit so callers cannot accidentally
+    # pass an integer provider ID where an address/UUID string is required.
+    if operation == "upcloud_networking":
+        if account["provider"] != "upcloud":
+            raise InputError("upcloud_networking is only supported for UpCloud")
+        sid = _required(args, "server_id")
+        return {"server_id": sid, "networking": await provider.upcloud_networking(sid)}
+
+    if operation == "upcloud_add_interface_ip":
+        if account["provider"] != "upcloud":
+            raise InputError("upcloud_add_interface_ip is only supported for UpCloud")
+        _confirm(args, "ADD_INTERFACE_IP")
+        sid = _required(args, "server_id")
+        interface_index = _required(args, "interface_index")
+        family = args.get("family") or "IPv4"
+        address = args.get("address")
+        result = await provider.add_upcloud_interface_ip(
+            sid, int(interface_index), address=address, family=family,
+            force=bool(args.get("force")))
+        _delete_cache(store, "all_servers")
+        _delete_cache(store, "all_floating_ips")
+        return {"added": True, "server_id": sid, "interface_index": int(interface_index),
+                "result": result}
+
+    if operation == "upcloud_remove_interface_ip":
+        if account["provider"] != "upcloud":
+            raise InputError("upcloud_remove_interface_ip is only supported for UpCloud")
+        _confirm(args, "REMOVE_INTERFACE_IP")
+        sid = _required(args, "server_id")
+        interface_index = _required(args, "interface_index")
+        address = _required(args, "address")
+        result = await provider.remove_upcloud_interface_ip(sid, int(interface_index), address)
+        _delete_cache(store, "all_servers")
+        _delete_cache(store, "all_floating_ips")
+        return {"removed": True, "server_id": sid, "interface_index": int(interface_index),
+                "address": address, "result": result}
+
+    if operation == "upcloud_delete_ip":
+        if account["provider"] != "upcloud":
+            raise InputError("upcloud_delete_ip is only supported for UpCloud")
+        _confirm(args, "DELETE_FLOATING_IP")
+        address = _required(args, "address")
+        result = await provider.delete_upcloud_ip(address)
+        _delete_cache(store, "all_servers")
+        _delete_cache(store, "all_floating_ips")
+        return {"deleted": True, "address": address, "result": result}
 
     if operation == "servers":
         return {"account": _account_public(account),
@@ -1085,7 +1576,14 @@ async def execute(operation, args, store):
             if stored is not None and isinstance(stored, dict) and "regions" in stored:
                 _set_op_cache(cache_key, stored, ttl=86400)
                 return stored
-        res = await provider.regions(force=force)
+        try:
+            res = await provider.regions(force=force)
+        except Exception:
+            # Preserve a known-good catalog across transient refresh errors.
+            stored = _get_cache(store, cache_key)
+            if isinstance(stored, dict) and "regions" in stored:
+                return stored
+            raise
         if provider.provider == "linode":
             asyncio.create_task(provider.precache_linode_plans(res))
         out = {"regions": [{"id": key, "label": label} for key, label in res]}
@@ -1113,7 +1611,11 @@ async def execute(operation, args, store):
 
     if operation == "images":
         force = bool(args.get("force") or args.get("refresh"))
-        cache_key = f"images:{account['provider']}:{account['id']}"
+        region = args.get("region")
+        # UpCloud templates may be zone-specific; keep each zone's catalog
+        # distinct so the deployment wizard never reuses incompatible images.
+        cache_suffix = (f":{region}" if account["provider"] == "upcloud" else "")
+        cache_key = f"images:{account['provider']}:{account['id']}{cache_suffix}"
         if not force:
             cached = _get_op_cache(cache_key)
             if cached is not None:
@@ -1123,7 +1625,7 @@ async def execute(operation, args, store):
                 _set_op_cache(cache_key, stored, ttl=86400)
                 return stored
         try:
-            res = await provider.images(force=force)
+            res = await provider.images(region=region, force=force)
         except TypeError:
             res = await provider.images()
         out = {"images": [{"id": key, "label": label} for key, label in res]}
@@ -1140,6 +1642,8 @@ async def execute(operation, args, store):
             cached = _get_cache(store, cache_key)
             if cached is not None and isinstance(cached, dict) and "primary_ips" in cached:
                 return cached
+        if args.get('cached_only'):
+            return {'primary_ips': []}
         pips = await provider.hetzner_primary_ips()
         res = {"primary_ips": pips, "cached_at": time.time()}
         _set_cache(store, cache_key, res)
@@ -1202,25 +1706,67 @@ async def execute(operation, args, store):
         # Resolve SSH keys if provided
         ssh_keys = args.get("ssh_keys") or []
         ssh_key_ids = args.get("ssh_key_ids") or []
-        resolved_ssh = []
+        use_vault_keys = args.get("use_vault_keys")
 
+        all_vault = store.ssh_keys()
+        vault_by_id = {k["id"]: k for k in all_vault}
+        vault_by_name = {k["name"]: k for k in all_vault}
+
+        # If no explicit keys provided and use_vault_keys not explicitly disabled, use vault keys
+        if not ssh_keys and not ssh_key_ids and (use_vault_keys is None or use_vault_keys):
+            ssh_key_ids = [k["id"] for k in all_vault]
+
+        resolved_ssh = []
         if ssh_key_ids:
             for kid in ssh_key_ids:
-                stored = store.ssh_key(int(kid))
-                if stored:
-                    resolved_ssh.append(stored)
+                try:
+                    kid_int = int(kid)
+                    stored = vault_by_id.get(kid_int) or store.ssh_key(kid_int)
+                    if stored:
+                        resolved_ssh.append(stored)
+                except (ValueError, TypeError):
+                    pass
+
+        raw_keys_to_pass = []
+        for raw_k in ssh_keys:
+            if not raw_k:
+                continue
+            raw_str = str(raw_k).strip()
+            if raw_str in vault_by_name:
+                resolved_ssh.append(vault_by_name[raw_str])
+            elif raw_str.isdigit() and int(raw_str) in vault_by_id:
+                resolved_ssh.append(vault_by_id[int(raw_str)])
+            elif raw_str.startswith(("ssh-", "ecdsa-")):
+                if account["provider"] in ("hetzner", "vultr"):
+                    resolved_ssh.append({"id": 0, "name": f"auto-{secrets.token_hex(4)}", "public_key": raw_str})
+                else:
+                    raw_keys_to_pass.append(raw_str)
+            else:
+                raw_keys_to_pass.append(raw_str)
+
+        # Deduplicate resolved_ssh by public key
+        seen_pubs = set()
+        deduped_resolved = []
+        for item in resolved_ssh:
+            pub = item.get("public_key")
+            if pub and pub not in seen_pubs:
+                seen_pubs.add(pub)
+                deduped_resolved.append(item)
+            elif not pub and item not in deduped_resolved:
+                deduped_resolved.append(item)
 
         # Upload or adapt keys for specific provider if needed
         provider_keys = []
-        if resolved_ssh:
+        if deduped_resolved:
             try:
-                resolved = await provider.resolve_ssh_keys_for_instance(resolved_ssh)
+                resolved = await provider.resolve_ssh_keys_for_instance(deduped_resolved)
                 if resolved:
                     provider_keys.extend(resolved)
             except Exception as exc:
                 log.warning("Failed resolving SSH keys for account %s: %s", account_id, exc)
-        for raw_k in ssh_keys:
-            provider_keys.append(raw_k)
+        for raw_k in raw_keys_to_pass:
+            if raw_k not in provider_keys:
+                provider_keys.append(raw_k)
 
         if count == 1:
             srv_name = name
@@ -1236,12 +1782,23 @@ async def execute(operation, args, store):
                                                   auto_backup=account.get("auto_backup"),
                                                   ssh_keys=provider_keys if provider_keys else None,
                                                   enable_ipv6=enable_ipv6)
-            store.set_server_pass(account_id, server["id"], server.get("root_password") or password)
+            returned_password = server.get("root_password")
+            # UpCloud may not return a password for cloud-init/SSH-only
+            # templates.  The generated fallback was never sent to that API,
+            # so storing it would create unusable credentials in the vault.
+            stored_password = returned_password or (None if account["provider"] == "upcloud" else password)
+            if stored_password:
+                store.set_server_pass(account_id, server["id"], stored_password)
             _delete_cache(store, "all_servers")
-            return {"server": _server_public(server), "servers": [_server_public(server)], "created_count": 1, "password_stored": True}
+            _record_activity(store, "CREATE_SERVER", provider=account.get("provider", ""),
+                                  target=server.get("name") or srv_name, status="success",
+                                  details=f"Plan: {plan}, Region: {region}, Image: {image}")
+            return {"server": _server_public(server), "servers": [_server_public(server)], "created_count": 1,
+                    "password_stored": bool(stored_password)}
 
         # Multiple server batch creation
         created_list = []
+        password_stored = False
         enable_ipv6 = bool(args.get("enable_ipv6", False))
         for i in range(1, count + 1):
             if re.search(r"-\d+$", name):
@@ -1260,7 +1817,11 @@ async def execute(operation, args, store):
                                                       auto_backup=account.get("auto_backup"),
                                                       ssh_keys=provider_keys if provider_keys else None,
                                                       enable_ipv6=enable_ipv6)
-                store.set_server_pass(account_id, srv["id"], srv.get("root_password") or pwd)
+                returned_password = srv.get("root_password")
+                stored_password = returned_password or (None if account["provider"] == "upcloud" else pwd)
+                if stored_password:
+                    store.set_server_pass(account_id, srv["id"], stored_password)
+                    password_stored = True
                 created_list.append(_server_public(srv))
             except Exception as e:
                 if not created_list:
@@ -1269,8 +1830,13 @@ async def execute(operation, args, store):
                 break
 
         _delete_cache(store, "all_servers")
+        _record_activity(store, "CREATE_SERVER_BATCH", provider=account.get("provider", ""),
+                              target=f"{name} ({len(created_list)}/{count})",
+                              status="success" if len(created_list) == count else "partial",
+                              details=f"Created {len(created_list)} of {count} servers. Plan: {plan}, Region: {region}")
         return {"servers": created_list, "created_count": len(created_list), "requested_count": count,
-                "server": created_list[0] if created_list else None, "password_stored": True}
+                "server": created_list[0] if created_list else None,
+                "password_stored": password_stored}
 
     if operation == "assign_floating_ip":
         floating_id = _required(args, "floating_id")
@@ -1279,10 +1845,18 @@ async def execute(operation, args, store):
             res = await provider.assign_hetzner_floating_ip(floating_id, server_id)
         elif account["provider"] == "vultr":
             res = await provider.attach_vultr_reserved_ip(floating_id, server_id)
+        elif account["provider"] == "upcloud":
+            _confirm(args, "ASSIGN_FLOATING_IP")
+            res = await provider.attach_upcloud_floating_ip(floating_id, server_id)
+        elif account["provider"] == "cloudferro":
+            res = await provider.attach_cloudferro_floating_ip(
+                floating_id, server_id, port_id=args.get("port_id"))
         else:
             raise InputError(f"Floating IP assignment not supported on {account['provider']}")
         _delete_cache(store, "all_floating_ips")
         _delete_cache(store, "all_servers")
+        _record_activity(store, "ASSIGN_FLOATING_IP", provider=account.get("provider", ""),
+                              target=str(floating_id), status="success", details=f"Assigned to server {server_id}")
         return {"assigned": True, "floating_id": floating_id, "server_id": server_id, "result": res}
 
     if operation == "unassign_floating_ip":
@@ -1291,10 +1865,17 @@ async def execute(operation, args, store):
             res = await provider.unassign_hetzner_floating_ip(floating_id)
         elif account["provider"] == "vultr":
             res = await provider.detach_vultr_reserved_ip(floating_id)
+        elif account["provider"] == "upcloud":
+            _confirm(args, "UNASSIGN_FLOATING_IP")
+            res = await provider.detach_upcloud_floating_ip(floating_id)
+        elif account["provider"] == "cloudferro":
+            res = await provider.detach_cloudferro_floating_ip(floating_id)
         else:
             raise InputError(f"Floating IP unassignment not supported on {account['provider']}")
         _delete_cache(store, "all_floating_ips")
         _delete_cache(store, "all_servers")
+        _record_activity(store, "UNASSIGN_FLOATING_IP", provider=account.get("provider", ""),
+                              target=str(floating_id), status="success", details=f"Detached floating IP {floating_id}")
         return {"unassigned": True, "floating_id": floating_id, "result": res}
 
     if operation == "update_floating_ip":
@@ -1305,6 +1886,16 @@ async def execute(operation, args, store):
             res = await provider.change_hetzner_floating_ip_ptr(floating_id, ip, ptr)
             _delete_cache(store, "all_floating_ips")
             return {"updated": True, "result": res}
+        if account["provider"] == "upcloud":
+            _confirm(args, "UPDATE_FLOATING_IP")
+            release_policy = args.get("release_policy")
+            if ptr is None and release_policy is None:
+                raise InputError("ptr or release_policy is required for UpCloud")
+            res = await provider.update_upcloud_ip(floating_id, ptr=ptr,
+                                                   release_policy=release_policy)
+            _delete_cache(store, "all_floating_ips")
+            _delete_cache(store, "all_servers")
+            return {"updated": True, "floating_id": floating_id, "result": res}
         return {"updated": True}
 
     if operation in {"server", "server_password", "set_server_password", "reset_server_password",
@@ -1327,6 +1918,7 @@ async def execute(operation, args, store):
         attached_fips = await _floating(provider, server_id)
         primary_ips = []
         linode_networking = None
+        upcloud_networking = None
         if account.get("provider") == "hetzner":
             try:
                 all_pips = await provider.hetzner_primary_ips()
@@ -1338,11 +1930,17 @@ async def execute(operation, args, store):
                 linode_networking = await provider.linode_instance_ips(server_id)
             except Exception:
                 pass
+        elif account.get("provider") == "upcloud":
+            try:
+                upcloud_networking = await provider.upcloud_networking(server_id)
+            except Exception:
+                pass
         return {
             "server": srv_pub,
             "floating_ips": attached_fips,
             "primary_ips": primary_ips,
             "linode_networking": linode_networking,
+            "upcloud_networking": upcloud_networking,
         }
 
     if operation == "server_password":
@@ -1388,6 +1986,9 @@ async def execute(operation, args, store):
         target_server_id = _required(args, "target_server_id")
         res = await provider.linode_swap_ips(server_id, target_server_id)
         _delete_cache(store, "all_servers")
+        _record_activity(store, "SWAP_IPS", provider="linode",
+                              target=f"{server_id} <-> {target_server_id}", status="success",
+                              details="Swapped IPv4 addresses between linodes")
         return {"swapped": True, "server_id": server_id, "target_server_id": target_server_id, "result": res}
 
     if operation == "delete_server":
@@ -1396,6 +1997,8 @@ async def execute(operation, args, store):
         store.delete_server_pass(account_id, server_id)
         _delete_cache(store, "all_servers")
         _delete_cache(store, "all_floating_ips")
+        _record_activity(store, "DELETE_SERVER", provider=account.get("provider", ""),
+                              target=str(server_id), status="success", details=f"Server {server_id} destroyed")
         return {"deleted": True, "server_id": server_id}
 
     if operation == "floating_ips":
@@ -1418,9 +2021,21 @@ async def execute(operation, args, store):
                 raise InputError("action must be start, halt, or reboot")
             _confirm(args, action.upper())
             await provider.power_server(server_id, action)
+        elif account["provider"] == "upcloud":
+            if action not in {"start", "halt", "shutdown", "reboot"}:
+                raise InputError("action must be start, halt, shutdown, or reboot")
+            _confirm(args, action.upper())
+            await provider.power_server(server_id, action)
+        elif account["provider"] == "cloudferro":
+            if action not in {"start", "halt", "shutdown", "stop", "reboot"}:
+                raise InputError("action must be start, stop, or reboot")
+            _confirm(args, action.upper())
+            await provider.power_server(server_id, action)
         else:
             raise InputError(f"power_server not supported for {account['provider']}")
         _delete_cache(store, "all_servers")
+        _record_activity(store, "POWER_ACTION", provider=account.get("provider", ""),
+                              target=str(server_id), status="success", details=f"Power {action} on server {server_id}")
         return {"accepted": True, "action": action, "server_id": server_id}
 
     if operation == "create_floating_ip":
@@ -1438,11 +2053,21 @@ async def execute(operation, args, store):
                     server_id, ip_type, f"cloudbot-{server_id}-{ip_type}-{secrets.token_hex(4)}")
             elif account["provider"] == "linode":
                 raise InputError("Linode does not support ephemeral floating IPs. Use Linode IP Swap or IP Sharing via Akamai Cloud Manager.")
+            elif account["provider"] == "upcloud":
+                zone = args.get("zone") or server.get("region")
+                if not zone:
+                    raise InputError("zone is required for UpCloud floating IP allocation")
+                policy = _required(args, "release_policy").lower()
+                result = await provider.create_upcloud_floating_ip(server_id, zone, policy)
+            elif account["provider"] == "cloudferro":
+                result = await provider.create_cloudferro_floating_ip(server_id)
             else:
                 raise InputError("floating IPs are supported for Vultr and Hetzner")
         else:
             # Standalone creation without attached server
-            region = _required(args, "region")
+            region = args.get("region") or ("waw3-1" if account["provider"] == "cloudferro" else None)
+            if not region and account["provider"] in {"vultr", "hetzner"}:
+                raise InputError("region is required for standalone floating IP allocation")
             ip_type = args.get("ip_type", "ipv4")
             label = args.get("name", "floating-ip")
             if account["provider"] == "vultr":
@@ -1451,10 +2076,17 @@ async def execute(operation, args, store):
                 result = await provider.create_hetzner_floating_ip(server_id=None, ip_type=ip_type, name=label, home_location=region)
             elif account["provider"] == "linode":
                 raise InputError("Linode does not support ephemeral floating IPs. Use Linode IP Swap or IP Sharing via Akamai Cloud Manager.")
+            elif account["provider"] == "upcloud":
+                raise InputError("UpCloud allocation requires server_id and cannot be standalone")
+            elif account["provider"] == "cloudferro":
+                result = await provider.create_cloudferro_floating_ip()
             else:
                 raise InputError("floating IPs are supported for Vultr and Hetzner")
         _delete_cache(store, "all_floating_ips")
         _delete_cache(store, "all_servers")
+        _record_activity(store, "CREATE_FLOATING_IP", provider=account.get("provider", ""),
+                              target=str(result.get("ip") or result.get("address") or "new-ip"), status="success",
+                              details=f"Allocated floating IP for server {server_id or 'standalone'}")
         return {"floating_ip": result, "configure_guest_os": account["provider"] == "hetzner"}
 
     if operation == "delete_floating_ip":
@@ -1462,16 +2094,24 @@ async def execute(operation, args, store):
         floating_id = _required(args, "floating_id")
         if server_id and server_id != "0":
             attached = await _floating(provider, server_id)
-            if not any(str(row.get("id")) == floating_id for row in attached):
+            if not any(str(row.get("id") or row.get("address")) == floating_id
+                       for row in attached):
                 raise InputError("floating IP is not attached to the specified server")
         if account["provider"] == "vultr":
             await provider.delete_vultr_floating_ip(floating_id)
         elif account["provider"] == "hetzner":
             await provider.delete_hetzner_floating_ip(floating_id)
+        elif account["provider"] == "upcloud":
+            # UpCloud identifies an IP by its address rather than a numeric ID.
+            await provider.delete_upcloud_ip(floating_id)
+        elif account["provider"] == "cloudferro":
+            await provider.delete_cloudferro_floating_ip(floating_id)
         else:
             raise InputError("floating IPs are supported for Vultr and Hetzner")
         _delete_cache(store, "all_floating_ips")
         _delete_cache(store, "all_servers")
+        _record_activity(store, "DELETE_FLOATING_IP", provider=account.get("provider", ""),
+                              target=str(floating_id), status="success", details="Floating IP deleted")
         return {"deleted": True, "floating_id": floating_id}
 
     raise InputError("unknown operation")

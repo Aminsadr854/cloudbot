@@ -60,6 +60,10 @@ if [ ! -s "$DIR/data/control_api.token" ]; then
   "$DIR/venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(48))' > "$DIR/data/control_api.token"
 fi
 chmod 600 "$DIR/data/control_api.token"
+if [ ! -s "$DIR/data/webhook.token" ]; then
+  "$DIR/venv/bin/python" -c 'import secrets; print(secrets.token_urlsafe(48))' > "$DIR/data/webhook.token"
+fi
+chmod 600 "$DIR/data/webhook.token"
 
 cat > /etc/systemd/system/$SERVICE.service <<UNIT
 [Unit]

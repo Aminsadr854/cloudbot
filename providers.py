@@ -11,12 +11,14 @@ created per request so token and proxy changes take effect immediately; the bot
 keeps its own short-lived server/IP snapshot for chat lookups.
 """
 import asyncio
+import base64
 import ipaddress
 import logging
 import secrets
 import re
 import socket
 import time
+import json
 from datetime import date
 
 import aiohttp
@@ -30,9 +32,68 @@ except Exception:  # pragma: no cover
 
 log = logging.getLogger("cloudbot.providers")
 
+RETRYABLE_API_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+
+def account_suspension(servers, info=None):
+    """Promote explicit server suspension, never ordinary power-off or debt."""
+    suspended = [s for s in servers
+                 if str(s.get('status') or '').lower() == 'billing_suspension' or
+                 'suspended' in re.split(r'[^a-z]+', str(s.get('status') or '').lower())]
+    if not suspended:
+        return {}
+    reason = f"Account suspended: {len(suspended)} server(s) reported suspended by the provider."
+    if any(str(s.get('status') or '').lower() == 'billing_suspension' for s in suspended):
+        reason += " Billing suspension reported by the provider."
+    if float((info or {}).get('owed') or 0) > 0:
+        reason += " Outstanding billing balance; review the provider's billing page."
+    return {"status": "suspended", "error": reason}
+
+
+def _retry_after_seconds(response, attempt):
+    """Respect Retry-After while keeping provider retries bounded."""
+    value = response.headers.get("Retry-After") if response is not None else None
+    try:
+        if value is not None:
+            return min(5.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        pass
+    return min(3.0, 0.35 * (2 ** (attempt - 1)) + ((attempt * 0.073) % 0.18))
+
 LINODE = "https://api.linode.com/v4"
 VULTR = "https://api.vultr.com/v2"
 HETZNER = "https://api.hetzner.cloud/v1"
+UPCLOUD = "https://api.upcloud.com/1.3"
+CLOUDFERRO_IDENTITY = "https://keystone.cloudferro.com"
+CLOUDFERRO_COMPUTE = "https://api.waw3-1.cloudferro.com:8774/v2.1"
+CLOUDFERRO_IMAGE = "https://api.waw3-1.cloudferro.com:9292"
+CLOUDFERRO_NETWORK = "https://api.waw3-1.cloudferro.com:9696"
+
+# Capability flags are deliberately data, so callers can gate UI/actions
+# without branching on provider names.  UpCloud injects keys through the
+# server's login user-data and has no account-level SSH-key CRUD API.
+PROVIDER_CAPABILITIES = {
+    "linode": {"server_lifecycle": True, "public_ip": True, "floating_ip": False,
+               "primary_ip_inventory": False, "networking": True,
+               "local_ssh_injection": True, "ssh_key_crud": True},
+    "vultr": {"server_lifecycle": True, "public_ip": True, "floating_ip": True,
+              "primary_ip_inventory": False, "networking": True,
+              "local_ssh_injection": True, "ssh_key_crud": True},
+    "hetzner": {"server_lifecycle": True, "public_ip": True, "floating_ip": True,
+                "primary_ip_inventory": True, "networking": True,
+                "local_ssh_injection": True, "ssh_key_crud": True},
+    "upcloud": {"server_lifecycle": True, "public_ip": True, "floating_ip": True,
+                "primary_ip_inventory": False, "networking": True,
+                "local_ssh_injection": True, "ssh_key_crud": False},
+    "cloudferro": {"server_lifecycle": True, "public_ip": True, "floating_ip": True,
+                    "primary_ip_inventory": False, "networking": True,
+                    "local_ssh_injection": False, "ssh_key_crud": False},
+}
+
+
+def provider_capabilities(provider):
+    """Return a stable copy of capability flags for a provider."""
+    return dict(PROVIDER_CAPABILITIES.get(str(provider or "").lower(), {}))
 
 
 # Server responses only carry a provider-specific location id, while the
@@ -70,6 +131,7 @@ _REGION_COUNTRIES = {
         "falkenstein": "DE", "nuremberg": "DE", "helsinki": "FI",
         "ashburn": "US", "hillsboro": "US", "singapore": "SG",
     },
+    "cloudferro": {"waw3-1": "PL", "waw3": "PL"},
 }
 
 _COUNTRY_ALIASES = {
@@ -228,6 +290,18 @@ class ProviderError(Exception):
     pass
 
 
+def is_proxy_failure(error):
+    """Only explicit proxy failures justify automatically changing an account route."""
+    value = str(error)
+    if 'provider traffic limit reached' in value.lower():
+        return False
+    if re.search(r"HTTP\s+407\b|Proxy authentication failed|ClientHttpProxyError|ClientProxyConnectionError|proxyconnect|tunnel\s+connection|could\s+not\s+connect\s+to\s+proxy|SOCKS proxy needs|Proxy(?:Connection|Timeout|Error)", value, re.I):
+        return True
+    if re.search(r"HTTP\s+\d{3}\b|invalid\s+(api\s+)?token|unauthori[sz]ed|authentication\s+failed|invalid\s+api\s+key|expired\s+token|permission denied", value, re.I):
+        return False
+    return bool(re.search(r"proxy|socks", value, re.I))
+
+
 def sanitize_linode_label(label: str) -> str:
     """Linode labels must begin and end with an alphanumeric character and be 3-64 chars."""
     clean = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(label).strip()).strip("-._")
@@ -242,56 +316,227 @@ def sanitize_linode_label(label: str) -> str:
     return clean[:64]
 
 
+def sanitize_upcloud_hostname(label: str) -> str:
+    """Return a valid, bounded UpCloud hostname derived from a server title."""
+    clean = re.sub(r"[^a-zA-Z0-9-]+", "-", str(label or "").strip().lower())
+    clean = re.sub(r"-+", "-", clean).strip("-")
+    if not clean:
+        clean = "upcloud-server"
+    if not clean[0].isalnum():
+        clean = "upcloud-" + clean
+    if not clean[-1].isalnum():
+        clean = clean.rstrip("-") or "upcloud-server"
+    return clean[:128].rstrip("-") or "upcloud-server"
+
+
+from proxy_usage import ProxyUsage, TrafficLimitExceeded
+
+
 class Provider:
     def __init__(self, account: dict):
         self.account = account
         self.acc = account
         self.provider = account["provider"]
         self.token = account["token"]
+        self._cloudferro_token = None
         self.proxy = proxy_url(account.get("proxy"))
         self.proxy_family = account.get("proxy_family", "default")
         self.auto_backup = account.get("auto_backup", "disabled")
 
     def _base(self):
-        return {"linode": LINODE, "vultr": VULTR, "hetzner": HETZNER}[self.provider]
+        return {"linode": LINODE, "vultr": VULTR, "hetzner": HETZNER,
+                "upcloud": UPCLOUD, "cloudferro": CLOUDFERRO_COMPUTE}[self.provider]
+
+    def _cloudferro_credentials(self):
+        raw = self.token
+        try:
+            data = raw if isinstance(raw, dict) else json.loads(str(raw))
+        except (TypeError, ValueError):
+            parts = str(raw).split(":", 2)
+            if len(parts) != 3:
+                raise ProviderError("CloudFerro token must be JSON with id, secret, project_id")
+            data = {"id": parts[0], "secret": parts[1], "project_id": parts[2]}
+        cid = data.get("id") or data.get("application_credential_id")
+        secret = data.get("secret") or data.get("application_credential_secret")
+        project = data.get("project_id") or self.account.get("project_id")
+        if not cid or not secret or not project:
+            raise ProviderError("CloudFerro credentials require application credential id, secret, and project_id")
+        return {"id": str(cid), "secret": str(secret), "project_id": str(project)}
+
+    async def _cloudferro_auth(self):
+        if self._cloudferro_token:
+            return self._cloudferro_token
+        c = self._cloudferro_credentials()
+        # Keystone application credentials are already project-scoped. Sending
+        # a separate project scope makes CloudFerro reject the request with
+        # "Application credentials cannot request a scope".
+        payload = {"auth": {"identity": {"methods": ["application_credential"],
+                    "application_credential": {"id": c["id"], "secret": c["secret"]}}}}
+        timeout = aiohttp.ClientTimeout(total=120, connect=45, sock_read=90)
+        proxy = await proxy_for_family(self.proxy, self.proxy_family)
+        meter = ProxyUsage(proxy)
+        if proxy and proxy.startswith(("socks5", "socks4")):
+            raise ProviderError("CloudFerro Keystone authentication requires an HTTP proxy")
+
+        # Keystone authentication is always a POST. Retry only when an
+        # explicit proxy is involved; authentication failures must not be
+        # repeated as if this were a safe provider read.
+        max_attempts = 4 if proxy else 1
+        for attempt in range(1, max_attempts + 1):
+            meter.ensure_available()
+            try:
+                async with aiohttp.ClientSession(timeout=timeout, trace_configs=meter.trace_configs()) as s:
+                    async with s.post(CLOUDFERRO_IDENTITY + "/v3/auth/tokens", json=payload,
+                                      proxy=proxy or None) as r:
+                        text = await meter.text(r)
+                        if r.status == 407:
+                            raise ProviderError(f"HTTP 407: Proxy authentication failed ({text[:200]})")
+                        if r.status >= 400:
+                            raise ProviderError(self._safe_error_text(f"HTTP {r.status}: {text[:300]}"))
+                        token = r.headers.get("X-Subject-Token")
+                        if not token:
+                            raise ProviderError("CloudFerro Keystone returned no token")
+                        self._cloudferro_token = token
+                        return token
+            except ProviderError as pe:
+                if proxy and ("407" in str(pe) or is_proxy_failure(pe)):
+                    if attempt < max_attempts:
+                        await asyncio.sleep(0.5 * attempt)
+                        continue
+                    safe_msg = self._safe_error_text(str(pe)[:250])
+                    if safe_msg.lower().startswith("proxy failed"):
+                        raise ProviderError(safe_msg)
+                    raise ProviderError(f"Proxy failed: {safe_msg}")
+                raise
+            except Exception as e:
+                is_p_err = False
+                if proxy:
+                    is_p_err = is_proxy_failure(e) or isinstance(e, (
+                        aiohttp.ClientProxyConnectionError,
+                        aiohttp.ClientHttpProxyError,
+                        aiohttp.ClientConnectorError,
+                        aiohttp.ServerDisconnectedError,
+                        asyncio.TimeoutError,
+                        TimeoutError,
+                    ))
+                    if not is_p_err:
+                        val = str(e).lower()
+                        if "proxy" in val or "socks" in val or "proxyconnect" in val:
+                            is_p_err = True
+
+                if is_p_err and attempt < max_attempts:
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+
+                safe_msg = self._safe_error_text(f"{type(e).__name__}: {str(e)[:250]}")
+                if is_p_err:
+                    if safe_msg.lower().startswith("proxy failed"):
+                        raise ProviderError(safe_msg)
+                    raise ProviderError(f"Proxy failed: {safe_msg}")
+                raise ProviderError(safe_msg)
+
+    def _safe_error_text(self, value):
+        text = str(value)
+        for secret in (self.token, self.acc.get("proxy"), self.proxy):
+            if secret:
+                text = text.replace(str(secret), "[redacted]")
+        return text
 
     async def _req(self, method, path, **kw):
-        headers = {"Authorization": f"Bearer {self.token}",
-                   "Content-Type": "application/json"}
-        timeout = aiohttp.ClientTimeout(total=45)
-        url = self._base() + path
+        if self.provider == "cloudferro":
+            headers = {"X-Auth-Token": await self._cloudferro_auth(),
+                       "Content-Type": "application/json"}
+        else:
+            headers = {"Authorization": f"Bearer {self.token}",
+                       "Content-Type": "application/json"}
+        timeout = aiohttp.ClientTimeout(total=120, connect=45, sock_read=90)
+        if self.provider == "cloudferro" and path.startswith("/v2/images"):
+            url = CLOUDFERRO_IMAGE + path
+        elif self.provider == "cloudferro" and path.startswith("/v2.0"):
+            url = CLOUDFERRO_NETWORK + path
+        else:
+            url = self._base() + path
         proxy = await proxy_for_family(self.proxy, self.proxy_family)
+        meter = ProxyUsage(proxy)
         is_socks = bool(proxy) and proxy.startswith(("socks5", "socks4"))
+        safe_read = method.upper() in {"GET", "HEAD", "OPTIONS"}
 
-        try:
-            if is_socks:
-                # A SOCKS proxy cannot be passed as aiohttp's proxy= (that is
-                # HTTP-proxy only); it has to be the session's connector.
-                if ProxyConnector is None:
-                    raise ProviderError("SOCKS proxy needs aiohttp-socks installed")
-                conn = ProxyConnector.from_url(proxy)
-                async with aiohttp.ClientSession(timeout=timeout, connector=conn) as s:
-                    async with s.request(method, url, headers=headers, **kw) as r:
-                        text = await r.text()
-                        if r.status >= 400:
-                            raise ProviderError(f"HTTP {r.status}: {text[:300]}")
-                        return await r.json() if text.strip() else {}
-            else:
-                async with aiohttp.ClientSession(timeout=timeout) as s:
-                    async with s.request(method, url, headers=headers,
-                                         proxy=proxy or None, **kw) as r:
-                        text = await r.text()
-                        if r.status >= 400:
-                            raise ProviderError(f"HTTP {r.status}: {text[:300]}")
-                        return await r.json() if text.strip() else {}
-        except ProviderError:
-            raise
-        except Exception as e:
-            # Surface the concrete transport failure (proxy refused, TLS, DNS)
-            # instead of a generic "connection failed".
-            log.warning("request %s %s via proxy=%s failed: %s",
-                        method, path, proxy, e)
-            raise ProviderError(f"{type(e).__name__}: {str(e)[:250]}")
+        max_attempts = 4 if proxy else 1
+        for attempt in range(1, max_attempts + 1):
+            meter.ensure_available()
+            try:
+                if is_socks:
+                    # A SOCKS proxy cannot be passed as aiohttp's proxy= (that is
+                    # HTTP-proxy only); it has to be the session's connector.
+                    if ProxyConnector is None:
+                        raise ProviderError("SOCKS proxy needs aiohttp-socks installed")
+                    conn = ProxyConnector.from_url(proxy)
+                    async with aiohttp.ClientSession(timeout=timeout, connector=conn, trace_configs=meter.trace_configs()) as s:
+                        async with s.request(method, url, headers=headers, **kw) as r:
+                            text = await meter.text(r)
+                            if r.status == 407:
+                                raise ProviderError(f"HTTP 407: Proxy authentication failed ({text[:200]})")
+                            if r.status >= 400:
+                                if safe_read and r.status in RETRYABLE_API_STATUS and attempt < max_attempts:
+                                    await asyncio.sleep(_retry_after_seconds(r, attempt))
+                                    continue
+                                raise ProviderError(self._safe_error_text(f"HTTP {r.status}: {text[:300]}"))
+                            return await r.json() if text.strip() else {}
+                else:
+                    async with aiohttp.ClientSession(timeout=timeout, trace_configs=meter.trace_configs()) as s:
+                        async with s.request(method, url, headers=headers,
+                                             proxy=proxy or None, **kw) as r:
+                            text = await meter.text(r)
+                            if r.status == 407:
+                                raise ProviderError(f"HTTP 407: Proxy authentication failed ({text[:200]})")
+                            if r.status >= 400:
+                                if safe_read and r.status in RETRYABLE_API_STATUS and attempt < max_attempts:
+                                    await asyncio.sleep(_retry_after_seconds(r, attempt))
+                                    continue
+                                raise ProviderError(self._safe_error_text(f"HTTP {r.status}: {text[:300]}"))
+                            return await r.json() if text.strip() else {}
+            except ProviderError as pe:
+                if proxy and ("407" in str(pe) or is_proxy_failure(pe)):
+                    if attempt < max_attempts:
+                        log.warning("request %s %s provider=%s proxy auth error (attempt %d/%d, retrying): %s",
+                                    method, path, self.provider, attempt, max_attempts, str(pe))
+                        await asyncio.sleep(0.5 * attempt)
+                        continue
+                    safe_msg = self._safe_error_text(str(pe)[:250])
+                    if safe_msg.lower().startswith("proxy failed"):
+                        raise ProviderError(safe_msg)
+                    raise ProviderError(f"Proxy failed: {safe_msg}")
+                raise
+            except Exception as e:
+                is_p_err = False
+                if proxy:
+                    is_p_err = is_proxy_failure(e) or isinstance(e, (
+                        aiohttp.ClientProxyConnectionError,
+                        aiohttp.ClientHttpProxyError,
+                        aiohttp.ClientConnectorError,
+                        aiohttp.ServerDisconnectedError,
+                        asyncio.TimeoutError,
+                        TimeoutError,
+                    ))
+                    if not is_p_err:
+                        val = str(e).lower()
+                        if "proxy" in val or "socks" in val or "proxyconnect" in val:
+                            is_p_err = True
+
+                if is_p_err and attempt < max_attempts:
+                    log.warning("request %s %s provider=%s failed via proxy (attempt %d/%d, retrying): %s",
+                                method, path, self.provider, attempt, max_attempts, type(e).__name__)
+                    await asyncio.sleep(0.5 * attempt)
+                    continue
+
+                log.warning("request %s %s provider=%s failed (%s)",
+                            method, path, self.provider, type(e).__name__)
+                safe_msg = self._safe_error_text(f"{type(e).__name__}: {str(e)[:250]}")
+                if is_p_err:
+                    if safe_msg.lower().startswith("proxy failed"):
+                        raise ProviderError(safe_msg)
+                    raise ProviderError(f"Proxy failed: {safe_msg}")
+                raise ProviderError(safe_msg)
 
     # -- connectivity check (also validates token + proxy together) ------
     async def whoami(self):
@@ -302,6 +547,13 @@ class Provider:
             d = await self._req("GET", "/account")
             acc = d.get("account", d)
             return acc.get("email") or acc.get("name") or "vultr account"
+        if self.provider == "upcloud":
+            d = await self._req("GET", "/account")
+            acc = d.get("account", d)
+            return acc.get("username") or acc.get("email") or "UpCloud account"
+        if self.provider == "cloudferro":
+            await self._req("GET", "/servers/detail?limit=1")
+            return "CloudFerro project"
         # hetzner: token is project-scoped, no account endpoint; a cheap call
         # that any valid token can make doubles as the validation.
         await self._req("GET", "/servers?per_page=1")
@@ -383,7 +635,184 @@ class Provider:
                     "pending_charges": 0.0,
                     "net": 0.0,
                 }
+        if self.provider == "upcloud":
+            d = await self._req("GET", "/account")
+            acc = d.get("account", d)
+            credits = acc.get("credits")
+            try:
+                credits = float(credits) if credits is not None else None
+            except (TypeError, ValueError):
+                credits = None
+            return {"name": acc.get("username") or acc.get("company"),
+                    "email": acc.get("email"), "balance": None,
+                    "credit": credits, "owed": None,
+                    "pending_charges": None, "net": None}
+        if self.provider == "cloudferro":
+            return {"name": "CloudFerro project", "currency": "EUR", "balance": None,
+                    "credit": None, "owed": None, "pending_charges": None, "net": None}
         return None
+
+    @staticmethod
+    def _upcloud_server_summary(server):
+        """Normalize an UpCloud server while preserving UUIDs as strings."""
+        server = server or {}
+        sid = str(server.get("uuid") or server.get("id") or "")
+        ips = []
+        ipv4 = ipv6 = None
+        networking = server.get("ip_addresses") or server.get("networking") or {}
+        raw_ips = networking.get("ip_address", []) if isinstance(networking, dict) else []
+        if not raw_ips and isinstance(networking, dict):
+            raw_ips = networking.get("ip_addresses", [])
+        if isinstance(raw_ips, dict):
+            raw_ips = [raw_ips]
+        for item in raw_ips:
+            if not isinstance(item, dict):
+                continue
+            address = item.get("address") or item.get("ip")
+            if not address or str(item.get("access", "public")).lower() != "public":
+                continue
+            address = str(address)
+            ips.append(address)
+            if ":" in address and ipv6 is None:
+                ipv6 = address
+            elif ":" not in address and ipv4 is None:
+                ipv4 = address
+        region = server.get("zone") or server.get("zone_code") or server.get("region")
+        plan = server.get("plan")
+        if isinstance(plan, dict):
+            plan = plan.get("name") or plan.get("id")
+        return {"id": sid, "label": server.get("title") or server.get("hostname"),
+                "region": region, "country": region_country("upcloud", region),
+                "ip": ipv4 or ipv6, "ips": ips,
+                "ipv4": ipv4, "ipv6": ipv6, "status": server.get("state") or server.get("status"),
+                "plan": plan, "specs": server.get("plan_info") or {}}
+
+    @staticmethod
+    def _cloudferro_server_summary(server):
+        addresses = server.get("addresses") or {}
+        ips = []
+        for network in addresses.values() if isinstance(addresses, dict) else []:
+            rows = network if isinstance(network, list) else [network]
+            for row in rows:
+                if isinstance(row, dict) and row.get("addr"):
+                    ips.append(str(row["addr"]))
+        ipv4 = next((x for x in ips if ":" not in x), None)
+        ipv6 = next((x for x in ips if ":" in x), None)
+        return {"id": str(server.get("id") or ""), "label": server.get("name"),
+                "region": "waw3-1", "country": "PL", "ip": ipv4 or ipv6,
+                "ips": ips, "ipv4": ipv4, "ipv6": ipv6,
+                "status": server.get("status"), "plan": str(server.get("flavor", {}).get("id")
+                if isinstance(server.get("flavor"), dict) else server.get("flavor") or "")}
+
+    def _cloudferro_project_id(self):
+        return self._cloudferro_credentials()["project_id"]
+
+    async def cloudferro_resource_limits(self):
+        """Return OpenStack quotas together with current server/IP usage."""
+        if self.provider != "cloudferro":
+            raise ProviderError("resource limits are only implemented for CloudFerro")
+        limits = await self._req("GET", "/limits")
+        try:
+            quotas = await self._req("GET", f"/v2.0/quotas/{self._cloudferro_project_id()}")
+        except ProviderError:
+            quotas = {}
+        servers = await self.list_servers()
+        fips = await self.cloudferro_floating_ips()
+        absolute = ((limits.get("limits") or {}).get("absolute") or {})
+        quota = (quotas.get("quota") or {}) if isinstance(quotas, dict) else {}
+        # Neutron owns floating-IP quota. Nova often reports
+        # ``maxTotalFloatingIps=-1`` and ``totalFloatingIpsUsed=0`` even when
+        # Neutron has assigned addresses, so expose the authoritative values.
+        absolute = dict(absolute)
+        if quota.get("floatingip") is not None and int(quota["floatingip"]) >= 0:
+            absolute["maxTotalFloatingIps"] = int(quota["floatingip"])
+        absolute["totalFloatingIpsUsed"] = len(fips)
+        return {"provider": "cloudferro", "project_id": self._cloudferro_project_id(),
+                "limits": absolute, "quotas": quota,
+                "usage": {"servers": len(servers), "floating_ips": len(fips)}}
+
+    async def _cloudferro_server_ports(self, server_id):
+        data = await self._req("GET", f"/servers/{server_id}/os-interface")
+        return [str(row.get("port_id")) for row in data.get("interfaceAttachments", [])
+                if row.get("port_id")]
+
+    async def cloudferro_floating_ips(self, server_id=None):
+        if self.provider != "cloudferro":
+            raise ProviderError("floating IPs are only implemented for CloudFerro")
+        data = await self._req("GET", "/v2.0/floatingips")
+        rows = []
+        wanted_ports = set(await self._cloudferro_server_ports(server_id)) if server_id else None
+        port_servers = {}
+        if server_id is None:
+            for server in await self.list_servers():
+                try:
+                    for port in await self._cloudferro_server_ports(server["id"]):
+                        port_servers[port] = str(server["id"])
+                except ProviderError:
+                    continue
+        for row in (data.get("floatingips") or []):
+            port_id = str(row.get("port_id")) if row.get("port_id") else None
+            if wanted_ports is not None and port_id not in wanted_ports:
+                continue
+            rows.append({"id": row.get("id"), "ip": row.get("floating_ip_address"),
+                         "type": "ipv6" if ":" in str(row.get("floating_ip_address") or "") else "ipv4",
+                         "port_id": port_id, "server_id": str(server_id) if server_id and port_id else port_servers.get(port_id),
+                         "network_id": row.get("floating_network_id"), "status": "assigned" if port_id else "unassigned"})
+        return rows
+
+    async def create_cloudferro_floating_ip(self, server_id=None):
+        if self.provider != "cloudferro":
+            raise ProviderError("floating IPs are only implemented for CloudFerro")
+        nets = await self._req("GET", "/v2.0/networks?router:external=true")
+        external = [n for n in nets.get("networks", []) if n.get("id")]
+        if not external:
+            raise ProviderError("CloudFerro has no external network available for floating IP allocation")
+        body = {"floatingip": {"floating_network_id": external[0]["id"]}}
+        result = await self._req("POST", "/v2.0/floatingips", json=body)
+        row = result.get("floatingip", result)
+        if server_id:
+            await self.attach_cloudferro_floating_ip(row.get("id"), server_id)
+            row["port_id"] = (await self._cloudferro_server_ports(server_id) or [None])[0]
+        return {"id": row.get("id"), "ip": row.get("floating_ip_address"),
+                "network_id": row.get("floating_network_id"), "port_id": row.get("port_id"),
+                "server_id": str(server_id) if server_id else None,
+                "type": "ipv6" if ":" in str(row.get("floating_ip_address") or "") else "ipv4"}
+
+    async def attach_cloudferro_floating_ip(self, floating_id, server_id, port_id=None):
+        ports = await self._cloudferro_server_ports(server_id)
+        if port_id:
+            target_port = str(port_id)
+        else:
+            assigned = {str(row.get("port_id")) for row in
+                        await self.cloudferro_floating_ips(server_id)
+                        if row.get("port_id")}
+            target_port = next((port for port in ports if port not in assigned), None)
+        if not target_port:
+            # Neutron allows one floating IP per fixed address. Add another
+            # interface on the server's project network for the next address.
+            if not ports:
+                raise ProviderError("CloudFerro server has no network port to attach a floating IP")
+            port_data = await self._req("GET", f"/v2.0/ports/{ports[0]}")
+            network_id = (port_data.get("port") or port_data).get("network_id")
+            if not network_id:
+                raise ProviderError("Could not determine the server network for a second floating IP")
+            created = await self._req("POST", f"/servers/{server_id}/os-interface",
+                                      json={"interfaceAttachment": {"net_id": network_id}})
+            target_port = ((created.get("interfaceAttachment") or created).get("port_id"))
+            if not target_port:
+                raise ProviderError("CloudFerro did not return the new server interface")
+        result = await self._req("PUT", f"/v2.0/floatingips/{floating_id}",
+                                 json={"floatingip": {"port_id": target_port}})
+        return result.get("floatingip", result)
+
+    async def detach_cloudferro_floating_ip(self, floating_id):
+        result = await self._req("PUT", f"/v2.0/floatingips/{floating_id}",
+                                 json={"floatingip": {"port_id": None}})
+        return result.get("floatingip", result)
+
+    async def delete_cloudferro_floating_ip(self, floating_id):
+        await self._req("DELETE", f"/v2.0/floatingips/{floating_id}")
+        return True
 
     # -- list servers ----------------------------------------------------
     async def list_servers(self):
@@ -442,6 +871,13 @@ class Provider:
                     "plan": i.get("plan"),
                 })
             return out
+        if self.provider == "upcloud":
+            d = await self._req("GET", "/server")
+            return [self._upcloud_server_summary(row)
+                    for row in (d.get("servers") or {}).get("server", [])]
+        if self.provider == "cloudferro":
+            d = await self._req("GET", "/servers/detail?limit=100")
+            return [self._cloudferro_server_summary(row) for row in d.get("servers", [])]
         # hetzner
         rows = []
         page = 1
@@ -497,6 +933,12 @@ class Provider:
                     "ip": i.get("main_ip"), "status": i.get("status"),
                     "plan": i.get("plan"), "default_password": i.get("default_password"),
                     "features": i.get("features", [])}
+        if self.provider == "upcloud":
+            d = await self._req("GET", f"/server/{server_id}")
+            return self._upcloud_server_summary((d.get("server") or d))
+        if self.provider == "cloudferro":
+            d = await self._req("GET", f"/servers/{server_id}")
+            return self._cloudferro_server_summary(d.get("server") or d)
         # hetzner
         d = await self._req("GET", f"/servers/{server_id}")
         i = d.get("server", d)
@@ -564,6 +1006,23 @@ class Provider:
                         f"{r.get('city','')} {r.get('country','')}".strip() or r["id"],
                         r.get("country")))
                     for r in d.get("regions", [])]
+        elif self.provider == "upcloud":
+            d = await self._req("GET", "/zone")
+            zones = (d.get("zones") or {}).get("zone", [])
+            if isinstance(zones, dict):
+                zones = [zones]
+            res = []
+            for zone in zones:
+                if str(zone.get("public", "")).lower() not in ("true", "yes", "1"):
+                    continue
+                zid = str(zone.get("id") or zone.get("zone") or "")
+                if not zid:
+                    continue
+                label = zone.get("title") or zone.get("description") or zid
+                res.append((zid, location_text(self.provider, label,
+                                                zone.get("country"))))
+        elif self.provider == "cloudferro":
+            res = [("waw3-1", "🇵🇱 Warsaw (CloudFerro WAW3-1)")]
         else:
             # Hetzner exposes per-location support and current availability on
             # each Server Type. Locations alone includes places where none of
@@ -718,6 +1177,41 @@ class Provider:
                 out.append((p["id"], f"{p.get('vcpu_count')}vCPU {p.get('ram')}MB "
                                      f"{p.get('disk')}GB - ${p.get('monthly_cost')}/mo"))
             res = out
+        elif self.provider == "upcloud":
+            d = await self._req("GET", "/plan")
+            plans = (d.get("plans") or {}).get("plan", [])
+            if isinstance(plans, dict):
+                plans = [plans]
+            out = []
+            for plan in plans:
+                available = plan.get("available_zones") or plan.get("zones") or plan.get("zone_codes")
+                if region and available and str(region) not in {str(x.get("id", x) if isinstance(x, dict) else x) for x in available}:
+                    continue
+                pid = str(plan.get("name") or plan.get("id") or "")
+                if not pid:
+                    continue
+                cores = plan.get("core_number") or plan.get("cores")
+                memory = plan.get("memory_amount") or plan.get("memory")
+                storage = plan.get("storage_size") or plan.get("storage")
+                price = plan.get("price") or plan.get("monthly_price")
+                if isinstance(price, dict):
+                    price = price.get("amount") or price.get("monthly")
+                details = " · ".join(x for x in (f"{cores}vCPU" if cores else None,
+                                                  f"{memory}MB" if memory else None,
+                                                  f"{storage}GB" if storage else None) if x)
+                label = plan.get("title") or pid
+                out.append((pid, f"{label}{(' · ' + details) if details else ''}"
+                            f"{(' - $' + str(price) + '/mo') if price is not None else ''}"))
+            res = out
+        elif self.provider == "cloudferro":
+            d = await self._req("GET", "/flavors/detail?limit=100")
+            res = []
+            for flavor in d.get("flavors", []):
+                fid = str(flavor.get("id") or "")
+                if not fid:
+                    continue
+                res.append((fid, f"{flavor.get('name') or fid} · {flavor.get('vcpus', '?')}vCPU "
+                            f"{flavor.get('ram', '?')}MB · {flavor.get('disk', '?')}GB"))
         else:
             # Hetzner's per-location availability flag is the purchase filter.
             # Prices describe billing; they do not mean a type can be ordered there.
@@ -742,8 +1236,8 @@ class Provider:
         _set_cached(cache_key, res, ttl)
         return res
 
-    async def images(self, force: bool = False, ttl: int = 86400):
-        cache_key = (self.provider, "images")
+    async def images(self, region=None, force: bool = False, ttl: int = 86400):
+        cache_key = (self.provider, "images", str(region or ""))
         if not force:
             cached = _get_cached(cache_key)
             if cached is not None:
@@ -765,6 +1259,36 @@ class Provider:
                     for x in ("ubuntu 22", "ubuntu 24", "debian 12", "debian 11"))]
             chosen = pref or oss
             res = [(str(o["id"]), o.get("name")) for o in chosen[:40]]
+            _set_cached(cache_key, res, ttl)
+            return res
+        if self.provider == "upcloud":
+            d = await self._req("GET", "/storage/template")
+            storages = (d.get("storages") or {}).get("storage", [])
+            if isinstance(storages, dict):
+                storages = [storages]
+            public = [s for s in storages
+                      if str(s.get("access", "public")).lower() == "public"
+                      and (not region or str(s.get("zone") or "") == str(region))]
+            pref = [s for s in public if any(x in (s.get("title") or s.get("name") or "").lower()
+                                              for x in ("ubuntu", "debian"))]
+            chosen = pref or public
+            res = [(str(s.get("uuid") or s.get("id")),
+                    s.get("title") or s.get("name") or str(s.get("uuid") or s.get("id")))
+                   for s in chosen[:40] if s.get("uuid") or s.get("id")]
+            _set_cached(cache_key, res, ttl)
+            return res
+        if self.provider == "cloudferro":
+            d = await self._req("GET", "/v2/images?status=active&visibility=public&limit=100")
+            imgs = d.get("images", [])
+            names = lambda i: (i.get("name") or "").lower()
+            pref = [i for i in imgs if "ubuntu 22.04" in names(i) or "ubuntu-22.04" in names(i)]
+            if not pref:
+                pref = [i for i in imgs if "ubuntu 24.04" in names(i) or "ubuntu-24.04" in names(i)]
+            if not pref:
+                pref = [i for i in imgs if any(x in names(i) for x in ("ubuntu", "debian"))]
+            chosen = pref or imgs
+            res = [(str(i.get("id")), i.get("name") or str(i.get("id")))
+                   for i in chosen[:40] if i.get("id")]
             _set_cached(cache_key, res, ttl)
             return res
         # hetzner system images; the image "name" (e.g. ubuntu-22.04) is what
@@ -813,6 +1337,74 @@ class Provider:
                     "region": i.get("region"), "plan": i.get("plan"),
                     "country": region_country(self.provider, i.get("region")),
                     "root_password": i.get("default_password") or root_password}
+        if self.provider == "upcloud":
+            # UpCloud creates from a public/private storage template by cloning
+            # it into a new boot disk.  The operation is asynchronous and the
+            # response contains the server in ``maintenance`` state.
+            storage_device = {
+                "action": "clone",
+                "storage": str(image),
+                "title": f"{label} operating system",
+            }
+            login_user = {"username": "root"}
+            clean_keys = [str(key).strip() for key in (ssh_keys or []) if str(key).strip()]
+            if clean_keys:
+                # The JSON representation mirrors the API's repeated
+                # ``ssh_key`` element from its XML schema.
+                login_user["ssh_keys"] = {"ssh_key": clean_keys}
+            body = {"server": {
+                "title": str(label),
+                "hostname": sanitize_upcloud_hostname(label),
+                "zone": str(region),
+                "plan": str(plan),
+                "storage_devices": {"storage_device": [storage_device]},
+                "login_user": login_user,
+            }}
+            d = await self._req("POST", "/server", json=body)
+            server = d.get("server") or d
+            normalized = self._upcloud_server_summary(server)
+            # UpCloud only returns a generated one-time password for templates
+            # that support password creation.  Never fall back to the caller's
+            # generated secret: it was not sent to UpCloud and is unusable.
+            password = (server.get("password") or server.get("root_password")
+                        or d.get("password") or d.get("root_password"))
+            if password:
+                normalized["root_password"] = str(password)
+            return normalized
+        if self.provider == "cloudferro":
+            networks = await self._req("GET", f"/v2.0/networks?project_id={self._cloudferro_project_id()}")
+            project_networks = [n for n in networks.get("networks", [])
+                                if n.get("id") and not n.get("router:external")]
+            # A project may have several internal networks, but only the one
+            # connected to its router can reach a public floating network.
+            # Prefer a network seen on a project router; fall back to the
+            # first project network for installations without router access.
+            routed_ids = set()
+            try:
+                routers = await self._req("GET", "/v2.0/routers")
+                for router in routers.get("routers", []):
+                    if router.get("project_id") != self._cloudferro_project_id():
+                        continue
+                    ports = await self._req("GET", f"/v2.0/ports?device_id={router.get('id')}")
+                    routed_ids.update(str(port.get("network_id")) for port in ports.get("ports", [])
+                                      if port.get("network_id"))
+            except ProviderError:
+                pass
+            selected_network = next((n for n in project_networks if str(n["id"]) in routed_ids),
+                                    project_networks[0] if project_networks else None)
+            body = {"server": {"name": str(label), "flavorRef": str(plan),
+                                "imageRef": str(image), "adminPass": str(root_password),
+                                "networks": [{"uuid": selected_network["id"]}] if selected_network else []}}
+            clean_keys = [str(key).strip() for key in (ssh_keys or []) if str(key).strip()]
+            if clean_keys:
+                cloud_config = "#cloud-config\nssh_authorized_keys:\n" + "".join(
+                    f"  - {key}\n" for key in clean_keys)
+                body["server"]["user_data"] = base64.b64encode(
+                    cloud_config.encode("utf-8")).decode("ascii")
+            d = await self._req("POST", "/servers", json=body)
+            normalized = self._cloudferro_server_summary(d.get("server") or d)
+            normalized["root_password"] = root_password
+            return normalized
         # hetzner: with no ssh_keys attached, Hetzner generates a root password
         # and returns it once in the create response - which is what node-it needs.
         body = {
@@ -869,6 +1461,24 @@ class Provider:
             await self._req("DELETE", f"/linode/instances/{server_id}")
         elif self.provider == "vultr":
             await self._req("DELETE", f"/instances/{server_id}")
+        elif self.provider == "upcloud":
+            sid = str(server_id)
+            # UpCloud rejects deletion unless the server is stopped.  Read the
+            # current state first and refuse to turn a destructive request into
+            # an implicit power operation.
+            current = await self._req("GET", f"/server/{sid}")
+            server = current.get("server") or current
+            state = str(server.get("state") or server.get("status") or "").lower()
+            if state != "stopped":
+                raise ProviderError("UpCloud server must be stopped before deletion")
+            # Explicitly remove attached storages and their backups.  Leaving
+            # either implicit would retain billable resources under API
+            # defaults and makes the destructive operation ambiguous.
+            await self._req("DELETE", f"/server/{sid}?storages=1&backups=delete")
+            return True
+        elif self.provider == "cloudferro":
+            await self._req("DELETE", f"/servers/{server_id}")
+            return True
         else:
             await self._req("DELETE", f"/servers/{server_id}")
         return True
@@ -1032,6 +1642,216 @@ class Provider:
             raise ProviderError("backup status must be 'disabled' or 'enabled'")
         return await self._req("PATCH", f"/instances/{server_id}", json={"backups": status})
 
+    # -- UpCloud IPs and server networking ------------------------------
+    @staticmethod
+    def _upcloud_ip_row(raw):
+        """Normalize an UpCloud IP object without coercing addresses/UUIDs."""
+        raw = raw or {}
+        family = str(raw.get("family") or "").strip().lower()
+        floating = raw.get("floating")
+        if isinstance(floating, str):
+            floating = floating.lower() in {"yes", "true", "1"}
+        else:
+            floating = bool(floating)
+        return {
+            "address": str(raw.get("address") or ""),
+            "family": family,
+            "server_id": (str(raw.get("server") or raw.get("server_uuid"))
+                          if (raw.get("server") or raw.get("server_uuid")) is not None else None),
+            "zone": raw.get("zone"),
+            "ptr": raw.get("ptr_record") or raw.get("ptr") or "",
+            "floating": floating,
+            "release_policy": raw.get("release_policy"),
+        }
+
+    @staticmethod
+    def _upcloud_interfaces(payload):
+        networking = (payload or {}).get("networking", payload or {})
+        interfaces = networking.get("interfaces", networking.get("interface", [])) \
+            if isinstance(networking, dict) else []
+        if isinstance(interfaces, dict):
+            interfaces = interfaces.get("interface", [])
+        if isinstance(interfaces, dict):
+            interfaces = [interfaces]
+        return [item for item in interfaces if isinstance(item, dict)]
+
+    async def _upcloud_stopped_server(self, server_id):
+        sid = str(server_id or "").strip()
+        if not sid:
+            raise ProviderError("UpCloud server UUID is required")
+        data = await self._req("GET", f"/server/{sid}")
+        server = data.get("server", data) if isinstance(data, dict) else {}
+        state = str(server.get("state") or server.get("status") or "").lower()
+        if state != "stopped":
+            raise ProviderError("UpCloud server must be stopped before changing its network")
+        return server
+
+    async def upcloud_networking(self, server_id):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud networking is only available for UpCloud accounts")
+        sid = str(server_id or "").strip()
+        if not sid:
+            raise ProviderError("UpCloud server UUID is required")
+        data = await self._req("GET", f"/server/{sid}/networking")
+        interfaces = self._upcloud_interfaces(data)
+        normalized = []
+        for iface in interfaces:
+            copy = dict(iface)
+            addresses = iface.get("ip_addresses") or iface.get("ip-addresses") or {}
+            raw_ips = addresses.get("ip_address", []) if isinstance(addresses, dict) else addresses
+            if isinstance(raw_ips, dict):
+                raw_ips = [raw_ips]
+            copy["ip_addresses"] = [self._upcloud_ip_row({**ip, "server": sid})
+                                     for ip in (raw_ips or []) if isinstance(ip, dict)]
+            normalized.append(copy)
+        return {"server_id": sid, "interfaces": normalized}
+
+    async def _upcloud_public_mac(self, server_id):
+        network = await self.upcloud_networking(server_id)
+        for iface in network.get("interfaces", []):
+            kind = str(iface.get("type") or iface.get("network") or "").lower()
+            if kind == "public" and iface.get("mac"):
+                return str(iface["mac"])
+        # Some responses omit interface type; a public address is still a
+        # reliable indication that the interface is the public one.
+        for iface in network.get("interfaces", []):
+            if iface.get("mac") and any(row.get("family") in {"ipv4", "ipv6"}
+                                        for row in iface.get("ip_addresses", [])):
+                return str(iface["mac"])
+        raise ProviderError("UpCloud server has no public network interface MAC")
+
+    @staticmethod
+    def _validate_upcloud_release_policy(policy):
+        policy = str(policy or "").strip().lower()
+        if policy not in {"keep", "release"}:
+            raise ProviderError("UpCloud release_policy must be 'keep' or 'release'")
+        return policy
+
+    async def upcloud_ip_addresses(self, server_id=None):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud IP addresses are only available for UpCloud accounts")
+        data = await self._req("GET", "/ip_address")
+        container = data.get("ip_addresses", data) if isinstance(data, dict) else {}
+        raw = container.get("ip_address", []) if isinstance(container, dict) else container
+        if isinstance(raw, dict):
+            raw = [raw]
+        rows = [self._upcloud_ip_row(item) for item in (raw or []) if isinstance(item, dict)]
+        if server_id is not None:
+            sid = str(server_id)
+            rows = [row for row in rows if str(row.get("server_id")) == sid]
+        return rows
+
+    async def create_upcloud_floating_ip(self, server_id, zone, release_policy):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud floating IPs are only available for UpCloud accounts")
+        sid = str(server_id or "").strip()
+        zone = str(zone or "").strip()
+        if not sid or not zone:
+            raise ProviderError("UpCloud server UUID and zone are required")
+        policy = self._validate_upcloud_release_policy(release_policy)
+        await self._upcloud_stopped_server(sid)
+        mac = await self._upcloud_public_mac(sid)
+        result = await self._req("POST", "/ip_address", json={"ip_address": {
+            "access": "public", "family": "IPv4", "floating": "yes",
+            "zone": zone, "server": sid, "mac": mac,
+            "release_policy": policy,
+        }})
+        raw = result.get("ip_address", result) if isinstance(result, dict) else {}
+        return self._upcloud_ip_row(raw)
+
+    async def attach_upcloud_floating_ip(self, address, server_id):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud floating IPs are only available for UpCloud accounts")
+        address = str(address or "").strip()
+        sid = str(server_id or "").strip()
+        if not address or not sid:
+            raise ProviderError("UpCloud IP address and server UUID are required")
+        await self._upcloud_stopped_server(sid)
+        mac = await self._upcloud_public_mac(sid)
+        result = await self._req("PATCH", f"/ip_address/{address}",
+                                 json={"ip_address": {"mac": mac}})
+        raw = result.get("ip_address", result) if isinstance(result, dict) else {}
+        return self._upcloud_ip_row(raw)
+
+    async def detach_upcloud_floating_ip(self, address):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud floating IPs are only available for UpCloud accounts")
+        address = str(address or "").strip()
+        if not address:
+            raise ProviderError("UpCloud IP address is required")
+        details = await self._req("GET", f"/ip_address/{address}")
+        raw = details.get("ip_address", details) if isinstance(details, dict) else {}
+        sid = raw.get("server") or raw.get("server_uuid")
+        if sid:
+            await self._upcloud_stopped_server(sid)
+        result = await self._req("PATCH", f"/ip_address/{address}",
+                                 json={"ip_address": {"mac": None}})
+        raw_result = result.get("ip_address", result) if isinstance(result, dict) else {}
+        return self._upcloud_ip_row(raw_result)
+
+    async def update_upcloud_ip(self, address, ptr=None, release_policy=None):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud IP addresses are only available for UpCloud accounts")
+        address = str(address or "").strip()
+        if not address:
+            raise ProviderError("UpCloud IP address is required")
+        body = {}
+        if ptr is not None:
+            body["ptr_record"] = str(ptr)
+        if release_policy is not None:
+            body["release_policy"] = self._validate_upcloud_release_policy(release_policy)
+        if not body:
+            raise ProviderError("PTR or release_policy is required")
+        result = await self._req("PATCH", f"/ip_address/{address}",
+                                 json={"ip_address": body})
+        raw = result.get("ip_address", result) if isinstance(result, dict) else {}
+        return self._upcloud_ip_row(raw)
+
+    async def delete_upcloud_ip(self, address):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud IP addresses are only available for UpCloud accounts")
+        address = str(address or "").strip()
+        if not address:
+            raise ProviderError("UpCloud IP address is required")
+        details = await self._req("GET", f"/ip_address/{address}")
+        raw = details.get("ip_address", details) if isinstance(details, dict) else {}
+        sid = raw.get("server") or raw.get("server_uuid")
+        if sid:
+            await self._upcloud_stopped_server(sid)
+        await self._req("DELETE", f"/ip_address/{address}")
+        return True
+
+    async def add_upcloud_interface_ip(self, server_id, interface_index, address=None,
+                                       family="IPv4", force=False):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud networking is only available for UpCloud accounts")
+        sid = str(server_id or "").strip()
+        if not sid:
+            raise ProviderError("UpCloud server UUID is required")
+        await self._upcloud_stopped_server(sid)
+        family = str(family or "").strip()
+        if family not in {"IPv4", "IPv6"}:
+            raise ProviderError("UpCloud IP family must be IPv4 or IPv6")
+        body_ip = {"family": family}
+        if address is not None and str(address).strip():
+            body_ip["address"] = str(address).strip()
+        path = f"/server/{sid}/networking/interface/{int(interface_index)}/ip_address"
+        if force:
+            path += "?force=yes"
+        result = await self._req("POST", path, json={"ip_address": body_ip})
+        raw = result.get("ip_address", result) if isinstance(result, dict) else {}
+        return self._upcloud_ip_row({**raw, "server": sid})
+
+    async def remove_upcloud_interface_ip(self, server_id, interface_index, address):
+        if self.provider != "upcloud":
+            raise ProviderError("UpCloud networking is only available for UpCloud accounts")
+        sid = str(server_id or "").strip()
+        address = str(address or "").strip()
+        if not sid or not address:
+            raise ProviderError("UpCloud server UUID and IP address are required")
+        await self._upcloud_stopped_server(sid)
+        return await self._req("DELETE", f"/server/{sid}/networking/interface/{int(interface_index)}/ip_address/{address}")
+
     # -- Hetzner Primary IPs --------------------------------------------
     def _primary_provider(self):
         if self.provider != "hetzner":
@@ -1165,6 +1985,37 @@ class Provider:
             return await self.hetzner_power(server_id, h_action)
         elif self.provider == "linode":
             return await self.linode_power(server_id, action)
+        elif self.provider == "upcloud":
+            if action in ("start", "poweron", "boot"):
+                endpoint = "start"
+            elif action in ("halt", "shutdown", "poweroff", "stop"):
+                endpoint = "stop"
+            elif action == "reboot":
+                endpoint = "restart"
+            else:
+                raise ProviderError(f"unsupported UpCloud power action: {action}")
+            sid = str(server_id)
+            if endpoint == "start":
+                payload = {"server": {"start_type": "sync"}}
+            elif endpoint == "stop":
+                payload = {"stop_server": {"stop_type": "soft", "timeout": "60"}}
+            else:
+                payload = {"restart_server": {
+                    "stop_type": "soft", "timeout": "60", "timeout_action": "destroy",
+                }}
+            await self._req("POST", f"/server/{sid}/{endpoint}", json=payload)
+            return True
+        elif self.provider == "cloudferro":
+            if action in ("start", "poweron", "boot"):
+                payload = {"os-start": None}
+            elif action in ("halt", "shutdown", "poweroff", "stop"):
+                payload = {"os-stop": None}
+            elif action == "reboot":
+                payload = {"reboot": {"type": "SOFT"}}
+            else:
+                raise ProviderError(f"unsupported CloudFerro power action: {action}")
+            await self._req("POST", f"/servers/{server_id}/action", json=payload)
+            return True
         raise ProviderError(f"power controls not supported for provider: {self.provider}")
 
     # -- Hetzner Floating IPs -------------------------------------------
@@ -1386,31 +2237,87 @@ class Provider:
             return None
         keys = []
         if self.provider == "hetzner":
+            existing = []
+            try:
+                existing = await self.hetzner_ssh_keys()
+            except Exception as exc:
+                log.warning("Failed listing existing Hetzner SSH keys: %s", exc)
+            existing_by_name = {item.get("name"): item.get("id") for item in existing if item.get("id")}
+            existing_by_key = {}
+            for item in existing:
+                if item.get("id") and item.get("public_key"):
+                    parts = str(item["public_key"]).strip().split()
+                    if len(parts) >= 2:
+                        existing_by_key[f"{parts[0]} {parts[1]}"] = item["id"]
+
             for k in stored_keys:
-                try:
-                    hk = await self.create_hetzner_ssh_key(k["name"], k["public_key"])
-                    keys.append(hk.get("id") or k["name"])
-                except Exception:
-                    keys.append(k["name"])
+                clean_pub = ""
+                pub_parts = str(k.get("public_key") or "").strip().split()
+                if len(pub_parts) >= 2:
+                    clean_pub = f"{pub_parts[0]} {pub_parts[1]}"
+                matched_id = existing_by_name.get(k.get("name")) or (existing_by_key.get(clean_pub) if clean_pub else None)
+                if matched_id:
+                    keys.append(matched_id)
+                else:
+                    try:
+                        hk = await self.create_hetzner_ssh_key(k["name"], k["public_key"])
+                        keys.append(hk.get("id") or k["name"])
+                    except Exception as exc:
+                        if "unique" in str(exc).lower():
+                            keys.append(k["name"])
+                        else:
+                            log.warning("Failed creating Hetzner SSH key %s: %s", k.get("name"), exc)
+                            keys.append(k["name"])
+
         elif self.provider == "vultr":
             existing = []
             try:
                 existing = await self.vultr_ssh_keys()
-            except Exception:
-                pass
+            except Exception as exc:
+                log.warning("Failed listing existing Vultr SSH keys: %s", exc)
             existing_map = {item.get("name"): item.get("id") for item in existing if item.get("id")}
+            existing_by_key = {}
+            for item in existing:
+                if item.get("id") and item.get("ssh_key"):
+                    parts = str(item["ssh_key"]).strip().split()
+                    if len(parts) >= 2:
+                        existing_by_key[f"{parts[0]} {parts[1]}"] = item["id"]
+
             for k in stored_keys:
-                if k["name"] in existing_map:
-                    keys.append(existing_map[k["name"]])
+                clean_pub = ""
+                pub_parts = str(k.get("public_key") or "").strip().split()
+                if len(pub_parts) >= 2:
+                    clean_pub = f"{pub_parts[0]} {pub_parts[1]}"
+                matched_id = existing_map.get(k.get("name")) or (existing_by_key.get(clean_pub) if clean_pub else None)
+                if matched_id:
+                    keys.append(matched_id)
                 else:
                     try:
                         vk = await self.create_vultr_ssh_key(k["name"], k["public_key"])
                         if vk.get("id"):
                             keys.append(vk["id"])
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log.warning("Failed creating Vultr SSH key %s: %s", k.get("name"), exc)
+
         elif self.provider == "linode":
             for k in stored_keys:
-                keys.append(k["public_key"])
+                clean_key = str(k.get("public_key") or "").strip()
+                if clean_key:
+                    keys.append(clean_key)
+
+        elif self.provider == "upcloud":
+            # UpCloud has no account-level SSH-key API.  Keep the local vault
+            # as the source of truth and pass OpenSSH strings in login_user.
+            for k in stored_keys:
+                public_key = str(k.get("public_key") or "").strip()
+                if public_key:
+                    keys.append(public_key)
+
+        elif self.provider == "cloudferro":
+            for k in stored_keys:
+                public_key = str(k.get("public_key") or "").strip()
+                if public_key:
+                    keys.append(public_key)
+
         return keys if keys else None
 

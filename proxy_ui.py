@@ -22,6 +22,7 @@ class Pool(StatesGroup):
     availability = State()
     country = State()
     validation = State()
+    usage_limit = State()
 
 
 def register_proxy_ui(dp, host):
@@ -60,6 +61,8 @@ def register_proxy_ui(dp, host):
         lines = [f"🌐 <b>{html.escape(p['label'])}</b>",
                  f"میزبان: <code>{html.escape(t['host'])}:{t['port']}</code>",
                  f"نوع: {t['scheme']}",
+                 f"Cloudbot traffic: {p.get('usage_bytes', 0) / 1e9:.5f} GB / "
+                 + (f"{p['usage_limit_bytes'] / 1e9:g} GB" if p.get('usage_limit_bytes') else 'Unlimited'),
                  f"شناسه‌ها: {len(sessions)} · فعال: {sum(s['enabled'] for s in sessions)}",
                  '🔐 قالب و رمز عبور رمزنگاری شده‌اند.', '', 'اتصال اکانت‌ها:']
         for acc in st.accounts():
@@ -78,6 +81,7 @@ def register_proxy_ui(dp, host):
         for action, label in [('default', '⭐ پیش‌فرض'), ('rename', '✏️ تغییر نام'),
                               ('ids', '➕ افزودن شناسه‌ها'), ('sessions', '📋 مدیریت شناسه‌ها'),
                               ('availability', '🌍 ظرفیت یک کشور'),
+                              ('limit', '📊 محدودیت مصرف GB'), ('reset_usage', '🔄 صفر کردن مصرف'),
                               ('format', '✏️ قالب بدون اتصال'),
                               ('toggle', '⏸ غیرفعال / فعال'), ('delete', '🗑 حذف بدون اتصال')]:
             b.button(text=label, callback_data=f'pp:{pid}:{action}')
@@ -216,17 +220,20 @@ def register_proxy_ui(dp, host):
         _, raw_pid, action = cb.data.split(':')
         pid = int(raw_pid)
         await host['clear_proxy_state'](state)
-        if action in {'rename', 'ids', 'availability', 'format'}:
+        if action in {'rename', 'ids', 'availability', 'format', 'limit'}:
             await state.update_data(pool_provider_id=pid)
-            await state.set_state({'rename': Pool.rename, 'ids': Pool.more_ids, 'availability': Pool.availability, 'format': Pool.edit_format}[action])
+            await state.set_state({'rename': Pool.rename, 'ids': Pool.more_ids, 'availability': Pool.availability, 'format': Pool.edit_format, 'limit': Pool.usage_limit}[action])
             await cb.message.edit_text({'rename': 'نام تازه را بفرست.', 'ids': 'شناسه‌ها را یکی در هر خط بفرست.',
                                         'availability': 'نام کشور یا کد دوحرفی را بفرست.',
+                                        'limit': 'محدودیت مصرف Cloudbot بر حسب GB را بفرست. 0 یعنی نامحدود. پیش‌فرض جدید: 0.1 GB. مصرف تا زمان صفر کردن نگه داشته می‌شود.',
                                         'format': 'قالب تازه یا یک خط پراکسی را بفرست. فقط قالب بدون اتصال قابل ویرایش است؛ پیام پاک می‌شود.'}[action])
         elif action == 'sessions':
             await session_page(cb, pid, 0)
         else:
             try:
-                if action != 'show':
+                if action == 'reset_usage':
+                    st.configure_proxy_usage(pid, reset=True)
+                elif action != 'show':
                     st.manage_proxy_provider(pid, action)
             except ProxyPoolError as exc:
                 await cb.answer(str(exc), show_alert=True)
@@ -242,12 +249,16 @@ def register_proxy_ui(dp, host):
     @dp.message(Pool.more_ids)
     @dp.message(Pool.availability)
     @dp.message(Pool.edit_format)
+    @dp.message(Pool.usage_limit)
     @owner
     async def provider_input(msg, state):
         data, current = await state.get_data(), await state.get_state()
         pid = data['pool_provider_id']
         try:
-            if current == Pool.rename.state:
+            if current == Pool.usage_limit.state:
+                st.configure_proxy_usage(pid, limit_gb=msg.text)
+                note = '✅ محدودیت مصرف ذخیره شد.'
+            elif current == Pool.rename.state:
                 if len((msg.text or '').strip()) > 64:
                     raise ProxyPoolError('نام حداکثر ۶۴ کاراکتر است.')
                 st.manage_proxy_provider(pid, 'rename', msg.text)

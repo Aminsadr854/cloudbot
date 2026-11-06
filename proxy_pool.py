@@ -8,6 +8,7 @@ from contextlib import contextmanager
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
 import time
@@ -82,6 +83,12 @@ def components(value):
     """Parse the bot's proxy syntax without importing network clients."""
     scheme = 'http'
     raw = str(value or '').strip()
+    if ' ' in raw and not raw.startswith('['):
+        raw = raw.split()[0]
+    raw = raw.rstrip(',;').strip('\"\'')
+    port_template = ':{port}' in raw
+    if port_template:
+        raw = raw.replace(':{port}', ':65535', 1)
     if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', raw):
         scheme, raw = raw.split('://', 1)
     if scheme not in {'http', 'https', 'socks4', 'socks5'}:
@@ -111,7 +118,7 @@ def components(value):
             raise ValueError()
     except ValueError:
         raise ProxyPoolError('میزبان یا پورت پراکسی نامعتبر است.') from None
-    return {'scheme': scheme, 'host': p.hostname.lower(), 'port': port,
+    return {'scheme': scheme, 'host': p.hostname.lower(), 'port': '{port}' if port_template else port,
             'username': unquote(p.username or ''), 'password': unquote(p.password or ''),
             'auth': p.username is not None}
 
@@ -124,7 +131,7 @@ def proxy_string(p):
 
 
 def session_ids(text):
-    values = [s.strip() for s in str(text).splitlines() if s.strip()]
+    values = [s.strip() for s in str(text).replace(',', '\n').splitlines() if s.strip()]
     if not values or any(not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', s) for s in values):
         raise ProxyPoolError('شناسه‌ها را یکی در هر خط بفرست؛ فقط حروف، عدد، _ و - مجاز است.')
     return list(dict.fromkeys(values))
@@ -132,8 +139,9 @@ def session_ids(text):
 
 def inferred_username(user):
     for pattern in (r'^(.*-country-)([A-Za-z]{2})(-ssid-)([A-Za-z0-9_-]+?)(-sst-.*)$',
-                    r'^(.*_zone_)([A-Za-z]{2})(_sid_)([A-Za-z0-9_-]+?)(_time_.*)$'):
-        m = re.fullmatch(pattern, user)
+                    r'^(.*_zone_)([A-Za-z]{2})(_sid_)([A-Za-z0-9_-]+?)(_time_.*)$',
+                    r'^(.*[-_](?:zone|country|region)[-_])([A-Za-z]{2})([-_](?:sid|ssid|session)[-_])([A-Za-z0-9_-]+?)((?:[-_](?:time|sst|life)[-_0-9]+)?)$'):
+        m = re.fullmatch(pattern, user, re.IGNORECASE)
         if m:
             prefix, country, separator, sid, suffix = m.groups()
             return prefix + '{country}' + separator + '{session}' + suffix, country.upper(), sid
@@ -150,10 +158,57 @@ def template_pattern(username):
 def username_namespace(username):
     # Session duration is a connection setting, not a separate session realm.
     for marker, ending in (('-country-{country}-ssid-{session}-sst-', '-sst-'),
-                           ('_zone_{country}_sid_{session}_time_', '_time_')):
+                           ('_zone_{country}_sid_{session}_time_', '_time_'),
+                           ('-sst-', '-sst-'),
+                           ('_time_', '_time_')):
         if marker in username:
             return username.rsplit(ending, 1)[0]
     return username
+
+
+def usage_limit_bytes(limit_gb):
+    try:
+        value = float(limit_gb)
+        if isinstance(limit_gb, bool) or not math.isfinite(value) or value < 0 or value > 1_000_000:
+            raise ValueError()
+        limit = int(round(value * 1_000_000_000))
+        if value > 0 and limit == 0:
+            raise ValueError()
+        return limit
+    except (TypeError, ValueError, OverflowError):
+        raise ProxyPoolError('Usage limit must be a finite non-negative number of GB; 0 means unlimited.') from None
+
+
+def render_proxy(template, country, identity):
+    p = dict(template)
+    if p['port'] == '{port}':
+        if not str(identity).isdigit() or not 1 <= int(identity) <= 65535:
+            raise ProxyPoolError('Port must be a number between 1 and 65535.')
+        if p['host'] == 'gw.dataimpulse.com' and not 10000 <= int(identity) <= 20000:
+            raise ProxyPoolError('DataImpulse sticky ports must be between 10000 and 20000.')
+        p['port'] = int(identity)
+        country = country.lower()
+    p['username'] = p['username'].replace('{country}', country).replace('{session}', str(identity))
+    return proxy_string(p)
+
+
+def match_proxy_template(template, proxy):
+    p = components(proxy) if isinstance(proxy, str) else proxy
+    if template['host'] != p['host'] or (template['port'] != '{port}' and template['port'] != p['port']):
+        return None
+    match = template_pattern(template['username']).fullmatch(p['username'])
+    if not match:
+        inferred = inferred_username(p['username'])
+        if inferred and username_namespace(inferred[0]) == username_namespace(template['username']):
+            return inferred[1], inferred[2]
+        if template['port'] == '{port}' and template['host'] == 'gw.dataimpulse.com':
+            prefix = template['username'].split('__cr.', 1)[0]
+            target = re.fullmatch(re.escape(prefix) + r'__cr\.([A-Za-z]{2})(?:;.*)?', p['username'])
+            if target:
+                return target[1].upper(), str(p['port'])
+        return None
+    values = match.groupdict()
+    return (values.get('country') or '').upper(), (str(p['port']) if template['port'] == '{port}' else values.get('session'))
 
 
 def import_format(text):
@@ -161,11 +216,11 @@ def import_format(text):
     lines = [v.strip() for v in str(text).splitlines() if v.strip()]
     if not lines:
         raise ProxyPoolError('قالب خالی است.')
-    if any(marker in unquote(lines[0]) for marker in ('{country}', '{session}', '{session_id}', '{sessionid}')):
+    if any(marker in unquote(lines[0]) for marker in ('{country}', '{session}', '{session_id}', '{sessionid}', '{port}')):
         p = components(lines[0])
         user = p['username'].replace('{session_id}', '{session}').replace('{sessionid}', '{session}')
         p['username'] = user
-        if user.count('{session}') != 1 or user.count('{country}') > 1:
+        if user.count('{session}') != (0 if p['port'] == '{port}' else 1) or user.count('{country}') > 1:
             raise ProxyPoolError('نام کاربری باید دقیقاً یک {session} و حداکثر یک {country} داشته باشد.')
         if '{' in user.replace('{country}', '').replace('{session}', '') or '}' in user.replace('{country}', '').replace('{session}', ''):
             raise ProxyPoolError('فقط {country} و {session} پشتیبانی می‌شود.')
@@ -177,6 +232,20 @@ def import_format(text):
         if re.fullmatch(r'\d+[.)]?', line):
             continue
         p = components(line)
+        if p['host'] == 'gw.dataimpulse.com':
+            match = re.fullmatch(r'(.*__cr\.)([A-Za-z]{2})(;[^{}]*)?', p['username'])
+            if match:
+                prefix, country, suffix = match.groups()
+                resolve_country(country)
+                sid = str(p['port'])
+                p['port'] = '{port}'
+                p['username'] = prefix + '{country}' + (suffix or '')
+                render_proxy(p, country, sid)
+                if template is not None and p != template:
+                    raise ProxyPoolError('همه خطوط باید از یک میزبان، قالب و رمز عبور باشند.')
+                template = p
+                ids.append(sid)
+                continue
         inferred = inferred_username(p['username'])
         if not inferred:
             raise ProxyPoolError('قالب ناشناخته؛ {country} و {session} را در نام کاربری مشخص کن.')
@@ -221,6 +290,14 @@ class ProxyPoolStore:
         inferred = inferred_username(p['username'])
         for provider in self.proxy_providers():
             t = provider['template']
+            if t['port'] == '{port}':
+                match = match_proxy_template(t, p)
+                if match:
+                    country, sid = match
+                    provider_id = provider['id']
+                    p['username'] = components(render_proxy(t, country, sid))['username']
+                    break
+                continue
             if (t['host'], t['port']) != (p['host'], p['port']):
                 continue
             m = template_pattern(t['username']).fullmatch(p['username'])
@@ -272,8 +349,9 @@ class ProxyPoolStore:
                 groups.setdefault(key, []).append({'id': a['id'], 'label': a['label']})
         return [owners for owners in groups.values() if len(owners) > 1]
 
-    def add_proxy_provider(self, label, template, ids, family='default'):
+    def add_proxy_provider(self, label, template, ids, family='default', usage_limit_gb=0.1):
         family = 'default'
+        limit = usage_limit_bytes(usage_limit_gb)
         if not str(label).strip():
             raise ProxyPoolError('نام نامعتبر است.')
         raw_tpl = proxy_string(template) if isinstance(template, dict) else str(template)
@@ -285,6 +363,7 @@ class ProxyPoolStore:
             cur = self.con.execute('INSERT INTO proxy_providers(label,template,identity,family) VALUES(?,?,?,?)',
                                    (label.strip(), self.f.encrypt(json.dumps(template).encode()), identity, family))
             pid = cur.lastrowid
+            self.con.execute('UPDATE proxy_providers SET usage_limit_bytes=? WHERE id=?', (limit, pid))
             self._add_proxy_sessions(pid, ids)
             if not self.get('proxy_default'):
                 self.con.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('proxy_default',?)", (str(pid),))
@@ -293,12 +372,28 @@ class ProxyPoolStore:
 
     def _add_proxy_sessions(self, pid, ids):
         ids = session_ids('\n'.join(ids))
+        provider = self.proxy_provider(pid)
+        if provider and provider['template']['port'] == '{port}':
+            for sid in ids:
+                render_proxy(provider['template'], 'DE', sid)
         start = self.con.execute('SELECT COALESCE(MAX(position),-1)+1 FROM proxy_sessions WHERE provider_id=?', (pid,)).fetchone()[0]
         count = 0
         for position, sid in enumerate(ids, start):
             count += self.con.execute('INSERT OR IGNORE INTO proxy_sessions(provider_id,session_id,position) VALUES(?,?,?)',
                                       (pid, sid, position)).rowcount
         return count
+
+    def configure_proxy_usage(self, pid, limit_gb=None, reset=False):
+        limit = None
+        if limit_gb is not None:
+            limit = usage_limit_bytes(limit_gb)
+        with self.proxy_transaction():
+            if not self.proxy_provider(pid):
+                raise ProxyPoolError('ارائه‌دهنده یافت نشد.')
+            if limit is not None:
+                self.con.execute('UPDATE proxy_providers SET usage_limit_bytes=? WHERE id=?', (limit, pid))
+            if reset:
+                self.con.execute('UPDATE proxy_providers SET usage_bytes=0, usage_reset_at=? WHERE id=?', (time.time(), pid))
 
     def add_proxy_sessions(self, pid, ids):
         with self.proxy_transaction():
@@ -444,6 +539,8 @@ class ProxyPoolStore:
             provider = self.proxy_provider(pid)
             if not provider or not provider['enabled']:
                 raise ProxyPoolError('ارائه‌دهنده غیرفعال است؛ یکی دیگر انتخاب کن.')
+            if provider.get('usage_limit_bytes') and provider.get('usage_bytes', 0) >= provider['usage_limit_bytes']:
+                raise ProxyPoolError('Provider traffic limit reached. Raise the GB limit or reset its usage counter.')
             self._expire_proxy_reservations()
             if acc_id:
                 self.con.execute('DELETE FROM proxy_claims WHERE account_id=? AND request_token IS NOT NULL', (acc_id,))
@@ -458,9 +555,7 @@ class ProxyPoolStore:
                         ids.remove(binding['session_id'])
                     ids.insert(0, binding['session_id'])
             for sid in ids:
-                t = dict(provider['template'])
-                t['username'] = t['username'].replace('{country}', country).replace('{session}', sid)
-                proxy = proxy_string(t)
+                proxy = render_proxy(provider['template'], country, sid)
                 try:
                     self._guard_proxy(proxy, acc_id)
                 except ProxyPoolError:
@@ -479,10 +574,8 @@ class ProxyPoolStore:
             for s in self.proxy_sessions(pid):
                 if not s['enabled'] or not provider['enabled']:
                     continue
-                p = dict(provider['template'])
-                p['username'] = p['username'].replace('{country}', country).replace('{session}', s['session_id'])
                 try:
-                    self._guard_proxy(proxy_string(p))
+                    self._guard_proxy(render_proxy(provider['template'], country, s['session_id']))
                     available += 1
                 except ProxyPoolError:
                     pass

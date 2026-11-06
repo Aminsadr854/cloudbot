@@ -65,3 +65,36 @@ class AccountStoreTests(unittest.TestCase):
                     os.environ.pop("CLOUDBOT_KEY", None)
                 else:
                     os.environ["CLOUDBOT_KEY"] = old_key
+
+    def test_account_note_setting_and_migration(self):
+        with tempfile.TemporaryDirectory() as d:
+            old_db = os.environ.get("CLOUDBOT_DB")
+            old_key = os.environ.get("CLOUDBOT_KEY")
+            os.environ["CLOUDBOT_DB"] = f"{d}/cloudbot.db"
+            os.environ["CLOUDBOT_KEY"] = f"{d}/secret.key"
+            try:
+                import store
+                st = store.Store()
+                # Default is empty note
+                acc_id = st.add_account("linode-test", "linode", "token", note="initial note")
+                account = st.account(acc_id)
+                self.assertEqual(account.get("note"), "initial note")
+
+                # Update note
+                st.set_account_note(acc_id, "updated note memo")
+                account = st.account(acc_id)
+                self.assertEqual(account.get("note"), "updated note memo")
+
+                # Clear note
+                st.set_account_note(acc_id, "")
+                account = st.account(acc_id)
+                self.assertEqual(account.get("note"), "")
+            finally:
+                if old_db is None:
+                    os.environ.pop("CLOUDBOT_DB", None)
+                else:
+                    os.environ["CLOUDBOT_DB"] = old_db
+                if old_key is None:
+                    os.environ.pop("CLOUDBOT_KEY", None)
+                else:
+                    os.environ["CLOUDBOT_KEY"] = old_key

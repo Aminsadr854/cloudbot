@@ -10,7 +10,7 @@ root-only token for the local owner automation API.
 
 ## What it does
 
-**Cloud accounts.** Linode, Vultr and Hetzner, each reached through its own
+**Cloud accounts.** Linode, Vultr, Hetzner, UpCloud, and CloudFerro, each reached through its own
 proxy (`host:port:user:pass`, HTTP or SOCKS). List, create and delete servers.
 API tokens and proxies are encrypted at rest with a key in its own root-only
 file, so the database on its own is inert.
@@ -22,6 +22,10 @@ and refreshed before provisioning, so unsupported or unavailable plan/location
 combinations are not offered. A last-second capacity change is reported with a
 button to reload the choices. Root passwords are encrypted in the bot database
 and appear only when you open that server's SSH details.
+UpCloud uses zones, plans, and zone-compatible storage templates in the same
+wizard. It accepts selected public keys from the local SSH vault at creation;
+UpCloud has no account-level SSH-key sync. A generated fallback password is not
+saved unless UpCloud itself returns a one-time password.
 
 **Panel nodes.** Provision a new server and attach it to a Pasarguard/Marzban
 panel in one step: firewall down, node installed, certificate and API key read
@@ -30,6 +34,8 @@ back, node registered. Duplicate names are cleaned up rather than stacked.
 **Tunnels.** GRE and paytun between an Iran relay and a foreign box, with port
 forwarding, teardown, and registration of tunnels you built by hand so the
 watchdog can repair them too.
+
+**Owner webhook.** `POST /v1/webhook/notify` on the control API forwards a message from an external script to the owner's Telegram, behind its own token (see `AI_API_MCP.md`). The Gemini exit watchdog in `projects/gemini-watchdog` uses it. A message may carry inline `buttons`, restricted to `td:<verb>:<ref>` callbacks so the notify token cannot forge the bot's own menu callbacks; `tdoctor_ui.py` handles those taps and replies to tunnel-doctor messages by forwarding them to the doctor's control API (see `projects/tunnel-doctor/README.md`, "Telegram").
 
 **Cloudflare DNS.** Create a subdomain, repoint one at a new IP, with the
 proxied flag left as you set it.
@@ -82,54 +88,57 @@ Then open the bot, send `/start`, and fill in **⚙️ Settings**:
 | 🇮🇷 Iran relay | `host:port:user:password` of a box inside Iran. Everything that has to be measured from Iran runs there. |
 | 🌐 Cloudflare token | an API token that can edit DNS in your zones. |
 
-Open **🌐 ارائه‌دهندگان پراکسی (Proxy providers)** to save a provider name,
-format and session IDs. Paste NiceProxy or SwiftProxy lines for automatic
-extraction, or use `host:port:login-{country}-sid-{session_id}:password` followed by
-IDs, one per line. HTTP is the default; prefix SOCKS formats with `socks5://`.
-Only country and session change; duration settings such as `sst-15` and
-`time_10` stay in the format. Numeric IDs retain leading zeros. Standalone
-numbering is ignored only when importing full proxy lines. Set a default
-provider if desired. Connections always use the default address selection;
-there is no IPv4/IPv6 prompt. `{session}` remains supported as an alias.
+Open **🌐 ارائه‌دهندگان پراکسی (Proxy providers)** to save a provider and
+its supplied identities. NiceProxy/SwiftProxy use username session IDs;
+DataImpulse uses sticky ports instead. Import full DataImpulse lines or use
+`http://LOGIN__cr.{country}:PASSWORD@gw.dataimpulse.com:{port}` with ports such
+as `10000-10014`. Country codes become lowercase; the port stays the supplied
+identity when changing country. HTTP is the default; SOCKS formats need a
+`socks5://` prefix. Numeric session IDs retain leading zeros and duration
+settings remain part of the format. `{session_id}` is an alias for `{session}`.
 
-Cloud accounts are added from **➕ Add account**. Choose **🌍 کشور و ارائه‌دهنده**
-to use a pool, enter a manual proxy, or choose no proxy. Existing accounts have
-**⚙️ Manage account → 🌐 مدیریت پراکسی**. Custom proxy and provider/country
-choices are also available on replacement, country and retry screens, even
-with no saved providers; add any provider from the picker without restarting
-account import. Enter a
-country name, common Persian name or code (`Germany`, `آلمان`, `DE`, `USA`,
-`SG`, `SK`). The account uses its saved provider or your default; switch it
-explicitly when needed. Country changes retain the session if that pair is
-free. **🔄 سشن دیگر** requests a different supplied session; IDs are never
-generated. Availability is counted per country, not across the entire pool.
+New providers default to a **0.1 GB** Cloudbot traffic allowance (decimal GB).
+Provider cards show usage and limit; Edit or the Telegram provider menu can
+change the limit or reset usage. **0 means unlimited**. Existing providers keep
+unlimited allowances during migration. Counters persist across restarts and
+are shared by bot and API processes. Exhaustion blocks live provider requests
+and new allocations; it does not trigger proxy replacement. Cloud API calls,
+Keystone authentication, retries and standalone proxy tests count HTTP headers
+and application body bytes. This is not vendor billing: TLS/CONNECT overhead,
+socket buffering and traffic outside Cloudbot are excluded. Read allowance is
+reserved before reading; interrupted reads may conservatively retain it.
 
-One provider/country/session pair belongs to one account at a time, including
-manual edits and concurrent requests. Password, protocol and session-duration
-changes cannot bypass this rule. Another country or provider can use the same
-ID. Removing/replacing a proxy or deleting its account releases its binding.
-Connection testing reserves candidates for ten minutes; failures and cancelled
-wizards release them. Old responses cannot overwrite newer account changes.
-The provider menu flags legacy duplicate account bindings until you resolve
-them. Disable IDs/providers to stop new assignments while retaining current
-bindings; delete IDs/providers and edit formats only when unused.
+Add accounts from **➕ Add account** using a provider/country, a manual proxy,
+or direct access. Existing routes are under **Manage account → Proxy**.
+Country changes retain an available identity; **🔄 سشن دیگر** selects another
+supplied identity. Add providers from the picker without restarting account
+import. Disabled providers/IDs keep their existing bindings but cannot receive
+new assignments. Delete or edit formats only while unused. Availability is
+counted per country; manual edits and concurrent allocation cannot duplicate
+one provider/country/identity pair. Replacing a route or deleting an account
+releases its binding. Connection tests reserve candidates for ten minutes;
+failures and cancellation release them, and stale replies cannot overwrite
+newer account changes.
 
 A cloud API allowlist sees the proxy's outbound address; a country/session identity does
 not guarantee a permanently fixed or distinct public IP from the provider.
 
-Cloudbot warms local account, server, Floating IP, and Hetzner Primary IP
-snapshots at startup. Account/server menus, primary IP pages, and location
-choices reuse them immediately; stale data refreshes in the background. A
-minute-based refresh detects changes made outside the bot, and refresh buttons
-fetch current data on demand. Bot mutations invalidate the affected account
-and refresh it; old in-flight responses cannot repopulate an invalidated cache.
-Provider checks for confirmations and IP changes remain live. Sending an IP
-opens its locally indexed server card; cache misses return immediately.
+The control API syncs inventory, balances/access, and IPs at startup and hourly.
+Cloudbot changes automatically queue another sync, even without a browser:
+account edits persist in SQLite; API mutations and Telegram server changes
+queue affected accounts. The worker checks every 2s, serializes passes, and
+preserves changes arriving mid-sync. Deleted accounts trigger inventory pruning.
+Visible consoles check `sync_status` every 3s and reload completed snapshots;
+provider reads retain saved inventory on failure. Refresh fetches the selected
+account/provider or all accounts in global views. Navigation and server cards
+stay local; IP search uses the saved index. Requests allow 120s (connect 45s/read
+90s), proxy tests 90s. Confirmation and provisioning checks stay live.
 
-The **🖥 Accounts → 🔍 Check all accounts** button checks every API key and
-connection. It reads balances for Linode and Vultr, validates Hetzner project
-access, and marks accounts with API failures or an outstanding balance with `!`
-in the account list until the next check or bot restart.
+**Accounts → Check all accounts** validates API access, billing where supported,
+and inventory. Server `suspended`/`billing_suspension` marks the account **Suspended**
+in Telegram, API checks, and console cards; balances remain visible. Successful
+refreshes clear suspension after recovery. Stopped servers and debt alone do not
+imply suspension; Telegram flags other API/billing problems with `!`.
 
 All bot messages and keyboard labels use the owner-created [Infrastructure Icons](https://t.me/addemoji/datacenter_emojis_by_vpnmanagerkiabot)
 custom-emoji pack. The pack contains thirteen static 100×100 PNG custom emojis:
@@ -171,6 +180,19 @@ copyable command for temporarily adding each address; it is lost at reboot.
 Configure the OS network for persistence, and remove the guest address
 separately when deleting the IP.
 
+**UpCloud** uses its own bearer API token, encrypted with other cloud account
+credentials. The web console and Telegram bot list servers, deploy from a
+public storage template in the selected zone, start, stop, reboot, and delete
+servers, and inject selected public SSH keys from the local vault during
+creation. Floating IPv4 allocation attaches to a server and asks for an
+explicit `keep` or `release` policy. The server must be stopped before
+allocating or changing floating/interface addresses. The UpCloud network panel
+lists interfaces and supports eligible secondary IP add/remove operations while
+stopped. These API operations do not configure the guest operating system;
+configure the guest network separately when adding an address or interface.
+Account checks verify UpCloud API access; Cloudbot does not show balance figures
+that its account API does not provide.
+
 ## Requirements
 
 * Debian or Ubuntu with systemd, Python 3.10+
@@ -180,15 +202,15 @@ separately when deleting the IP.
 
 ## Web Hosting Console & API for automation
 
-Cloudbot includes a modern web-based hosting console and owner automation API listening on `127.0.0.1:9601`:
+The web console and owner API listen on `127.0.0.1:9601`:
 * **Web Hosting Dashboard (`http://127.0.0.1:9601`)**: A responsive single-page console providing full hosting capabilities:
-  - Multi-cloud server inventory (Hetzner, Vultr, Linode) with live power controls, root password reveals from the encrypted vault, and instance teardown.
+  - Multi-cloud server inventory (Hetzner, Vultr, Linode, UpCloud) with live power controls, root password reveals from the encrypted vault, and instance teardown.
   - Interactive deployment wizard with dynamic region/plan inventory and SSH key injection.
-  - Floating IP & Reserved IP management: allocation, attachment to instances, reverse DNS PTR records, and copyable guest OS network configuration commands.
-  - SSH Key Vault: in-browser Ed25519 keypair generation, public key storage, and auto-syncing to cloud providers.
-  - Cloud accounts, proxy pool routing, and Cloudflare DNS management.
-  - The dashboard hydrates the last known local snapshot immediately, then performs a live sync. A status strip shows whether data is syncing, current, stale, or needs attention; failed resource loads retain their last known values and expose a retry action.
-  - Read requests retry bounded network and transient server failures. When a proxied account reports a route failure, the console repeats the account check once, then attempts one verified replacement session only if the route still fails, followed by one final account check. Destructive actions are never retried automatically.
+  - Floating IP & Reserved IP management: allocation, attachment to instances, reverse DNS PTR records, and copyable guest OS network configuration commands. UpCloud address actions use server-aware controls and explicit release policy.
+  - SSH Key Vault: in-browser Ed25519 keypair generation and public key storage; UpCloud uses selected local vault keys during deployment because it has no account-level SSH-key API.
+  - Accounts opens with connected provider logos and account/server counts; choose a provider to list its accounts, then use All providers to return. Edit account changes the display name or verifies and replaces the API token; leaving the token empty preserves it. More → Add/Edit note edits a plain memo with password autofill suppressed. Proxy pool routing and Cloudflare DNS are also managed here.
+  - The dashboard loads the last known local snapshot; Refresh requests a live sync. A status strip shows whether data is syncing, current, stale, or needs attention; failed resource loads retain their last known values and expose a retry action.
+  - Read requests retry bounded network and transient server failures. Account errors distinguish invalid/expired API tokens, API access restrictions, provider errors, and explicit proxy failures. Only explicit proxy failures offer proxy reconfiguration or automatic session replacement; the console rechecks the route before replacement and verifies the account afterward. Action dialogs explain the effect and offer Yes/No without typing. Destructive actions never retry automatically.
   - Local access via loopback or SSH tunnel: `ssh -L 9601:127.0.0.1:9601 root@YOUR_CLOUDBOT_HOST`.
 * **Automation API & MCP**: JSON operations protected by bearer token for AI clients (Claude, Cursor, Antigravity) and custom tooling. See [AI_API_MCP.md](AI_API_MCP.md) for endpoints, confirmation guardrails, and MCP setup.
 
@@ -200,3 +222,11 @@ Cloudbot includes a modern web-based hosting console and owner automation API li
   the cloud credentials and proxy formats. Measurements are not — they are
   operational data, and being able to read them is worth more than hiding them.
 * Automatic server replacement is off until you switch it on. It spends money.
+
+**CloudFerro** uses the OpenStack API in the WAW3-1 region. Add it as a
+`cloudferro` account and use an encrypted JSON token containing the application
+credential and project id, for example
+`{"id":"...","secret":"...","project_id":"..."}`. The bot authenticates
+against Keystone and supports account checks, server inventory, region/flavor/
+image discovery, create/delete, and start/stop/reboot. CloudFerro billing and
+floating-IP management are not exposed by this integration.

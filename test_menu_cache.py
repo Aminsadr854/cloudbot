@@ -31,20 +31,16 @@ class MenuCacheTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await asyncio.gather(one, two), [[1], [1]])
         loader.assert_awaited_once()
 
-    async def test_stale_value_returns_before_background_refresh_finishes(self):
+    async def test_stale_value_stays_until_explicit_refresh(self):
         await self.cache.get(self.account, 'ips', AsyncMock(return_value=['old']))
         key = (1, self.cache.revision(self.account), 'ips')
         self.cache.entries[key] = (['old'], 0)
-        entered, release = asyncio.Event(), asyncio.Event()
-        async def load():
-            entered.set()
-            await release.wait()
-            return ['new']
+        load = AsyncMock(return_value=['new'])
         self.assertEqual(await self.cache.get(self.account, 'ips', load), ['old'])
-        await entered.wait()
+        await asyncio.sleep(0)
+        load.assert_not_awaited()
         self.assertEqual(self.cache.peek(self.account, 'ips'), ['old'])
-        release.set()
-        await asyncio.gather(*self.cache.tasks.values())
+        self.assertEqual(await self.cache.get(self.account, 'ips', load, force=True), ['new'])
         self.assertEqual(self.cache.peek(self.account, 'ips'), ['new'])
 
     async def test_mutation_discards_inflight_response(self):

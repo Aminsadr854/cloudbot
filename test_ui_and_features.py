@@ -1,7 +1,8 @@
 import json
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 from aiohttp.test_utils import TestClient, TestServer
 
 import control_service
@@ -577,7 +578,7 @@ class UiAndFeaturesTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_page_routes_serve_ui(self):
         # Multi-page URLs should serve the web application without requiring auth tokens
-        for route in ["/overview", "/accounts", "/proxies", "/hetzner", "/vultr", "/linode", "/compute", "/ips", "/ssh", "/dns", "/watchdog"]:
+        for route in ["/overview", "/accounts", "/proxies", "/hetzner", "/vultr", "/linode", "/upcloud", "/compute", "/ips", "/ssh", "/dns", "/watchdog"]:
             res = await self.client.get(route)
             self.assertEqual(res.status, 200, f"Route {route} failed")
             body = await res.text()
@@ -651,6 +652,57 @@ niceproxy.io:17521:accounts1_k5ub-country-AF-ssid-JcVtnUPMVN:accpas2
             "FLPd7d6l0X", "fK8NLFu5W3", "JySrhHa9NT", "Q2JzZBdagY", "JcVtnUPMVN"
         ])
 
+    async def test_swiftproxy_bulk_extraction_and_import(self):
+        headers = {"Authorization": f"Bearer {self.token}"}
+        swiftproxy_input = """
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_86536532_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_56383866_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_12223284_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_78811913_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_57811441_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_89163257_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_28527297_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_55749829_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_59973453_time_10:acou234KD
+        eu.swiftproxy.net:7878:1acounts_custom_zone_SE_sid_32747857_time_10:acou234KD  , thats a sample for swift proxy , also the ux is so bad try to improve the ui ux
+        """
+        # 1. Parse proxy sessions
+        parse_res = await self.client.post("/v1/operations/parse_proxy_sessions", json={
+            "raw_text": swiftproxy_input,
+        }, headers=headers)
+        self.assertEqual(parse_res.status, 200)
+        data = await parse_res.json()
+        self.assertEqual(data["count"], 10)
+        self.assertEqual(data["session_ids"], [
+            "86536532", "56383866", "12223284", "78811913", "57811441",
+            "89163257", "28527297", "55749829", "59973453", "32747857"
+        ])
+        self.assertEqual(data["detected_country"], "SE")
+        self.assertIsNotNone(data["detected_template"])
+        self.assertEqual(data["detected_template"]["host"], "eu.swiftproxy.net")
+        self.assertEqual(data["detected_template"]["port"], 7878)
+        self.assertEqual(data["detected_template"]["username"], "1acounts_custom_zone_{country}_sid_{session}_time_10")
+        self.assertEqual(data["detected_template"]["password"], "acou234KD")
+
+        # 2. Add provider using the sample
+        add_p_res = await self.client.post("/v1/operations/add_proxy_provider", json={
+            "label": "SwiftProxy Sweden Pool",
+            "template": data["detected_template"],
+            "session_ids": data["session_ids"],
+        }, headers=headers)
+        self.assertEqual(add_p_res.status, 200)
+        prov_data = await add_p_res.json()
+        self.assertEqual(prov_data["sessions_count"], 10)
+
+        # 3. Add bulk sessions with comma-separated list into the newly created provider
+        bulk_comma = "99001122, 99003344, 99005566"
+        add_s_res = await self.client.post("/v1/operations/add_proxy_sessions", json={
+            "provider_id": prov_data["id"],
+            "raw_text": bulk_comma,
+        }, headers=headers)
+        self.assertEqual(add_s_res.status, 200)
+        s_data = await add_s_res.json()
+        self.assertEqual(s_data["added"], 3)
 
     async def test_auto_heal_proxies(self):
         headers = {"Authorization": f"Bearer {self.token}"}
@@ -668,6 +720,24 @@ niceproxy.io:17521:accounts1_k5ub-country-AF-ssid-JcVtnUPMVN:accpas2
             self.assertEqual(data["healed_count"], 1)
             self.assertEqual(data["healed"][0]["id"], 2)
             self.assertEqual(data["healed"][0]["country"], "DE")
+
+    async def test_auto_heal_does_not_rotate_account_errors(self):
+        headers = {"Authorization": f"Bearer {self.token}"}
+        for provider in ("linode", "hetzner", "vultr", "upcloud"):
+            self.store._accounts[1]["provider"] = provider
+            for error in ('HTTP 401: {"errors": [{"reason": "Invalid Token"}]}',
+                          'HTTP 401: Unauthorized IP address',
+                          'HTTP 403: insufficient token permissions',
+                          'HTTP 503: provider unavailable'):
+                with self.subTest(provider=provider, error=error), \
+                     patch.object(providers.Provider, "whoami", side_effect=providers.ProviderError(error)), \
+                     patch.object(self.store, "allocate_proxy", wraps=self.store.allocate_proxy) as allocate:
+                    res = await self.client.post("/v1/operations/auto_heal_proxies",
+                                                 json={"force": True}, headers=headers)
+                    self.assertEqual(res.status, 200)
+                    data = await res.json()
+                    self.assertEqual(data["healed_count"], 0)
+                    allocate.assert_not_called()
 
     def test_store_data_cache_methods(self):
         import tempfile
@@ -718,11 +788,21 @@ niceproxy.io:17521:accounts1_k5ub-country-AF-ssid-JcVtnUPMVN:accpas2
             acc = store.accounts()[0]
 
             # 1. Seed cache
-            store.set_cache("all_servers", {"servers": [{"id": 99, "name": "cached-node"}], "account_errors": {}})
+            store.set_cache("all_servers", {"servers": [{"id": 99, "name": "cached-node"}], "account_errors": {}, "cached_at": 1})
             # Call all_servers without refresh -> should return cached immediately
             res = await control_service.execute("all_servers", {}, store)
             self.assertEqual(len(res["servers"]), 1)
             self.assertEqual(res["servers"][0]["name"], "cached-node")
+
+            store.set_cache("all_floating_ips", {"floating_ips": [{"id": "saved-ip"}], "cached_at": 1})
+            res = await control_service.execute("all_floating_ips", {}, store)
+            self.assertEqual(res["floating_ips"][0]["id"], "saved-ip")
+            provider = AsyncMock()
+            provider.list_servers.return_value = []
+            provider.hetzner_floating_ips.return_value = []
+            with patch.object(control_service, "Provider", return_value=provider):
+                res = await control_service.execute("all_servers", {"refresh": True}, store)
+            self.assertEqual(res["servers"], [])
 
             # 2. Test cache invalidation on delete_account
             await control_service.execute("delete_account", {"account_id": acc["id"], "confirm": "DELETE_ACCOUNT"}, store)
@@ -974,3 +1054,135 @@ niceproxy.io:17521:accounts1_k5ub-country-AF-ssid-JcVtnUPMVN:accpas2
         self.assertIn("detachSelectedFipsFromModal", js)
         self.assertIn("detachAndDeleteSelectedFipsFromModal", js)
         self.assertIn("selectedServerModalFips", js)
+
+    def test_upcloud_console_controls_and_routes(self):
+        from pathlib import Path
+        html = Path("projects/cloudbot/ui/index.html").read_text()
+        js = Path("projects/cloudbot/ui/app.js").read_text()
+        css = Path("projects/cloudbot/ui/style.css").read_text()
+        api_client = Path("projects/cloudbot/ui/api-client.js").read_text()
+        control_api = Path("projects/cloudbot/control_api.py").read_text()
+
+        for route in ("/overview", "/accounts", "/proxies", "/hetzner", "/vultr",
+                      "/linode", "/compute", "/ips", "/ssh", "/dns", "/watchdog"):
+            self.assertIn(f'"{route}"', js)
+        self.assertIn('"/upcloud": "tab-upcloud"', js)
+        self.assertIn('"tab-upcloud": "/upcloud"', js)
+        self.assertIn('upcloud: { name: "UpCloud"', js)
+        self.assertIn('data-tab="tab-upcloud"', html)
+        self.assertIn('data-jump-tab="tab-upcloud"', html)
+        self.assertIn('id="tab-upcloud"', html)
+        self.assertIn('id="upcloud-accounts-view"', html)
+        self.assertIn('id="upcloud-servers-view"', html)
+        self.assertIn('id="hub-upcloud-servers"', html)
+        self.assertIn('id="hub-upcloud-accounts"', html)
+        self.assertIn('id="hub-upcloud-fips"', html)
+        self.assertIn('id="filter-acc-count-upcloud"', html)
+        self.assertIn('value="upcloud"', html)
+        self.assertIn('data-prov="upcloud"', html)
+        self.assertIn('id="deploy-login-user"', html)
+        self.assertIn('id="srvmodal-upcloud-networking"', html)
+        self.assertIn('badge-upcloud', css)
+        self.assertIn('renderUpcloudHub()', js)
+        self.assertIn('PROVIDER_CAPABILITIES', js)
+        self.assertIn('ASSIGN_FLOATING_IP', js)
+        self.assertIn('UNASSIGN_FLOATING_IP', js)
+        self.assertIn('ADD_INTERFACE_IP', js)
+        self.assertIn('REMOVE_INTERFACE_IP', js)
+        self.assertIn('upcloud_networking', js)
+        self.assertIn('editUpcloudIpSettings', js)
+        self.assertIn('confirm: "UPDATE_FLOATING_IP"', js)
+        self.assertIn('confirmAction(`Allocate and attach a ${ipType} Floating IP', js)
+        self.assertIn('confirmAction(`Attach Floating IP ${fipId} to this server?', js)
+        self.assertIn('mergeFailedAccountRows(data.servers, state.servers, errors)', js)
+        self.assertIn('mergeFailedAccountRows(data.floating_ips, state.floatingIps, errors)', js)
+        self.assertIn('getCachedImages(accId, isUpcloud ? region : null)', js)
+        self.assertIn('"upcloud_networking"', api_client)
+        self.assertIn('"/upcloud"', control_api)
+        self.assertIn('String(s.id)', js)
+        self.assertLess(html.index('/ui/api-client.js'), html.index('/ui/sync-manager.js'))
+        self.assertLess(html.index('/ui/sync-manager.js'), html.index('/ui/app.js'))
+
+    async def test_proxy_auto_retry_and_say_proxy_failed(self):
+        acc = {
+            "id": 1,
+            "label": "test",
+            "provider": "hetzner",
+            "token": "secret-token",
+            "proxy": "http://user:pass@198.51.100.22:8080",
+            "proxy_family": "default",
+        }
+        p = providers.Provider(acc)
+
+        mock_session = MagicMock()
+        mock_session.request.side_effect = aiohttp.ClientProxyConnectionError(
+            MagicMock(), OSError("Connection refused")
+        )
+        mock_session.__aenter__.return_value = mock_session
+        mock_session.__aexit__.return_value = None
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            with self.assertRaises(providers.ProviderError) as ctx:
+                await p._req("GET", "/servers")
+            # Should have attempted 4 times (1 initial + 3 retries)
+            self.assertEqual(mock_session.request.call_count, 4)
+            self.assertEqual(mock_sleep.call_count, 3)
+            # Must explicitly say Proxy failed
+            self.assertTrue(str(ctx.exception).startswith("Proxy failed:"))
+
+    async def test_proxy_retry_succeeds_on_second_attempt(self):
+        acc = {
+            "id": 1,
+            "label": "test",
+            "provider": "hetzner",
+            "token": "secret-token",
+            "proxy": "http://user:pass@198.51.100.22:8080",
+            "proxy_family": "default",
+        }
+        p = providers.Provider(acc)
+
+        mock_response = AsyncMock()
+        mock_response.status = 200
+        mock_response.text = AsyncMock(return_value='{"servers": []}')
+        mock_response.json = AsyncMock(return_value={"servers": []})
+
+        mock_cm = AsyncMock()
+        mock_cm.__aenter__.return_value = mock_response
+        mock_cm.__aexit__.return_value = None
+
+        mock_session = MagicMock()
+        mock_session.request.side_effect = [
+            aiohttp.ClientProxyConnectionError(MagicMock(), OSError("timeout")),
+            mock_cm
+        ]
+        mock_session.__aenter__.return_value = mock_session
+        mock_session.__aexit__.return_value = None
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            res = await p._req("GET", "/servers")
+            self.assertEqual(res, {"servers": []})
+            self.assertEqual(mock_session.request.call_count, 2)
+            self.assertEqual(mock_sleep.call_count, 1)
+
+    async def test_test_proxy_retries_and_says_proxy_failed(self):
+        headers = {"Authorization": f"Bearer {self.token}"}
+        mock_session = MagicMock()
+        mock_session.get.side_effect = aiohttp.ClientProxyConnectionError(
+            MagicMock(), OSError("Connection refused")
+        )
+        mock_session.__aenter__.return_value = mock_session
+        mock_session.__aexit__.return_value = None
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            res = await self.client.post("/v1/operations/test_proxy", json={
+                "proxy": "http://user:pass@198.51.100.22:8080"
+            }, headers=headers)
+            self.assertEqual(res.status, 200)
+            data = await res.json()
+            self.assertEqual(data["status"], "error")
+            self.assertEqual(mock_session.get.call_count, 4)
+            self.assertEqual(mock_sleep.call_count, 3)
+            self.assertTrue(data["error"].startswith("Proxy failed:"))

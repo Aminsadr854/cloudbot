@@ -81,8 +81,6 @@ class MenuCache:
         key = (int(account['id']), revision, name)
         entry = self.entries.get(key)
         if entry is not None and not force:
-            if entry[1] <= time.monotonic():
-                self._start(account, name, loader, ttl)
             return copy.deepcopy(entry[0])
         value = await asyncio.shield(self._start(account, name, loader, ttl))
         # A mutation/credential edit happened while this request was in flight.

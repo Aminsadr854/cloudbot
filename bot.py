@@ -88,7 +88,7 @@ dp = Dispatcher(storage=MemoryStorage())
 # Provider markers use the real provider logo stickers from the Infrastructure
 # Icons set.  The Unicode symbols remain the fallback for clients without
 # custom-emoji support.
-PROVIDER_LABEL = {"linode": "🟣 Linode", "vultr": "🔷 Vultr", "hetzner": "🟦 Hetzner"}
+PROVIDER_LABEL = {"linode": "🟣 Linode", "vultr": "🔷 Vultr", "hetzner": "🟦 Hetzner", "upcloud": "☁️ UpCloud", "cloudferro": "🇵🇱 CloudFerro"}
 PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
 account_check_status = {}
 menu_cache = MenuCache()
@@ -336,7 +336,7 @@ def kb_accounts():
         b.row(
             InlineKeyboardButton(
                 text=f"{PROVIDER_LABEL.get(a['provider'], a['provider'])} · "
-                     f"{a['label']}{' · !' if status == 'problem' else ''}",
+                     f"{a['label']}{' · Suspended' if status == 'suspended' else ' · !' if status == 'problem' else ''}",
                 callback_data=f"acc:{a['id']}"),
         )
     if st.accounts():
@@ -350,7 +350,8 @@ def kb_account(acc):
     b = InlineKeyboardBuilder()
     b.button(text="📋 سرورها", callback_data=f"srvs:{acc['id']}")
     b.button(text="➕ ساخت سرور", callback_data=f"new:{acc['id']}")
-    if acc["provider"] == "hetzner":
+    caps = providers.provider_capabilities(acc.get("provider"))
+    if caps.get("primary_ip_inventory"):
         b.button(text="🌐 Primary IPها", callback_data=f"hp:list:{acc['id']}:0")
     b.button(text="⚙️ مدیریت اکانت", callback_data=f"accset:{acc['id']}")
     b.button(text="🔑 حذف اکانت", callback_data=f"delacc:{acc['id']}")
@@ -444,10 +445,10 @@ def proxy_editor_text(acc):
 
 async def send_web_login_card(target, is_callback=False):
     otp = st.create_login_otp(OWNER, ttl=600)
-    web_url = f"https://vmanager.realkia.com:9443/login?otp={otp}"
+    web_url = f"https://vmanager.realkia.com/login?otp={otp}"
     msg = (
         f"{tg_emoji('server', '🖥')} <b>ورود مستقیم به پنل وب هاستینگ</b>\n\n"
-        f"🌐 <b>آدرس پنل:</b> <code>https://vmanager.realkia.com:9443</code>\n\n"
+        f"🌐 <b>آدرس پنل:</b> <code>https://vmanager.realkia.com</code>\n\n"
         "برای ورود خودکار به داشبورد وب هاستینگ روی دکمه زیر کلیک کن:\n"
         "<i>(این لینک ورود اختصاصی شما بوده، یک‌بار مصرف است و تا ۱۰ دقیقه اعتبار دارد.)</i>"
     )
@@ -545,6 +546,7 @@ async def remove_account_server_ip_cache(acc_id):
 
 async def remove_server_ip_cache(acc_id, server_id):
     menu_cache.invalidate(acc_id)
+    st.request_sync(acc_id)
     key = (int(acc_id), str(server_id))
     async with ip_cache_lock:
         server_cache.pop(key, None)
@@ -644,6 +646,9 @@ async def menu_floating_ips(acc, server_id=None, force=False):
     if acc["provider"] == "vultr":
         items = await menu_cache.get(acc, "floating_ips", p.vultr_reserved_ips, force=force)
         return [ip for ip in items if str(ip.get("instance_id")) == str(server_id)] if server_id else items
+    if acc["provider"] == "cloudferro":
+        items = await menu_cache.get(acc, "floating_ips", p.cloudferro_floating_ips, force=force)
+        return [ip for ip in items if str(ip.get("server_id")) == str(server_id)] if server_id else items
     return []
 
 
@@ -655,6 +660,8 @@ async def menu_locations(acc, force=False):
 async def refresh_account_menu_metadata(acc, force=False):
     p = providers.Provider(acc)
     loads = [menu_cache.get(acc, "account_info", p.account_info, force=force)]
+    if acc["provider"] == "cloudferro":
+        loads.append(menu_cache.get(acc, "resource_limits", p.cloudferro_resource_limits, force=force))
     if acc["provider"] == "hetzner":
         loads += [menu_primary_ips(acc, force), menu_locations(acc)]
     await asyncio.gather(*loads, return_exceptions=True)
@@ -790,6 +797,7 @@ def schedule_account_server_ip_cache_refresh(acc_id, acc=None, servers=None, for
     acc_id = int(acc_id)
     if force:
         menu_cache.invalidate(acc_id)
+        st.request_sync(acc_id)
     elif (servers is None and acc
           and time.monotonic() - server_ip_cache_updated.get(acc_id, 0) < 60
           and menu_cache.fresh(acc, "servers")):
@@ -838,9 +846,26 @@ async def check_account(acc):
     """Read billing where offered; validate Hetzner's project token."""
     try:
         provider = providers.Provider(acc)
+        servers = await provider.list_servers()
+        suspension = providers.account_suspension(servers)
+        if suspension:
+            return acc, "suspended", suspension["error"]
         if acc["provider"] == "hetzner":
             await provider.whoami()
             return acc, "ok", "کلید API فعال است؛ اطلاعات صورتحساب در API پروژه موجود نیست."
+        if acc["provider"] == "upcloud":
+            await provider.whoami()
+            return acc, "ok", "کلید API فعال است؛ جزئیات بدهی و هزینه جاری در API موجود نیست."
+        if acc["provider"] == "cloudferro":
+            limits = await provider.cloudferro_resource_limits()
+            absolute = limits.get("limits") or {}
+            usage = limits.get("usage") or {}
+            def quota(name, used_key, fallback):
+                limit = absolute.get(name)
+                used = absolute.get(used_key, usage.get(fallback))
+                return f"{used}/{limit}" if limit is not None else str(used)
+            return acc, "ok", (f"مصرف: سرور {quota('maxTotalInstances', 'totalInstancesUsed', 'servers')} · "
+                                f"Floating IP {quota('maxTotalFloatingIps', 'totalFloatingIpsUsed', 'floating_ips')}")
         info = await provider.account_info()
         if info is None:
             raise ValueError("اطلاعات حساب دریافت نشد")
@@ -874,7 +899,7 @@ async def cb_check_accounts(cb: CallbackQuery):
     lines = [f"{tg_emoji('datacenter', '🗄️')} <b>نتیجه بررسی اکانت‌ها</b> ({len(results)})"]
     for acc, status, detail in results:
         account_check_status[acc["id"]] = status
-        marker = tg_emoji("error", "❌") if status == "problem" else tg_emoji("ok", "✅")
+        marker = tg_emoji("error", "❌") if status in {"problem", "suspended"} else tg_emoji("ok", "✅")
         label = html.escape(acc["label"])
         lines.append(f"{marker} <b>{label}</b> ({html.escape(acc['provider'])})\n{html.escape(detail)}")
     await cb.message.edit_text("\n\n".join(lines), reply_markup=kb_accounts())
@@ -922,6 +947,16 @@ def format_account_details(info: dict | None, provider: str) -> str:
             net = credit - pending
             lines.append(f"💰 <b>مانده تخمینی:</b> ${net:,.2f}")
 
+    elif provider == "cloudferro":
+        limits = info.get("resource_limits") or {}
+        usage = limits.get("usage") or {}
+        absolute = limits.get("limits") or {}
+        servers = absolute.get("totalInstancesUsed", usage.get("servers", 0))
+        max_servers = absolute.get("maxTotalInstances", "∞")
+        fips = absolute.get("totalFloatingIpsUsed", usage.get("floating_ips", 0))
+        max_fips = absolute.get("maxTotalFloatingIps", "∞")
+        lines.append(f"📊 <b>مصرف منابع:</b> سرور {servers}/{max_servers} · Floating IP {fips}/{max_fips}")
+
     return ("\n\n" + "\n".join(lines)) if lines else ""
 
 
@@ -936,10 +971,15 @@ async def cb_account(cb: CallbackQuery):
     family = PROXY_FAMILY_LABEL.get(acc.get("proxy_family", "default"), "پیش‌فرض")
     await cb.answer()
     info = menu_cache.peek(acc, "account_info")
+    if acc["provider"] == "cloudferro" and info is not None:
+        limits = menu_cache.peek(acc, "resource_limits")
+        if limits:
+            info = {**info, "resource_limits": limits}
     details_str = format_account_details(info, acc["provider"]) if info is not None else ""
     _track_background_task(refresh_account_menu_metadata(acc), f"account-menu-{acc['id']}")
+    note_line = f"\n📝 <b>یادداشت:</b> <code>{html.escape(acc['note'])}</code>" if acc.get("note") else ""
     await edit_menu_message(cb.message,
-        f"{PROVIDER_LABEL.get(acc['provider'])} <b>{html.escape(acc['label'])}</b>\n"
+        f"{PROVIDER_LABEL.get(acc['provider'])} <b>{html.escape(acc['label'])}</b>{note_line}\n"
         f"🌐 پروکسی: <code>{html.escape(prx)}</code> · {family}"
         f"{details_str}",
         reply_markup=kb_account(acc))
@@ -1050,6 +1090,9 @@ class Add(StatesGroup):
     provider = State()
     label = State()
     token = State()
+    cloud_id = State()
+    cloud_secret = State()
+    cloud_project = State()
     proxy = State()
     proxy_family = State()
 
@@ -1078,6 +1121,8 @@ async def add_start(cb: CallbackQuery, state: FSMContext):
     b.button(text=PROVIDER_LABEL["linode"], callback_data="prov:linode")
     b.button(text=PROVIDER_LABEL["vultr"], callback_data="prov:vultr")
     b.button(text=PROVIDER_LABEL["hetzner"], callback_data="prov:hetzner")
+    b.button(text=PROVIDER_LABEL["upcloud"], callback_data="prov:upcloud")
+    b.button(text=PROVIDER_LABEL["cloudferro"], callback_data="prov:cloudferro")
     b.adjust(2)
     await cb.message.edit_text("ارائه‌دهنده را انتخاب کن:", reply_markup=b.as_markup())
     await cb.answer()
@@ -1094,8 +1139,49 @@ async def add_provider(cb: CallbackQuery, state: FSMContext):
 @dp.message(Add.label)
 async def add_label(msg: Message, state: FSMContext):
     await state.update_data(label=msg.text.strip())
-    await state.set_state(Add.token)
-    await msg.answer("حالا <b>API Token</b> را بفرست.\n<i>پیام پس از خواندن پاک می‌شود.</i>")
+    data = await state.get_data()
+    if data.get("provider") == "cloudferro":
+        await state.set_state(Add.cloud_id)
+        await msg.answer("شناسهٔ Application Credential CloudFerro را بفرست.")
+    else:
+        await state.set_state(Add.token)
+        await msg.answer("حالا <b>API Token</b> را بفرست.\n<i>پیام پس از خواندن پاک می‌شود.</i>")
+
+
+@dp.message(Add.cloud_id)
+async def add_cloud_id(msg: Message, state: FSMContext):
+    await state.update_data(cloud_id=msg.text.strip())
+    await state.set_state(Add.cloud_secret)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await msg.answer("Secret مربوط به Application Credential را بفرست.")
+
+
+@dp.message(Add.cloud_secret)
+async def add_cloud_secret(msg: Message, state: FSMContext):
+    await state.update_data(cloud_secret=msg.text.strip())
+    await state.set_state(Add.cloud_project)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await msg.answer("Project ID را بفرست (مثلاً <code>f6dc446b54644837b40597e16b0709df</code>).")
+
+
+@dp.message(Add.cloud_project)
+async def add_cloud_project(msg: Message, state: FSMContext):
+    data = await state.get_data()
+    await state.update_data(token=json.dumps({"id": data.get("cloud_id", ""),
+                                               "secret": data.get("cloud_secret", ""),
+                                               "project_id": msg.text.strip()}))
+    await state.set_state(Add.proxy)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+    await msg.answer("پراکسی سفارشی را به شکل <code>host:port:username:password</code> بفرست، یا کشور و ارائه‌دهنده را انتخاب کن.", reply_markup=kb_proxy_choice('new'))
 
 
 @dp.message(Add.token)
@@ -1284,6 +1370,7 @@ async def linode_promo_apply(msg: Message, state: FSMContext):
     try:
         provider = providers.Provider(acc)
         res = await provider.apply_linode_promo_code(code)
+        st.request_sync(acc_id)
         st.delete_cache("all_billing")
         st.delete_cache("all_servers")
         rem = res.get("credit_remaining") or res.get("credit_monthly_cap") or "نامشخص"
@@ -1734,7 +1821,8 @@ def build_server_card(acc_id, srv_id, acc, s, floating_ips):
         b.button(text="📋 خط اتصال SSH", callback_data=f"srvssh:{acc_id}:{srv_id}")
     if not pw:
         b.button(text="🔑 ثبت رمز این سرور", callback_data=f"srvpw:{acc_id}:{srv_id}")
-    if acc.get("provider") == "hetzner":
+    caps = providers.provider_capabilities(acc.get("provider"))
+    if caps.get("primary_ip_inventory"):
         b.button(text="🌐 مدیریت IPها", callback_data=f"hetzipman:{acc_id}:{srv_id}")
         b.button(text="🌐 Primary IPها / تغییر IP", callback_data=f"hp:list:{acc_id}:0")
         b.button(text="⏹ خاموش کردن", callback_data=f"hp:ask:{acc_id}:shutdown:{srv_id}")
@@ -1748,6 +1836,12 @@ def build_server_card(acc_id, srv_id, acc, s, floating_ips):
         b.button(text=power_label, callback_data=f"power:{power_action}:{acc_id}:{srv_id}")
         if "auto_backups" in s.get("features", []):
             b.button(text="💾 غیرفعال‌سازی بکاپ خودکار", callback_data=f"disbackup:{acc_id}:{srv_id}")
+    if acc.get("provider") == "upcloud" and caps.get("floating_ip"):
+        b.button(text="🌐 مدیریت IPها", callback_data=f"ucip:{acc_id}:{srv_id}")
+        b.button(text="🔄 ریبوت", callback_data=f"power:reboot:{acc_id}:{srv_id}")
+        power_label = "⏹ خاموش کردن" if s.get("status") in ("started", "active") else "▶️ روشن کردن"
+        power_action = "halt" if s.get("status") in ("started", "active") else "start"
+        b.button(text=power_label, callback_data=f"power:{power_action}:{acc_id}:{srv_id}")
     b.button(text="🗑 حذف سرور", callback_data=f"delsrv:{acc_id}:{srv_id}")
     b.button(text="🔙 سرورها", callback_data=f"srvs:{acc_id}")
     b.adjust(1)
@@ -1758,7 +1852,7 @@ def build_server_card(acc_id, srv_id, acc, s, floating_ips):
 
     float_lines = ""
     vultr_extra = ""
-    if acc["provider"] in ("vultr", "hetzner"):
+    if caps.get("floating_ip"):
         if floating_ips:
             shown = []
             for floating in floating_ips:
@@ -1808,6 +1902,99 @@ async def cb_server(cb: CallbackQuery):
     await edit_menu_message(cb.message, text, reply_markup=markup)
 
 
+@dp.callback_query(F.data.startswith("ucip:"))
+async def upcloud_ip_manager(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":", 2)
+    acc = st.account(int(acc_id))
+    if not acc or acc.get("provider") != "upcloud":
+        await cb.answer("اکانت UpCloud پیدا نشد", show_alert=True)
+        return
+    try:
+        ips = [row for row in await providers.Provider(acc).upcloud_ip_addresses(srv_id)
+               if row.get("floating")]
+    except Exception as exc:
+        await cb.answer(str(exc)[:180], show_alert=True)
+        return
+    b = InlineKeyboardBuilder()
+    server = await providers.Provider(acc).server(srv_id)
+    if str(server.get("status") or "").lower() == "stopped":
+        b.button(text="➕ ساخت Floating IPv4 (حفظ پس از حذف)",
+                 callback_data=f"ucipnew:{acc_id}:{srv_id}")
+    else:
+        b.button(text="ℹ️ خاموش کن تا IP بسازی", callback_data=f"srv:{acc_id}:{srv_id}")
+    for row in ips:
+        address = str(row.get("address") or "")
+        if address:
+            b.button(text=f"🔌 جدا کردن {address}", callback_data=f"ucipdetach:{acc_id}:{address}")
+    b.button(text="🔙 بازگشت به سرور", callback_data=f"srv:{acc_id}:{srv_id}")
+    b.adjust(1)
+    listed = "\n".join(f"• <code>{html.escape(str(row.get('address')))}</code> · "
+                        f"{html.escape(str(row.get('release_policy') or ''))}"
+                        for row in ips) or "Floating IP متصل ندارد."
+    await cb.message.edit_text(f"🌐 <b>IPهای UpCloud</b>\n\n{listed}\n\n"
+                               "برای IP جدید، سیاست حفظ (keep) پیش‌فرض است.", reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("ucipnew:"))
+async def upcloud_ip_create(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":", 2)
+    acc = st.account(int(acc_id))
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ بله، بساز", callback_data=f"ucipnewok:{acc_id}:{srv_id}")
+    b.button(text="🔙 انصراف", callback_data=f"ucip:{acc_id}:{srv_id}")
+    b.adjust(1)
+    await cb.message.edit_text("Floating IPv4 به سرور متصل می‌شود. release policy برابر keep خواهد بود.", reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("ucipnewok:"))
+async def upcloud_ip_create_execute(cb: CallbackQuery):
+    _, acc_id, srv_id = cb.data.split(":", 2)
+    acc = st.account(int(acc_id))
+    try:
+        p = providers.Provider(acc)
+        server = await p.server(srv_id)
+        result = await p.create_upcloud_floating_ip(srv_id, server.get("region"), "keep")
+        schedule_account_server_ip_cache_refresh(int(acc_id), acc, force=True)
+        await cb.message.edit_text(
+            f"✅ Floating IPv4 ساخته و متصل شد: <code>{html.escape(result.get('address', ''))}</code>",
+            reply_markup=InlineKeyboardBuilder().button(text="🔙 مدیریت IPها",
+                callback_data=f"ucip:{acc_id}:{srv_id}").as_markup())
+    except Exception as exc:
+        await cb.message.edit_text(f"❌ {html.escape(str(exc)[:220])}")
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("ucipdetach:"))
+async def upcloud_ip_detach(cb: CallbackQuery):
+    _, acc_id, address = cb.data.split(":", 2)
+    acc = st.account(int(acc_id))
+    b = InlineKeyboardBuilder()
+    b.button(text="⚠️ بله، جدا کن", callback_data=f"ucipdetachok:{acc_id}:{address}")
+    b.button(text="🔙 انصراف", callback_data="accounts")
+    b.adjust(1)
+    await cb.message.edit_text(f"Floating IP <code>{html.escape(address)}</code> از سرور جدا می‌شود و طبق release policy باقی می‌ماند.", reply_markup=b.as_markup())
+    await cb.answer()
+
+
+@dp.callback_query(F.data.startswith("ucipdetachok:"))
+async def upcloud_ip_detach_execute(cb: CallbackQuery):
+    _, acc_id, address = cb.data.split(":", 2)
+    acc = st.account(int(acc_id))
+    try:
+        inventory = await providers.Provider(acc).upcloud_ip_addresses()
+        server_id = next((row.get("server_id") for row in inventory
+                          if row.get("address") == address), None)
+        await providers.Provider(acc).detach_upcloud_floating_ip(address)
+        schedule_account_server_ip_cache_refresh(int(acc_id), acc, force=True)
+        await cb.message.edit_text("✅ Floating IP جدا شد.", reply_markup=InlineKeyboardBuilder().button(
+            text="🔙 مدیریت IPها", callback_data=(f"ucip:{acc_id}:{server_id}" if server_id else f"acc:{acc_id}")).as_markup())
+    except Exception as exc:
+        await cb.message.edit_text(f"❌ {html.escape(str(exc)[:220])}")
+    await cb.answer()
+
+
 @dp.callback_query(F.data.startswith("disbackup:"))
 async def cb_disable_backup(cb: CallbackQuery):
     _, acc_id, srv_id = cb.data.split(":")
@@ -1835,12 +2022,21 @@ async def cb_server_ssh(cb: CallbackQuery):
     pw = st.server_pass(int(acc_id), srv_id)
     b = InlineKeyboardBuilder()
     b.button(text="🔙 بازگشت", callback_data=f"srv:{acc_id}:{srv_id}")
+    ssh_user = "eouser" if acc.get("provider") == "cloudferro" else "root"
+    live_network = ("\n\n<b>فعال‌سازی رابط دوم بدون ریبوت:</b>\n"
+                    "<code>ip -br link\n"
+                    "sudo ip link set &lt;interface&gt; up\n"
+                    "sudo dhclient -v &lt;interface&gt;\n"
+                    "ip -4 addr show dev &lt;interface&gt;\n"
+                    "sudo ip rule add from &lt;fixed-ip&gt;/32 table 101\n"
+                    "sudo ip route replace default via 192.168.168.1 dev &lt;interface&gt; table 101 onlink</code>") if acc.get("provider") == "cloudferro" else ""
     await cb.message.edit_text(
         f"🖥 <b>{html.escape(str(s['label']))}</b>\n\n"
-        f"<code>ssh root@{s.get('ip')}</code>\n\n"
+        f"<code>ssh {ssh_user}@{s.get('ip')}</code>\n\n"
         f"🔑 <code>{html.escape(pw or '—')}</code>\n\n"
         f"<code>sshpass -p '{html.escape(pw or '')}' ssh -o StrictHostKeyChecking=no "
-        f"root@{s.get('ip')}</code>\n\n"
+        f"{ssh_user}@{s.get('ip')}</code>\n\n"
+        f"{live_network}\n\n"
         f"<i>روی هر خط بزنی کپی می‌شود.</i>",
         reply_markup=b.as_markup())
     await cb.answer()
@@ -2510,7 +2706,11 @@ async def vultr_power_prompt(cb: CallbackQuery):
         await cb.answer("عملیات نامعتبر", show_alert=True)
         return
     try:
-        _, server = await _vultr_action_context(acc_id, srv_id)
+        acc = st.account(int(acc_id))
+        if acc and acc.get("provider") == "upcloud":
+            server = await providers.Provider(acc).server(srv_id)
+        else:
+            _, server = await _vultr_action_context(acc_id, srv_id)
     except Exception as e:
         await cb.answer(str(e)[:180], show_alert=True)
         return
@@ -2534,8 +2734,12 @@ async def vultr_power_execute(cb: CallbackQuery):
     label, _ = POWER_TEXT[action]
     await cb.message.edit_text(f"⏳ در حال {label}…")
     try:
-        acc, _ = await _vultr_action_context(acc_id, srv_id)
-        await providers.Provider(acc).vultr_power(srv_id, action)
+        acc = st.account(int(acc_id))
+        if acc and acc.get("provider") == "upcloud":
+            await providers.Provider(acc).power_server(srv_id, action)
+        else:
+            acc, _ = await _vultr_action_context(acc_id, srv_id)
+            await providers.Provider(acc).vultr_power(srv_id, action)
     except Exception as e:
         hint = _proxy_failure_hint(e)
         await cb.message.edit_text(
@@ -2863,7 +3067,7 @@ async def pick_plan(cb: CallbackQuery, state: FSMContext):
     await state.update_data(plan=plan)
     await cb.message.edit_text("در حال گرفتن ایمیج‌ها…")
     try:
-        images = await providers.Provider(acc).images()
+        images = await providers.Provider(acc).images(data.get("region"))
     except Exception as e:
         await cb.message.edit_text(f"❌ {html.escape(str(e)[:200])}")
         await cb.answer()
@@ -3005,14 +3209,18 @@ async def do_create(msg: Message, state: FSMContext):
 
         # Linode and Hetzner passwords are returned only at creation; Vultr
         # generates its own password. Preserve each provider's actual value.
-        server_password = srv.get("root_password") or root_pw
-        srv["root_password"] = server_password
-        st.set_server_pass(acc["id"], srv["id"], server_password)
+        server_password = srv.get("root_password")
+        if acc["provider"] != "upcloud" and not server_password:
+            server_password = root_pw
+        if server_password:
+            srv["root_password"] = server_password
+            st.set_server_pass(acc["id"], srv["id"], server_password)
         created_servers.append(srv)
         ip = srv.get("ip") or "(در حال تخصیص؛ کمی بعد فهرست سرورها را ببین)"
         details = (f"✅ <code>{html.escape(str(srv['label']))}</code> · "
                    f"آی‌پی <code>{html.escape(str(ip))}</code> · "
-                   "🔐 رمز ذخیره و رمزنگاری شد")
+                   + ("🔐 رمز ذخیره و رمزنگاری شد" if server_password else
+                      "🔑 دسترسی SSH با کلید محلی تنظیم شد"))
         if provider_keys:
             details += f" · 🔑 کلید SSH ({len(provider_keys)})"
         if acc["provider"] == "vultr":
@@ -6371,6 +6579,8 @@ async def cb_phone_del(cb: CallbackQuery):
 
 from proxy_ui import register_proxy_ui
 register_proxy_ui(dp, globals())
+from tdoctor_ui import register_tdoctor_ui
+register_tdoctor_ui(dp, globals())  # before the catch-all text handler below: replies to doctor messages go to the doctor
 
 
 @dp.message(F.text)

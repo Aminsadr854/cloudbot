@@ -5,6 +5,68 @@ from unittest.mock import AsyncMock, patch
 import providers
 
 
+class _FakeResponse:
+    def __init__(self, status=201, headers=None, body="{}"):
+        self.status = status
+        self.headers = headers or {}
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def text(self):
+        return self._body
+
+    async def json(self):
+        return {}
+
+
+class _FakeSession:
+    def __init__(self, response):
+        self.response = response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    def post(self, *args, **kwargs):
+        return self.response
+
+    def request(self, *args, **kwargs):
+        return self.response
+
+
+class CloudFerroRetryRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cloudferro_auth_does_not_require_an_out_of_scope_method(self):
+        provider = providers.Provider({
+            "provider": "cloudferro",
+            "token": '{"id":"credential-id","secret":"credential-secret","project_id":"project-id"}',
+            "proxy": None,
+        })
+        session = _FakeSession(_FakeResponse(headers={"X-Subject-Token": "session-token"}))
+        with patch.object(providers.aiohttp, "ClientSession", return_value=session):
+            self.assertEqual(await provider._cloudferro_auth(), "session-token")
+
+    async def test_cloudferro_get_retries_transient_api_errors_without_name_error(self):
+        provider = providers.Provider({
+            "provider": "cloudferro",
+            "token": '{"id":"credential-id","secret":"credential-secret","project_id":"project-id"}',
+            "proxy": None,
+        })
+        provider._cloudferro_auth = AsyncMock(return_value="session-token")
+        response = _FakeResponse(status=500, body="temporary failure")
+        session = _FakeSession(response)
+        with patch.object(providers.aiohttp, "ClientSession", return_value=session):
+            with self.assertRaises(providers.ProviderError) as raised:
+                await provider._req("GET", "/servers/detail?limit=1")
+        self.assertIn("HTTP 500", str(raised.exception))
+
+
 class ProxyParsingTests(unittest.TestCase):
     def test_bracketed_ipv6_proxy_is_accepted(self):
         self.assertEqual(
