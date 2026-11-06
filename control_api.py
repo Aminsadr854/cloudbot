@@ -34,7 +34,7 @@ def read_token():
 
 PAGE_ROUTES = {
     "/", "/overview", "/accounts", "/proxies", "/hetzner", "/vultr",
-    "/linode", "/upcloud", "/cloudferro", "/compute", "/ips", "/ssh", "/dns", "/watchdog", "/settings", "/logs",
+    "/linode", "/upcloud", "/cloudferro", "/compute", "/ips", "/ssh", "/dns", "/watchdog", "/settings", "/logs", "/api",
     "/index.html", "/favicon.ico"
 }
 

@@ -3974,7 +3974,8 @@ const ROUTE_MAP = {
   "/ssh": "tab-ssh",
   "/dns": "tab-dns",
   "/watchdog": "tab-watchdog",
-  "/logs": "tab-logs"
+  "/logs": "tab-logs",
+  "/api": "tab-api"
 };
 
 const TAB_TO_ROUTE = {
@@ -3991,7 +3992,8 @@ const TAB_TO_ROUTE = {
   "tab-ssh": "/ssh",
   "tab-dns": "/dns",
   "tab-watchdog": "/watchdog",
-  "tab-logs": "/logs"
+  "tab-logs": "/logs",
+  "tab-api": "/api"
 };
 
 // ==================== NAVIGATION & TAB SWITCHING ====================
@@ -4089,7 +4091,8 @@ function switchTab(tabId, pushState = true) {
     "tab-ssh": "SSH keys",
     "tab-dns": "DNS records",
     "tab-watchdog": "Watchdog & tunnels",
-    "tab-logs": "Logs & activity"
+    "tab-logs": "Logs & activity",
+    "tab-api": "API & MCP"
   };
   const title = titles[tabId] || "Hosting Console";
   document.getElementById("view-title").textContent = title;

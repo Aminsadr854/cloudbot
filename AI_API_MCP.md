@@ -102,7 +102,8 @@ In addition to programmatic API calls, `control_api.py` serves a modern, full-fe
 - **SSH Key Vault**: Generate Ed25519 key pairs directly in browser, add public keys, and sync to cloud providers.
 - **Cloud Accounts & Proxies**: Manage credentials and proxy routing.
 - **DNS Management**: View and modify Cloudflare DNS records.
-- Access locally via browser or via SSH tunnel: `ssh -L 9601:127.0.0.1:9601 root@YOUR_CLOUDBOT_HOST`.
+- **API & MCP page** (`/api`, sidebar "API & MCP"): in-console quick guide for connecting MCP, calling the HTTP API, safety rules, and the MCP tool reference.
+- Production URL is `https://vmanager.realkia.com` (Telegram OTP login); locally use the SSH tunnel: `ssh -L 9601:127.0.0.1:9601 root@YOUR_CLOUDBOT_HOST`.
 
 ## Owner notification webhook
 
@@ -142,6 +143,8 @@ MCP tools cover inventory inspection, server provisioning and lifecycle manageme
 - **SSH Key Vault**: `add_ssh_key` (with automatic `sync_accounts`) and `delete_ssh_key`.
 - **Floating & Primary IPs**: `create_floating_ip`, `delete_floating_ip`, `assign_floating_ip`, `unassign_floating_ip`, `update_floating_ip`, `create_hetzner_primary_ip`, `assign_hetzner_primary_ip`, `unassign_hetzner_primary_ip`, and `delete_hetzner_primary_ip`.
 - **DNS**: `upsert_dns` and `delete_dns_record`.
+- **Accounts**: `add_account`, `delete_account`, `set_account_note`, `set_account_region`.
+- **Account proxies**: `set_account_proxy`, `allocate_account_proxy`, `test_proxy`, `proxy_providers`, `proxy_sessions`, `proxy_availability`, `add_proxy_provider`, `update_proxy_provider`, `delete_proxy_provider`, `toggle_proxy_provider`, `add_proxy_sessions`, `toggle_proxy_session`, `delete_proxy_session`, and `auto_heal_proxies`.
 
 Their typed parameters mirror the API arguments. Start with `list_accounts` to find account IDs, then use read tools to inspect current resources and choices.
 
