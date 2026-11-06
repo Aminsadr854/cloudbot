@@ -644,11 +644,30 @@
           <div class="section-heading-row mb-4"><div><h2 class="section-title">API &amp; MCP</h2>
             <p class="text-xs text-secondary">Drive Cloudbot from AI clients (Claude, Cursor) or scripts. Same operations as this console.</p></div></div>
           <div class="api-card">
-            <h3 class="font-bold">1. Connect an AI client over MCP</h3>
-            <p class="text-sm">Remote MCP (streamable HTTP). The bearer token is the contents of <code>/opt/cloudbot/data/mcp_http.token</code> on the host; keep it secret.</p>
-            <pre class="api-code">claude mcp add --transport http cloudbot https://cloudbot-mcp.vsl247.com/mcp \
+            <h3>1. Connect an AI client over MCP</h3>
+            <div class="api-ai-tabs" role="tablist">
+              <button type="button" class="api-ai-tab active" data-ai="claude">Claude Code</button>
+              <button type="button" class="api-ai-tab" data-ai="codex">Codex</button>
+            </div>
+            <p>Remote MCP (streamable HTTP). The bearer token is the contents of <code>/opt/cloudbot/data/mcp_http.token</code> on the host; keep it secret.</p>
+            <div class="api-ai-pane" data-ai-pane="claude">
+              <p>Run once in your terminal:</p>
+              <pre class="api-code">claude mcp add --transport http cloudbot https://cloudbot-mcp.vsl247.com/mcp \
   --header "Authorization: Bearer &lt;mcp_http.token&gt;"</pre>
-            <p class="text-sm">Then ask: "list my cloud accounts", "show servers on account 3", "point a.example.com at 1.2.3.4". Start with <code>list_accounts</code> to learn account IDs.</p>
+              <p>Check with <code>claude mcp list</code> or <code>/mcp</code> inside a session. Add <code>--scope user</code> to use it in every project.</p>
+            </div>
+            <div class="api-ai-pane" data-ai-pane="codex" hidden>
+              <p>Export the token, then register the server (keeps the token out of the config file):</p>
+              <pre class="api-code">export CLOUDBOT_MCP_TOKEN="&lt;mcp_http.token&gt;"
+codex mcp add cloudbot --url https://cloudbot-mcp.vsl247.com/mcp \
+  --bearer-token-env-var CLOUDBOT_MCP_TOKEN</pre>
+              <p>Or edit <code>~/.codex/config.toml</code>:</p>
+              <pre class="api-code">[mcp_servers.cloudbot]
+url = "https://cloudbot-mcp.vsl247.com/mcp"
+bearer_token_env_var = "CLOUDBOT_MCP_TOKEN"</pre>
+              <p>Check with <code>codex mcp list</code>. The variable must be set in the shell that launches Codex.</p>
+            </div>
+            <p>Then ask: "list my cloud accounts", "show servers on account 3", "point a.example.com at 1.2.3.4". The AI starts with <code>list_accounts</code> to learn account IDs.</p>
           </div>
           <div class="api-card">
             <h3 class="font-bold">2. Call the HTTP API directly</h3>

@@ -122,7 +122,7 @@ curl -sS -X POST -H "Authorization: Bearer $(cat /opt/cloudbot/data/webhook.toke
 
 The MCP server uses the [official Python MCP SDK](https://github.com/modelcontextprotocol/python-sdk) v2. It reads the local token file and calls the local API. The default transport is stdio; set `CLOUDBOT_MCP_TRANSPORT=streamable-http` for a loopback HTTP server on `127.0.0.1:9602` (`CLOUDBOT_MCP_HOST`/`CLOUDBOT_MCP_PORT`, `CLOUDBOT_MCP_ALLOWED_HOSTS` for the public hostname). It runs stateless, so a dropped connection or restart needs no reconnect.
 
-Production uses HTTP: `cloudbot-mcp.service` plus an nginx vhost on `cloudbot-mcp.vsl247.com` that terminates TLS and requires `Authorization: Bearer <contents of data/mcp_http.token>` on `/mcp`. Register it with `claude mcp add --transport http cloudbot https://cloudbot-mcp.vsl247.com/mcp --header "Authorization: Bearer <token>"`. Stdio over SSH still works if no HTTP front end exists:
+Production uses HTTP: `cloudbot-mcp.service` plus an nginx vhost on `cloudbot-mcp.vsl247.com` that terminates TLS and requires `Authorization: Bearer <contents of data/mcp_http.token>` on `/mcp`. Register it with Claude Code: `claude mcp add --transport http cloudbot https://cloudbot-mcp.vsl247.com/mcp --header "Authorization: Bearer <token>"`. With Codex: `export CLOUDBOT_MCP_TOKEN=<token>` then `codex mcp add cloudbot --url https://cloudbot-mcp.vsl247.com/mcp --bearer-token-env-var CLOUDBOT_MCP_TOKEN` (or the equivalent `[mcp_servers.cloudbot]` block in `~/.codex/config.toml`). The console's API & MCP page switches the command between the two. Stdio over SSH still works if no HTTP front end exists:
 
 ```json
 {

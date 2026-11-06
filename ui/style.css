@@ -3573,3 +3573,4 @@ code, .font-mono {
 
 .api-code{background:var(--bg-surface,#111);border:1px solid var(--border-subtle,#333);border-radius:8px;padding:.75rem;overflow-x:auto;font-size:.8rem;white-space:pre}
 #tab-api .api-card{background:var(--bg-surface,#161616);border:1px solid var(--border-subtle,#333);border-radius:10px;padding:1rem;margin-bottom:1rem}#tab-api h3{margin:0 0 .5rem}#tab-api p{margin:.4rem 0}#tab-api code{font-size:.85em}
+.api-ai-tabs{display:flex;gap:.5rem;margin:.25rem 0 .75rem}.api-ai-tab{background:transparent;color:inherit;border:1px solid var(--border-subtle,#333);border-radius:8px;padding:.35rem .9rem;cursor:pointer;font:inherit}.api-ai-tab.active{background:var(--accent,#2f6feb);border-color:var(--accent,#2f6feb);color:#fff}#tab-api [hidden]{display:none}

@@ -7479,3 +7479,19 @@ async function runWithButtonLoading(btn, asyncFn, loadingTextOrIcon = null) {
 window.setButtonLoading = setButtonLoading;
 window.runWithButtonLoading = runWithButtonLoading;
 
+
+
+// ==================== API & MCP PAGE ====================
+function initApiGuide() {
+  const tabs = document.querySelectorAll(".api-ai-tab");
+  const show = (ai) => {
+    tabs.forEach((t) => t.classList.toggle("active", t.dataset.ai === ai));
+    document.querySelectorAll("[data-ai-pane]").forEach((p) => { p.hidden = p.dataset.aiPane !== ai; });
+    try { localStorage.setItem("cloudbot_api_ai", ai); } catch (e) {}
+  };
+  tabs.forEach((t) => t.addEventListener("click", () => show(t.dataset.ai)));
+  let saved = "claude";
+  try { saved = localStorage.getItem("cloudbot_api_ai") || "claude"; } catch (e) {}
+  show(saved === "codex" ? "codex" : "claude");
+}
+document.addEventListener("DOMContentLoaded", initApiGuide);
