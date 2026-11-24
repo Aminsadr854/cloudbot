@@ -91,10 +91,10 @@ def evaluate(results: list, state: dict):
 
 
 VERDICT_FA = {
-    "healthy": "🟢 سالم",
-    "degraded": "🟡 ضعیف",
-    "filtered": "🔴 فیلتر شده",
-    "down": "⚫️ قطع",
+    "healthy": "🟢 Healthy",
+    "degraded": "🟡 Degraded",
+    "filtered": "🔴 Filtered",
+    "down": "⚫️ Down",
 }
 
 

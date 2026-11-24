@@ -76,7 +76,7 @@ def resolve_country(value):
         # Exact lookup only: never guess a country from a fuzzy match.
         return pycountry.countries.lookup(value).alpha_2
     except LookupError:
-        raise ProxyPoolError('کشور نامعتبر است؛ نام کشور یا کد دوحرفی مثل DE را بفرست.') from None
+        raise ProxyPoolError('Invalid country; send a country name or a two-letter code such as DE.') from None
 
 
 def components(value):
@@ -92,13 +92,13 @@ def components(value):
     if re.match(r'^[A-Za-z][A-Za-z0-9+.-]*://', raw):
         scheme, raw = raw.split('://', 1)
     if scheme not in {'http', 'https', 'socks4', 'socks5'}:
-        raise ProxyPoolError('نوع پراکسی نامعتبر است.')
+        raise ProxyPoolError('Invalid proxy type.')
     bare_fields = raw.split(':', 2)
     if '@' not in raw or raw.startswith('[') or (len(bare_fields) == 3 and bare_fields[1].isdigit()):
         if raw.startswith('['):
             end = raw.find(']')
             if end < 0 or raw[end + 1:end + 2] != ':':
-                raise ProxyPoolError('میزبان IPv6 باید داخل [] باشد.')
+                raise ProxyPoolError('An IPv6 host must be inside [].')
             host, fields = raw[:end + 1], raw[end + 2:].split(':', 2)
         else:
             fields = raw.split(':', 3)
@@ -109,7 +109,7 @@ def components(value):
         elif len(fields) == 1:
             raw = f'{host}:{fields[0]}'
         else:
-            raise ProxyPoolError('قالب باید host:port:username:password باشد.')
+            raise ProxyPoolError('The format must be host:port:username:password.')
     try:
         p = urlsplit(f'{scheme}://{raw}')
         port = p.port
@@ -117,7 +117,7 @@ def components(value):
                 or not port or p.path not in ('', '/') or p.query or p.fragment):
             raise ValueError()
     except ValueError:
-        raise ProxyPoolError('میزبان یا پورت پراکسی نامعتبر است.') from None
+        raise ProxyPoolError('Invalid proxy host or port.') from None
     return {'scheme': scheme, 'host': p.hostname.lower(), 'port': '{port}' if port_template else port,
             'username': unquote(p.username or ''), 'password': unquote(p.password or ''),
             'auth': p.username is not None}
@@ -133,7 +133,7 @@ def proxy_string(p):
 def session_ids(text):
     values = [s.strip() for s in str(text).replace(',', '\n').splitlines() if s.strip()]
     if not values or any(not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', s) for s in values):
-        raise ProxyPoolError('شناسه‌ها را یکی در هر خط بفرست؛ فقط حروف، عدد، _ و - مجاز است.')
+        raise ProxyPoolError('Send IDs one per line; only letters, digits, _ and - are allowed.')
     return list(dict.fromkeys(values))
 
 
@@ -215,17 +215,17 @@ def import_format(text):
     """Return one format and IDs. Numbering is ignored only for proxy lines."""
     lines = [v.strip() for v in str(text).splitlines() if v.strip()]
     if not lines:
-        raise ProxyPoolError('قالب خالی است.')
+        raise ProxyPoolError('The template is empty.')
     if any(marker in unquote(lines[0]) for marker in ('{country}', '{session}', '{session_id}', '{sessionid}', '{port}')):
         p = components(lines[0])
         user = p['username'].replace('{session_id}', '{session}').replace('{sessionid}', '{session}')
         p['username'] = user
         if user.count('{session}') != (0 if p['port'] == '{port}' else 1) or user.count('{country}') > 1:
-            raise ProxyPoolError('نام کاربری باید دقیقاً یک {session} و حداکثر یک {country} داشته باشد.')
+            raise ProxyPoolError('The username must contain exactly one {session} and at most one {country}.')
         if '{' in user.replace('{country}', '').replace('{session}', '') or '}' in user.replace('{country}', '').replace('{session}', ''):
-            raise ProxyPoolError('فقط {country} و {session} پشتیبانی می‌شود.')
+            raise ProxyPoolError('Only {country} and {session} are supported.')
         if any('{' in str(p[k]) or '}' in str(p[k]) for k in ('host', 'password')):
-            raise ProxyPoolError('جای‌نگهدار فقط در نام کاربری مجاز است.')
+            raise ProxyPoolError('Placeholders are only allowed in the username.')
         return p, session_ids('\n'.join(lines[1:])) if len(lines) > 1 else []
     template, ids = None, []
     for line in lines:
@@ -242,22 +242,22 @@ def import_format(text):
                 p['username'] = prefix + '{country}' + (suffix or '')
                 render_proxy(p, country, sid)
                 if template is not None and p != template:
-                    raise ProxyPoolError('همه خطوط باید از یک میزبان، قالب و رمز عبور باشند.')
+                    raise ProxyPoolError('All lines must share the same host, template and password.')
                 template = p
                 ids.append(sid)
                 continue
         inferred = inferred_username(p['username'])
         if not inferred:
-            raise ProxyPoolError('قالب ناشناخته؛ {country} و {session} را در نام کاربری مشخص کن.')
+            raise ProxyPoolError('Unknown template; mark {country} and {session} in the username.')
         username, country, sid = inferred
         resolve_country(country)
         p['username'] = username
         if template is not None and p != template:
-            raise ProxyPoolError('همه خطوط باید از یک میزبان، قالب و رمز عبور باشند.')
+            raise ProxyPoolError('All lines must share the same host, template and password.')
         template = p
         ids.append(sid)
     if template is None:
-        raise ProxyPoolError('هیچ خط پراکسی معتبری پیدا نشد.')
+        raise ProxyPoolError('No valid proxy line found.')
     return template, list(dict.fromkeys(ids))
 
 
@@ -353,13 +353,13 @@ class ProxyPoolStore:
         family = 'default'
         limit = usage_limit_bytes(usage_limit_gb)
         if not str(label).strip():
-            raise ProxyPoolError('نام نامعتبر است.')
+            raise ProxyPoolError('Invalid name.')
         raw_tpl = proxy_string(template) if isinstance(template, dict) else str(template)
         template, _ = import_format(raw_tpl)
         identity = self._proxy_hash([template['host'], template['port'], username_namespace(template['username'])])
         with self.proxy_transaction():
             if self.con.execute('SELECT 1 FROM proxy_providers WHERE identity=?', (identity,)).fetchone():
-                raise ProxyPoolError('این قالب قبلاً ثبت شده؛ شناسه‌ها را به همان ارائه‌دهنده اضافه کن.')
+                raise ProxyPoolError('This template is already registered; add the IDs to that provider.')
             cur = self.con.execute('INSERT INTO proxy_providers(label,template,identity,family) VALUES(?,?,?,?)',
                                    (label.strip(), self.f.encrypt(json.dumps(template).encode()), identity, family))
             pid = cur.lastrowid
@@ -389,7 +389,7 @@ class ProxyPoolStore:
             limit = usage_limit_bytes(limit_gb)
         with self.proxy_transaction():
             if not self.proxy_provider(pid):
-                raise ProxyPoolError('ارائه‌دهنده یافت نشد.')
+                raise ProxyPoolError('Provider not found.')
             if limit is not None:
                 self.con.execute('UPDATE proxy_providers SET usage_limit_bytes=? WHERE id=?', (limit, pid))
             if reset:
@@ -398,7 +398,7 @@ class ProxyPoolStore:
     def add_proxy_sessions(self, pid, ids):
         with self.proxy_transaction():
             if not self.proxy_provider(pid):
-                raise ProxyPoolError('ارائه‌دهنده یافت نشد.')
+                raise ProxyPoolError('Provider not found.')
             return self._add_proxy_sessions(pid, ids)
 
     def proxy_sessions(self, pid):
@@ -418,14 +418,14 @@ class ProxyPoolStore:
         with self.proxy_transaction():
             p = self.proxy_provider(pid)
             if not p:
-                raise ProxyPoolError('ارائه‌دهنده یافت نشد.')
+                raise ProxyPoolError('Provider not found.')
             if action == 'rename':
                 if not str(value or '').strip():
-                    raise ProxyPoolError('نام خالی است.')
+                    raise ProxyPoolError('The name is empty.')
                 self.con.execute('UPDATE proxy_providers SET label=? WHERE id=?', (str(value).strip(), pid))
             elif action == 'default':
                 if not p['enabled']:
-                    raise ProxyPoolError('ابتدا ارائه‌دهنده را فعال کن.')
+                    raise ProxyPoolError('Enable the provider first.')
                 self.con.execute("INSERT OR REPLACE INTO settings(k,v) VALUES('proxy_default',?)", (str(pid),))
             elif action == 'toggle':
                 self.con.execute('UPDATE proxy_providers SET enabled=1-enabled WHERE id=?', (pid,))
@@ -434,23 +434,23 @@ class ProxyPoolStore:
             elif action == 'format':
                 self._expire_proxy_reservations()
                 if self.con.execute('SELECT 1 FROM proxy_claims WHERE provider_id=?', (pid,)).fetchone():
-                    raise ProxyPoolError('قالب در استفاده است؛ ابتدا پراکسی اکانت‌ها را آزاد کن.')
+                    raise ProxyPoolError('The template is in use; release the proxies of the accounts first.')
                 template, _ = import_format(proxy_string(value))
                 identity = self._proxy_hash([template['host'], template['port'], username_namespace(template['username'])])
                 if self.con.execute('SELECT 1 FROM proxy_providers WHERE identity=? AND id<>?', (identity, pid)).fetchone():
-                    raise ProxyPoolError('این قالب قبلاً ثبت شده است.')
+                    raise ProxyPoolError('This template is already registered.')
                 self.con.execute('UPDATE proxy_providers SET template=?,identity=? WHERE id=?',
                                  (self.f.encrypt(json.dumps(template).encode()), identity, pid))
                 self._sync_proxy_claims()
             elif action == 'delete':
                 self._expire_proxy_reservations()
                 if self.con.execute('SELECT 1 FROM proxy_claims WHERE provider_id=?', (pid,)).fetchone():
-                    raise ProxyPoolError('این ارائه‌دهنده در استفاده است؛ ابتدا اتصال اکانت‌ها را آزاد کن.')
+                    raise ProxyPoolError('This provider is in use; release the bindings of the accounts first.')
                 self.con.execute('DELETE FROM proxy_sessions WHERE provider_id=?', (pid,))
                 self.con.execute('DELETE FROM proxy_providers WHERE id=?', (pid,))
                 self.con.execute("DELETE FROM settings WHERE k='proxy_default' AND v=?", (str(pid),))
             else:
-                raise ProxyPoolError('عملیات نامعتبر است.')
+                raise ProxyPoolError('Invalid operation.')
 
     def manage_proxy_session(self, pid, sid, action):
         with self.proxy_transaction():
@@ -461,10 +461,10 @@ class ProxyPoolStore:
                 self._sync_proxy_claims()
             elif action == 'delete':
                 if self.con.execute('SELECT 1 FROM proxy_claims WHERE provider_id=? AND session_id=?', (pid, sid)).fetchone():
-                    raise ProxyPoolError('این شناسه در استفاده است؛ ابتدا اتصال اکانت را آزاد کن.')
+                    raise ProxyPoolError('This ID is in use; release the binding of the account first.')
                 self.con.execute('DELETE FROM proxy_sessions WHERE provider_id=? AND session_id=?', (pid, sid))
             else:
-                raise ProxyPoolError('عملیات نامعتبر است.')
+                raise ProxyPoolError('Invalid operation.')
 
     def _expire_proxy_reservations(self):
         if self.con.execute('DELETE FROM proxy_claims WHERE request_token IS NOT NULL AND expires_at<=?', (time.time(),)).rowcount:
@@ -484,9 +484,9 @@ class ProxyPoolStore:
         if claim:
             if claim['request_token']:
                 if claim['request_token'] != request_token:
-                    raise ProxyPoolError('این پراکسی در حال تخصیص است؛ دوباره تلاش کن.')
+                    raise ProxyPoolError('This proxy is being allocated; try again.')
             elif claim['account_id'] != acc_id:
-                raise ProxyPoolError('این پراکسی متعلق به اکانت دیگری است یا تعارض دارد.')
+                raise ProxyPoolError('This proxy belongs to another account or conflicts.')
         # Check account data as well, including legacy duplicate ownership.
         for account in self.accounts():
             if account['id'] == acc_id or not account['proxy']:
@@ -496,7 +496,7 @@ class ProxyPoolStore:
             except ProxyPoolError:
                 continue
             if occupied:
-                raise ProxyPoolError(f'این پراکسی در اکانت #{account["id"]} استفاده شده است.')
+                raise ProxyPoolError(f'This proxy is already used by account #{account["id"]}.')
 
     def reserve_proxy(self, proxy, acc_id=None, provider_id=None):
         with self.proxy_transaction():
@@ -506,20 +506,20 @@ class ProxyPoolStore:
         self._expire_proxy_reservations()
         account = self.account(acc_id) if acc_id else None
         if acc_id and not account:
-            raise ProxyPoolError('اکانت یافت نشد.')
+            raise ProxyPoolError('Account not found.')
         if acc_id:
             self.con.execute('DELETE FROM proxy_claims WHERE account_id=? AND request_token IS NOT NULL', (acc_id,))
             self._sync_proxy_claims()
         self._guard_proxy(proxy, acc_id)
         key, pid, country, sid = self._proxy_identity(proxy)
         if provider_id is not None and pid != provider_id:
-            raise ProxyPoolError('قالب پراکسی تغییر کرده است.')
+            raise ProxyPoolError('The proxy template has changed.')
         if pid:
             p = self.proxy_provider(pid)
             current = bool(account and account['proxy'] and self._proxy_identity(account['proxy'])[0] == key)
             session = self.con.execute('SELECT enabled FROM proxy_sessions WHERE provider_id=? AND session_id=?', (pid, sid)).fetchone()
             if not current and (not p['enabled'] or (session and not session[0])):
-                raise ProxyPoolError('ارائه‌دهنده یا شناسه غیرفعال شده است.')
+                raise ProxyPoolError('The provider or ID has been disabled.')
             if not session:
                 self._add_proxy_sessions(pid, [sid])
         # Reserving the current proxy is idempotent; the old claim is restored
@@ -538,7 +538,7 @@ class ProxyPoolStore:
         with self.proxy_transaction():
             provider = self.proxy_provider(pid)
             if not provider or not provider['enabled']:
-                raise ProxyPoolError('ارائه‌دهنده غیرفعال است؛ یکی دیگر انتخاب کن.')
+                raise ProxyPoolError('The provider is disabled; choose another one.')
             if provider.get('usage_limit_bytes') and provider.get('usage_bytes', 0) >= provider['usage_limit_bytes']:
                 raise ProxyPoolError('Provider traffic limit reached. Raise the GB limit or reset its usage counter.')
             self._expire_proxy_reservations()
@@ -562,13 +562,13 @@ class ProxyPoolStore:
                     continue
                 result = self._reserve_proxy(proxy, acc_id, pid)
                 return {**result, 'family': 'default'}
-            raise ProxyPoolError(f'برای {country} شناسه آزاد وجود ندارد؛ شناسه اضافه کن یا ارائه‌دهنده را عوض کن.')
+            raise ProxyPoolError(f'No free ID for {country}; add IDs or switch provider.')
 
     def proxy_availability(self, pid, country):
         country = resolve_country(country)
         provider = self.proxy_provider(pid)
         if not provider:
-            raise ProxyPoolError('ارائه‌دهنده یافت نشد.')
+            raise ProxyPoolError('Provider not found.')
         available = 0
         with self.proxy_transaction():
             for s in self.proxy_sessions(pid):
@@ -585,16 +585,16 @@ class ProxyPoolStore:
         self._expire_proxy_reservations()
         r = self.con.execute('SELECT * FROM proxy_claims WHERE request_token=?', (token,)).fetchone()
         if not r or r['account_id'] != acc_id or self.f.decrypt(r['proxy']).decode() != proxy:
-            raise ProxyPoolError('درخواست منقضی یا لغو شده است؛ دوباره پراکسی را انتخاب کن.')
+            raise ProxyPoolError('The request expired or was cancelled; select the proxy again.')
         if acc_id:
             account = self.account(acc_id)
             if not account or account['proxy_revision'] != r['expected_revision']:
-                raise ProxyPoolError('پراکسی اکانت تغییر کرده؛ درخواست قدیمی ذخیره نشد.')
+                raise ProxyPoolError('The proxy of the account changed; the old request was not saved.')
         if r['provider_id']:
             provider = self.proxy_provider(r['provider_id'])
             session = self.con.execute('SELECT enabled FROM proxy_sessions WHERE provider_id=? AND session_id=?',
                                        (r['provider_id'], r['session_id'])).fetchone()
             current = bool(acc_id and self.account(acc_id)['proxy'] and self._proxy_identity(self.account(acc_id)['proxy'])[0] == r['proxy_key'])
             if not current and (not provider or not provider['enabled'] or not session or not session[0]):
-                raise ProxyPoolError('ارائه‌دهنده یا شناسه غیرفعال شده است.')
+                raise ProxyPoolError('The provider or ID has been disabled.')
         self._guard_proxy(proxy, acc_id, token)

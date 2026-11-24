@@ -43,17 +43,17 @@ async def fetch(url: str) -> list:
                                      headers={"User-Agent": UA}) as s:
         async with s.get(url) as r:
             if r.status != 200:
-                raise RuntimeError(f"HTTP {r.status} از لینک ساب")
+                raise RuntimeError(f"HTTP {r.status} from the subscription link")
             body = (await r.text()).strip()
     if not body:
-        raise RuntimeError("لینک ساب خالی برگشت")
+        raise RuntimeError("The subscription link returned empty content")
 
     # A subscription is either a base64 blob or already one URI per line.
     if "://" not in body:
         try:
             body = _b64_fix(body).decode("utf-8", "replace")
         except Exception:
-            raise RuntimeError("محتوای لینک ساب قابل خواندن نبود")
+            raise RuntimeError("The subscription link content could not be parsed")
     return [ln.strip() for ln in body.splitlines() if "://" in ln]
 
 

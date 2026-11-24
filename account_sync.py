@@ -69,7 +69,7 @@ async def notify_account_health(store, result, send=telegram_send):
                 continue
             shown = confirmed.get(acc_id, item)
             try:
-                await send(f"🔴 <b>اکانت {name}</b> ({provider}) از کار افتاد\n"
+                await send(f"🔴 <b>Account {name}</b> ({provider}) is down\n"
                            f"{html.escape(_reason(shown))}")
                 state[key] = {'down': True, 'notified': True}
             except Exception:
@@ -78,7 +78,7 @@ async def notify_account_health(store, result, send=telegram_send):
         elif prev.get('down'):
             if prev.get('notified'):
                 try:
-                    await send(f"🟢 <b>اکانت {name}</b> ({provider}) برگشت")
+                    await send(f"🟢 <b>Account {name}</b> ({provider}) is back")
                 except Exception:
                     log.warning("Account recovery alert for %s not delivered", acc_id)
                     continue

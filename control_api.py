@@ -87,8 +87,8 @@ async def handle_login(request):
     bot_user = os.environ.get("CLOUDBOT_BOT_USERNAME", "vpnmanagerkiabot")
     html = f"""<!DOCTYPE html>
 <html>
-<head><meta charset="utf-8"><title>ورود به پنل هاستینگ</title>
-<style>body{{background:#0d1117;color:#c9d1d9;font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;direction:rtl;}}
+<head><meta charset="utf-8"><title>Hosting panel login</title>
+<style>body{{background:#0d1117;color:#c9d1d9;font-family:system-ui,-apple-system,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;margin:0;direction:ltr;}}
 .box{{background:#161b22;border:1px solid #30363d;border-radius:12px;padding:32px;text-align:center;max-width:420px;box-shadow:0 8px 24px rgba(0,0,0,0.5);}}
 h2{{color:#f85149;margin-top:0;}}
 p{{color:#8b949e;line-height:1.6;font-size:14px;}}
@@ -97,9 +97,9 @@ a:hover{{background:#2ea043;}}
 </style></head>
 <body>
 <div class="box">
-<h2>❌ لینک ورود منقضی یا نامعتبر است</h2>
-<p>این لینک یک‌بار مصرف بوده یا اعتبار زمانی آن (۱۰ دقیقه) پایان یافته است.<br>برای دریافت لینک ورود مستقیم وارد ربات تلگرام شوید:</p>
-<a href="https://t.me/{bot_user}?start=login">🤖 دریافت لینک جدید در ربات تلگرام</a>
+<h2>❌ Login link expired or invalid</h2>
+<p>This link is single-use or its 10-minute validity has ended.<br>Open the Telegram bot to get a new login link:</p>
+<a href="https://t.me/{bot_user}?start=login">🤖 Get a new link in the Telegram bot</a>
 </div>
 </body></html>"""
     return web.Response(text=html, content_type="text/html", status=403)

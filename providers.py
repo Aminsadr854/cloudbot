@@ -2366,7 +2366,7 @@ class Provider:
         data = await self._req("GET", f"/servers/{int(server_id)}")
         server = data["server"]
         if server.get("status") != "off":
-            raise ProviderError("ابتدا سرور را خاموش کنید؛ تغییر Primary IP نیاز به خاموشی دارد.")
+            raise ProviderError("Power off the server first; changing the Primary IP requires it to be off.")
         return server
 
     async def unassign_hetzner_primary_ip(self, ip_id):
@@ -2383,12 +2383,12 @@ class Provider:
         if ip.get("assignee_id") is not None:
             if str(ip["assignee_id"]) == str(server_id):
                 return
-            raise ProviderError("این IP به سرور دیگری متصل است؛ ابتدا آن را جدا کنید.")
+            raise ProviderError("This IP is attached to another server; detach it first.")
         server = await self._primary_server_off(server_id)
         location = server.get("location") or (server.get("datacenter") or {}).get("location") or {}
         ip_location = ip.get("location") or (ip.get("datacenter") or {}).get("location") or {}
         if not location.get("name") or location.get("name") != ip_location.get("name"):
-            raise ProviderError("IP و سرور باید در یک منطقه باشند.")
+            raise ProviderError("The IP and the server must be in the same region.")
         old = (server.get("public_net", {}).get(ip["type"]) or {}).get("id")
         if old:
             await self.update_hetzner_primary_ip(old, auto_delete=False)
@@ -2418,9 +2418,9 @@ class Provider:
     async def delete_hetzner_primary_ip(self, ip_id):
         ip = await self.hetzner_primary_ip(ip_id)
         if ip.get("assignee_id") is not None:
-            raise ProviderError("ابتدا IP را از سرور جدا کنید.")
+            raise ProviderError("Detach the IP from the server first.")
         if (ip.get("protection") or {}).get("delete"):
-            raise ProviderError("ابتدا محافظت حذف را غیرفعال کنید.")
+            raise ProviderError("Disable delete protection first.")
         await self._req("DELETE", f"/primary_ips/{int(ip_id)}")
 
     async def hetzner_power(self, server_id, action):

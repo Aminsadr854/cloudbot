@@ -652,10 +652,10 @@ async def _execute(operation, args, store):
                         except Exception as exc:
                             if "read only" in str(exc).lower():
                                 item.update({"status": "suspended",
-                                             "error": "اکانت Fastly فقط‌خواندنی (read only) شده و نمی‌شود سرویس canary ساخت؛ احتمالاً توسط Fastly قفل یا معلق شده است."})
+                                             "error": "The Fastly account is read-only, so the canary service cannot be created; Fastly has probably locked or suspended it."})
                     elif canary[0] == "dead":
                         item.update({"status": "suspended",
-                                     "error": "لبه Fastly برای سرویس canary پاسخ Domain Not Found می‌دهد؛ اکانت از کار افتاده است."})
+                                     "error": "The Fastly edge answers Domain Not Found for the canary service; the account is dead."})
                 return item
             except Exception as exc:
                 return {

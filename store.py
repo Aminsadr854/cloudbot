@@ -238,7 +238,7 @@ class Store(ProxyPoolStore):
         proxy_family = "default"
         with self.proxy_transaction():
             if not self.account(acc_id):
-                raise ProxyPoolError('اکانت یافت نشد.')
+                raise ProxyPoolError('Account not found.')
             if proxy_request:
                 self._check_proxy_reservation(proxy_request, acc_id, proxy)
             else:
