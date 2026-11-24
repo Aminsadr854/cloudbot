@@ -133,3 +133,57 @@ class PersistentSyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.pending_sync(), {})
         status = await control_service.execute('sync_status', {}, self.store)
         self.assertFalse(status['pending'])
+
+
+class AccountHealthAlertTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.cache = {}
+        self.store = Mock()
+        self.store.accounts.return_value = [{"id": 1}, {"id": 2}]
+        self.store.get_cache.side_effect = lambda k: self.cache.get(k)
+        self.store.set_cache.side_effect = lambda k, v: self.cache.__setitem__(k, v)
+        self.send = AsyncMock()
+
+    @staticmethod
+    def result(status, acc_id=1):
+        return {"accounts": [{"account": {"id": acc_id, "label": "a<b", "provider": "linode"},
+                              "status": status, "error": "bad token"}]}
+
+    async def run_health(self, status, recheck=None):
+        recheck = recheck or self.result(status)
+        with patch.object(account_sync, "RECHECK_DELAY", 0), \
+                patch.object(account_sync, "execute", AsyncMock(return_value=recheck)):
+            await account_sync.notify_account_health(self.store, self.result(status), self.send)
+
+    async def test_goes_down_then_recovers_alert_once_each(self):
+        await self.run_health("ok")
+        await self.run_health("error")
+        self.assertEqual(self.send.await_count, 1)
+        self.assertIn("a&lt;b", self.send.await_args.args[0])
+        await self.run_health("error")
+        self.assertEqual(self.send.await_count, 1)
+        await self.run_health("ok")
+        self.assertEqual(self.send.await_count, 2)
+        self.assertIn("🟢", self.send.await_args.args[0])
+
+    async def test_transient_failure_not_confirmed_stays_silent(self):
+        await self.run_health("ok")
+        await self.run_health("error", recheck=self.result("ok"))
+        self.send.assert_not_awaited()
+
+    async def test_first_sighting_of_down_account_is_silent(self):
+        await self.run_health("error")
+        self.send.assert_not_awaited()
+
+    async def test_undelivered_alert_is_retried(self):
+        await self.run_health("ok")
+        self.send.side_effect = [RuntimeError("tg"), None]
+        await self.run_health("error")
+        await self.run_health("error")
+        self.assertEqual(self.send.await_count, 2)
+        self.assertTrue(self.cache[account_sync.HEALTH_KEY]["1"]["notified"])
+
+    async def test_suspended_counts_as_down(self):
+        await self.run_health("ok")
+        await self.run_health("suspended")
+        self.assertEqual(self.send.await_count, 1)
