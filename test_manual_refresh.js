@@ -21,7 +21,7 @@ const context = { window: {}, console, Event: class {},
   loadAllPhase: async (generation, force) => { phases.push(force); },
   autoRecoverFailedAccounts: async () => {}, escapeHtml: x => x,
   updateDeployCountPreview() {}, prefetchAccountDeployOptions() {},
-  updateCloudCredentialHint() {}, populateAddAccProxyProviders() {},
+  updateCloudCredentialHint() {}, mountTagEditor() {}, populateAddAccProxyProviders() {},
   switchAddAccountProxyMode() {}, updateAddAccProxyRegionHint() {}, updateProxyInputPreview() {}
 };
 vm.createContext(context);

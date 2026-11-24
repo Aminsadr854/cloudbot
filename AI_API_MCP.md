@@ -54,9 +54,12 @@ For access from your workstation, open an SSH tunnel with `ssh -L 9601:127.0.0.1
 |---|---|---|
 | `accounts` | `{}` | Account IDs, labels, and providers; no tokens or proxy secrets |
 | `account_info` | `account_id` | Provider identity, balance, and credit details |
-| `add_account` | `label`, `provider`, `token`, `region?`, `proxy?`, `proxy_family?`, `auto_backup?`, `note?` | Encrypts and adds new cloud account with optional region and memo note |
+| `account_token` | `account_id`, `confirm: "SHOW_TOKEN"` | Reveals the stored API token (HTTP API / web UI only, not an MCP tool) |
+| `add_account` | `label`, `provider`, `token`, `region?`, `proxy?`, `proxy_family?`, `auto_backup?`, `note?`, `tags?` | Encrypts and adds a cloud account (`provider` includes `fastly`, whose token is a Fastly API token) with optional region, memo note and tags. The token and proxy are checked live first; nothing is saved if the check fails, and the error says whether the token or the proxy was at fault |
 | `delete_account` | `account_id`, `confirm: "DELETE_ACCOUNT"` | Removes cloud account |
 | `set_account_note` | `account_id`, `note` | Sets or clears account memo note |
+| `set_account_tags` | `account_id`, `tags` | Replaces the account's tags (list or comma-separated; max 8, lowercase, 24 chars) used for grouping/filtering in the console |
+| `fastly_services` | `account_id` | Fastly CDN services of a Fastly account (id, name, active version), via the account proxy |
 | `update_account` | `account_id`, `label?`, `token?` | Renames an account; a nonempty replacement token is verified before saving, and an empty token preserves the existing credential (HTTP API) |
 | `check_all_accounts` | `refresh?` | Status and balance check across all accounts (instant SQLite cache; `refresh: true` polls cloud) |
 | `servers` | `account_id` | Servers in one account |
@@ -151,3 +154,7 @@ Their typed parameters mirror the API arguments. Start with `list_accounts` to f
 For write tools, the AI should obtain the owner's approval for the specific action and target before supplying the confirmation string. The string is an input guard, not a substitute for approval. A timeout does not establish that a paid action failed; inspect the resource list before retrying.
 
 The API bearer token authorizes **all listed operations**, including billable ones. Treat SSH access and the token as owner credentials. Do not publicly reverse proxy the API without adding a separate access layer. The phone probe token cannot authorize it.
+
+## Locked servers
+
+`servers`, `all_servers` and `server` carry `locked` for Hetzner. `test_account` and `check_all_accounts` return `server_warnings` for locked servers. A provider abuse hold usually shows this way; a null-routed IP on an otherwise unlocked server is not visible through the API.

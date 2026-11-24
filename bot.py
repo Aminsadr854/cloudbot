@@ -88,7 +88,7 @@ dp = Dispatcher(storage=MemoryStorage())
 # Provider markers use the real provider logo stickers from the Infrastructure
 # Icons set.  The Unicode symbols remain the fallback for clients without
 # custom-emoji support.
-PROVIDER_LABEL = {"linode": "🟣 Linode", "vultr": "🔷 Vultr", "hetzner": "🟦 Hetzner", "upcloud": "☁️ UpCloud", "cloudferro": "🇵🇱 CloudFerro"}
+PROVIDER_LABEL = {"linode": "🟣 Linode", "vultr": "🔷 Vultr", "hetzner": "🟦 Hetzner", "upcloud": "☁️ UpCloud", "cloudferro": "🇵🇱 CloudFerro", "gcore": "🇱🇺 Gcore"}
 PROXY_FAMILY_LABEL = {"default": "پیش‌فرض", "ipv4": "IPv4", "ipv6": "IPv6"}
 account_check_status = {}
 menu_cache = MenuCache()

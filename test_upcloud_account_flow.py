@@ -85,6 +85,7 @@ class AccountFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(provider.images.await_args_list[0].kwargs["region"], "fi-hel1")
         self.assertEqual(provider.images.await_args_list[1].kwargs["region"], "uk-lon1")
 
+    @patch.object(control_service, "_verify_new_account", new=AsyncMock())
     async def test_add_upcloud_encrypts_token_and_proxy_and_masks_public_account(self):
         with tempfile.TemporaryDirectory() as tmp:
             store = Store(os.path.join(tmp, "cloudbot.db"), os.path.join(tmp, "secret.key"))
@@ -106,6 +107,7 @@ class AccountFlowTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 store.close()
 
+    @patch.object(control_service, "_verify_new_account", new=AsyncMock())
     async def test_add_account_allocation_response_does_not_include_proxy_secret(self):
         store = MemoryStore()
         result = await control_service.execute("add_account", {
@@ -204,6 +206,7 @@ class AccountFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(TOKEN, result["error"])
         self.assertNotIn(PROXY, result["error"])
 
+    @patch.object(control_service, "_verify_new_account", new=AsyncMock())
     async def test_account_mutation_invalidates_shared_caches(self):
         store = MemoryStore()
         for key in ("all_servers", "all_floating_ips", "all_billing"):
@@ -245,6 +248,37 @@ class AccountFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("1", result["account_errors"])
         self.assertNotIn(TOKEN, result["account_errors"]["1"])
         self.assertNotIn(TOKEN, "\n".join(logs.output))
+
+
+class AddAccountVerificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_failed_check_saves_nothing_and_names_the_cause(self):
+        store = MemoryStore()
+        bad_token = AsyncMock()
+        bad_token.whoami.side_effect = RuntimeError("HTTP 401: unauthorized")
+        with patch.object(control_service, "Provider", return_value=bad_token):
+            with self.assertRaisesRegex(control_service.InputError, "API token error"):
+                await control_service.execute("add_account", {
+                    "label": "x", "provider": "hetzner", "token": TOKEN}, store)
+        bad_proxy = AsyncMock()
+        bad_proxy.whoami.side_effect = RuntimeError("Proxy failed: timeout")
+        with patch.object(control_service, "Provider", return_value=bad_proxy):
+            with self.assertRaisesRegex(control_service.InputError, "proxy error"):
+                await control_service.execute("add_account", {
+                    "label": "x", "provider": "hetzner", "token": TOKEN, "proxy": PROXY}, store)
+        self.assertEqual(store.accounts(), [])
+
+    async def test_account_token_needs_confirmation(self):
+        store = MemoryStore([account(1)])
+        with self.assertRaises(control_service.InputError):
+            await control_service.execute("account_token", {"account_id": 1}, store)
+        res = await control_service.execute(
+            "account_token", {"account_id": 1, "confirm": "SHOW_TOKEN"}, store)
+        self.assertEqual(res["token"], TOKEN)
+
+    def test_locked_hetzner_server_is_reported(self):
+        from providers import server_warnings
+        warns = server_warnings([{"id": 1, "label": "a", "locked": True}, {"id": 2, "locked": False}])
+        self.assertEqual([w["server_id"] for w in warns], [1])
 
 
 if __name__ == "__main__":

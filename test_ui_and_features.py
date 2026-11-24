@@ -816,6 +816,7 @@ niceproxy.io:17521:accounts1_k5ub-country-AF-ssid-JcVtnUPMVN:accpas2
             if os.path.exists(key_path):
                 os.remove(key_path)
 
+    @patch.object(control_service, "_verify_new_account", new=AsyncMock())
     async def test_add_account_with_proxy_provider(self):
         import tempfile
         import os

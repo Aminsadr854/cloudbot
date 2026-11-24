@@ -4,8 +4,8 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Cloudbot | Multi-Cloud Hosting Console</title>
-  <link rel="stylesheet" href="/ui/style.css?v=20261102-ui">
-  <link rel="stylesheet" href="/ui/workspace.css?v=20261106-provider-cards">
+  <link rel="stylesheet" href="/ui/style.css?v=20261123-traffic-clean">
+  <link rel="stylesheet" href="/ui/workspace.css?v=20261110-server-page2">
   <link rel="icon" type="image/svg+xml" href="/ui/assets/cloud.svg">
 </head>
 <body>
@@ -55,7 +55,7 @@
       <nav class="sidebar-content" aria-label="Main navigation">
         <div class="nav-section"><div class="nav-section-title">Workspace</div><button class="nav-item" data-tab="tab-overview"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-grid"/></svg></span><span>Overview</span></div></button><button class="nav-item" data-tab="tab-compute"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-server"/></svg></span><span>Servers</span></div><span class="nav-count-badge" id="badge-total-servers">0</span></button><button class="nav-item" data-tab="tab-accounts"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-user"/></svg></span><span>Accounts</span></div><span class="nav-count-badge" id="badge-accounts-count">0</span></button><button class="nav-item" data-tab="tab-proxies"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-route"/></svg></span><span>Account proxies</span></div><span class="nav-count-badge" id="badge-proxies-count">0</span></button></div>
         <details class="nav-section nav-disclosure"><summary>Network & tools</summary><button class="nav-item" data-tab="tab-ips"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-globe"/></svg></span><span>IP addresses</span></div><span class="nav-count-badge" id="badge-fips-count">0</span></button><button class="nav-item" data-tab="tab-ssh"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-key"/></svg></span><span>SSH keys</span></div><span class="nav-count-badge" id="badge-ssh-count">0</span></button><button class="nav-item" data-tab="tab-dns"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-dns"/></svg></span><span>DNS records</span></div></button><button class="nav-item" data-tab="tab-watchdog"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-activity"/></svg></span><span>Watchdog & tunnels</span></div></button><button class="nav-item" data-tab="tab-logs"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-list"/></svg></span><span>Logs & activity</span></div></button><button class="nav-item" data-tab="tab-api"><div class="nav-item-left"><span class="nav-icon"><svg class="i" aria-hidden="true"><use href="#i-list"/></svg></span><span>API & MCP</span></div></button></details>
-        <details class="nav-section nav-disclosure" id="provider-navigation"><summary>Browse by provider</summary><button class="nav-item" data-tab="tab-hetzner"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/hetzner.svg" alt=""><span>Hetzner</span></div><span class="nav-count-badge" id="badge-hetzner-count">0</span></button><button class="nav-item" data-tab="tab-vultr"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/vultr.svg" alt=""><span>Vultr</span></div><span class="nav-count-badge" id="badge-vultr-count">0</span></button><button class="nav-item" data-tab="tab-linode"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/linode.svg" alt=""><span>Linode</span></div><span class="nav-count-badge" id="badge-linode-count">0</span></button><button class="nav-item" data-tab="tab-upcloud"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/cloud.svg" alt=""><span>UpCloud</span></div><span class="nav-count-badge" id="badge-upcloud-count">0</span></button><button class="nav-item" data-tab="tab-cloudferro"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/cloud.svg" alt=""><span>CloudFerro</span></div><span class="nav-count-badge" id="badge-cloudferro-count">0</span></button></details>
+        <details class="nav-section nav-disclosure" id="provider-navigation"><summary>Browse by provider</summary><button class="nav-item" data-tab="tab-hetzner"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/hetzner.svg" alt=""><span>Hetzner</span></div><span class="nav-count-badge" id="badge-hetzner-count">0</span></button><button class="nav-item" data-tab="tab-vultr"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/vultr.svg" alt=""><span>Vultr</span></div><span class="nav-count-badge" id="badge-vultr-count">0</span></button><button class="nav-item" data-tab="tab-linode"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/linode.svg" alt=""><span>Linode</span></div><span class="nav-count-badge" id="badge-linode-count">0</span></button><button class="nav-item" data-tab="tab-upcloud"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/cloud.svg" alt=""><span>UpCloud</span></div><span class="nav-count-badge" id="badge-upcloud-count">0</span></button><button class="nav-item" data-tab="tab-cloudferro"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/cloud.svg" alt=""><span>CloudFerro</span></div><span class="nav-count-badge" id="badge-cloudferro-count">0</span></button><button class="nav-item" data-tab="tab-gcore"><div class="nav-item-left"><img class="nav-provider-logo" src="/ui/assets/cloud.svg" alt=""><span>Gcore</span></div><span class="nav-count-badge" id="badge-gcore-count">0</span></button></details>
       </nav>
 
       <!-- Sidebar Footer Status -->
@@ -181,6 +181,8 @@
             </div>
             <input type="search" class="input-search-sm" id="search-accounts-input" oninput="filterAccountsList()" placeholder="Search accounts…" aria-label="Search accounts">
           </div>
+
+          <div class="tag-bar" id="account-tag-bar" hidden></div>
 
           <!-- Accounts Master Container -->
           <div class="accounts-master-container" id="accounts-master-grid">
@@ -377,6 +379,11 @@
           <div id="cloudferro-accounts-view"><div class="section-heading-row"><div><h3 class="section-title">CloudFerro Accounts</h3><p class="text-xs text-secondary mt-0.5">OpenStack WAW3-1 instances, quotas, and floating IPs</p></div><div id="cloudferro-summary-stats" class="flex items-center gap-2 flex-wrap"></div></div><div class="accounts-cards-grid" id="cloudferro-accounts-grid"></div></div>
           <div id="cloudferro-servers-view" style="display: none;"></div>
         </section>
+        <section class="tab-pane" id="tab-gcore">
+          <div class="provider-banner"><div class="provider-banner-left"><img src="/ui/assets/cloud.svg" alt="" class="provider-banner-logo"><div><h2 class="provider-banner-title">Gcore Hub</h2></div></div><div class="provider-banner-actions"><button class="btn btn-secondary" onclick="loadAll(true, {provider: 'gcore'})">Refresh Gcore</button><button class="btn btn-secondary" onclick="openAddAccountModalFor('gcore')">+ Add Gcore Account</button><button class="btn btn-primary" onclick="openDeployModalForProvider('gcore')">Deploy Gcore Instance</button></div></div>
+          <div id="gcore-accounts-view"><div class="section-heading-row"><div><h3 class="section-title">Gcore Accounts</h3><p class="text-xs text-secondary mt-0.5">Gcore Cloud virtual instances across all regions</p></div><div id="gcore-summary-stats" class="flex items-center gap-2 flex-wrap"></div></div><div class="accounts-cards-grid" id="gcore-accounts-grid"></div></div>
+          <div id="gcore-servers-view" style="display: none;"></div>
+        </section>
         <section class="tab-pane" id="tab-compute">
           <div class="section-heading-row">
             <div>
@@ -393,7 +400,9 @@
                 <option value="linode">Linode</option>
                 <option value="upcloud">UpCloud</option>
                 <option value="cloudferro">CloudFerro</option>
+                <option value="gcore">Gcore</option>
               </select>
+              <select id="filter-server-tag" class="select-input" aria-label="Filter by account group" onchange="renderAllCompute()" hidden><option value="all">All groups</option></select>
           </div>
 
           <div id="compute-summary" class="text-sm text-secondary mb-4" role="status"></div>
@@ -678,14 +687,6 @@
               <li>The notify webhook (<code>POST /v1/webhook/notify</code>) uses its own token and cannot call operations.</li>
             </ul>
           </div>
-          <h3 class="font-bold">3. Safety rules</h3>
-            <ul class="text-sm" style="padding-left:1.2rem;list-style:disc">
-              <li>Billable or destructive tools require an exact <code>confirm</code> string (e.g. <code>DELETE_SERVER</code>). It is a guard, not approval: get the owner's OK for the specific action first.</li>
-              <li>A timeout does not mean a paid action failed. List resources before retrying.</li>
-              <li>The tokens grant full owner access. Do not expose the API publicly.</li>
-              <li>The notify webhook (<code>POST /v1/webhook/notify</code>) uses its own token and cannot call operations.</li>
-            </ul>
-          </div>
           <h3 class="font-bold">MCP tool reference</h3>
           <div class="api-card"><h3 class="font-bold">Inspect (read-only)</h3><div class="data-table-container"><table class="data-table"><thead><tr><th>Tool</th><th>What it does</th></tr></thead><tbody><tr><td><code>list_accounts / account_info / resource_limits</code></td><td>Account IDs, balance, quotas. Start here to find <code>account_id</code>.</td></tr><tr><td><code>check_all_accounts / test_account</code></td><td>Health and balance across all accounts; <code>refresh</code> polls the clouds instead of the cache.</td></tr><tr><td><code>list_servers / all_servers / get_server</code></td><td>Server inventory per account or multi-cloud, and one server with its attached IPs.</td></tr><tr><td><code>list_regions / list_plans / list_images</code></td><td>What can be deployed: locations, plans with prices, OS images.</td></tr><tr><td><code>all_floating_ips / list_floating_ips / hetzner_primary_ips</code></td><td>Floating, Reserved and Hetzner Primary IPs.</td></tr><tr><td><code>list_ssh_keys, list_dns_zones, list_dns_records, get_dns_record</code></td><td>Key vault and Cloudflare DNS.</td></tr><tr><td><code>watchdog_status / list_tunnels / proxy_pool</code></td><td>Watchdog results, tunnel endpoints, proxy pools.</td></tr></tbody></table></div></div><div class="api-card"><h3 class="font-bold">Servers &amp; secrets (billable / destructive)</h3><div class="data-table-container"><table class="data-table"><thead><tr><th>Tool</th><th>What it does</th></tr></thead><tbody><tr><td><code>create_server</code></td><td>Creates one billable server; vault SSH keys attach by default. Needs <code>CREATE_SERVER</code>.</td></tr><tr><td><code>delete_server / power_server</code></td><td>Terminate (<code>DELETE_SERVER</code>) or start/reboot/halt.</td></tr><tr><td><code>server_password / set_server_password</code></td><td>Reveal (<code>SHOW_PASSWORD</code>) or set the stored root password.</td></tr></tbody></table></div></div><div class="api-card"><h3 class="font-bold">SSH keys, IPs and DNS</h3><div class="data-table-container"><table class="data-table"><thead><tr><th>Tool</th><th>What it does</th></tr></thead><tbody><tr><td><code>add_ssh_key / delete_ssh_key</code></td><td>Vault keys; <code>sync_accounts</code> pushes to providers.</td></tr><tr><td><code>create/assign/unassign/update/delete_floating_ip</code></td><td>Floating IP lifecycle, PTR and description.</td></tr><tr><td><code>create/assign/unassign/delete_hetzner_primary_ip</code></td><td>Hetzner Primary IPs.</td></tr><tr><td><code>upsert_dns / delete_dns_record</code></td><td>Create or repoint Cloudflare A records.</td></tr></tbody></table></div></div><div class="api-card"><h3 class="font-bold">Accounts and proxies</h3><div class="data-table-container"><table class="data-table"><thead><tr><th>Tool</th><th>What it does</th></tr></thead><tbody><tr><td><code>add_account / delete_account / set_account_note / set_account_region</code></td><td>Manage cloud accounts.</td></tr><tr><td><code>set_account_proxy / allocate_account_proxy / test_proxy</code></td><td>Route an account through a proxy and verify it.</td></tr><tr><td><code>proxy_providers / proxy_sessions / proxy_availability</code></td><td>Inspect proxy providers and sessions.</td></tr><tr><td><code>add/update/delete/toggle_proxy_provider, add_proxy_sessions, toggle/delete_proxy_session</code></td><td>Edit proxy providers and sessions.</td></tr><tr><td><code>auto_heal_proxies</code></td><td>Replace broken account proxies automatically.</td></tr></tbody></table></div></div>
           <p class="text-xs text-secondary">Full detail, HTTP operation names and install steps: <code>projects/cloudbot/AI_API_MCP.md</code>.</p>
@@ -829,6 +830,8 @@
                     <option value="linode">Linode</option>
                     <option value="upcloud">UpCloud</option>
                     <option value="cloudferro">CloudFerro</option>
+                    <option value="gcore">Gcore</option>
+                  <option value="fastly">Fastly</option>
                   </select>
                 </div>
                 <div class="toolbar-item">
@@ -941,6 +944,11 @@
                 <span class="provider-picker-logo" style="font-size: 1.5rem; line-height: 1.2;">🇵🇱</span>
                 <span class="provider-picker-name">CloudFerro</span>
                 <span class="provider-picker-count" id="deploy-prov-count-cloudferro">0 accounts</span>
+              </div>
+              <div class="provider-picker-btn" data-prov="gcore">
+                <span class="provider-picker-logo" style="font-size: 1.5rem; line-height: 1.2;">🇱🇺</span>
+                <span class="provider-picker-name">Gcore</span>
+                <span class="provider-picker-count" id="deploy-prov-count-gcore">0 accounts</span>
               </div>
             </div>
           </div>
@@ -1268,11 +1276,18 @@
               <option value="linode">Linode / Akamai</option>
               <option value="upcloud">UpCloud</option>
               <option value="cloudferro">CloudFerro</option>
+              <option value="gcore">Gcore</option>
+              <option value="fastly">Fastly CDN</option>
             </select>
           </div>
           <div class="form-group">
             <label class="form-label">Account Label</label>
             <input type="text" id="acc-label" class="text-input" placeholder="e.g. hetzner-prod-01" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Groups / Tags (Optional)</label>
+            <div id="acc-tags-editor" class="tag-editor"></div>
+            <span class="text-xs text-secondary mt-1 block">Tags group accounts so you can filter them here and in Servers.</span>
           </div>
           <div class="form-group">
             <label class="form-label">Note (Optional)</label>
@@ -1639,6 +1654,41 @@
     </div>
   </div>
 
+  <!-- Modal: Edit Account Tags -->
+  <div class="modal-backdrop" id="modal-edit-tags">
+    <div class="modal-box" style="max-width: 480px;">
+      <div class="modal-header">
+        <h3 class="modal-title">Edit Groups / Tags</h3>
+        <button class="modal-close" data-close="modal-edit-tags">&times;</button>
+      </div>
+      <form id="form-edit-account-tags" autocomplete="off">
+        <div class="modal-body">
+          <input type="hidden" id="edit-tags-account-id">
+          <div class="form-group">
+            <label class="form-label" id="edit-tags-account-label">Tags</label>
+            <div id="edit-tags-editor" class="tag-editor"></div>
+            <span class="text-xs text-secondary mt-1 block">Up to 8 tags. Press Enter or comma to add one, Backspace to remove the last.</span>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-close="modal-edit-tags">Cancel</button>
+          <button type="submit" class="btn btn-primary" id="btn-save-account-tags">Save Tags</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Fastly Services -->
+  <div class="modal-backdrop" id="modal-fastly-services">
+    <div class="modal-box" style="max-width: 960px;">
+      <div class="modal-header">
+        <h3 class="modal-title" id="fastly-services-title">Fastly services</h3>
+        <button class="modal-close" data-close="modal-fastly-services">&times;</button>
+      </div>
+      <div class="modal-body" id="fastly-services-body"></div>
+    </div>
+  </div>
+
   <!-- Modal: Quick Edit Account Note -->
   <div class="modal-backdrop" id="modal-edit-note">
     <div class="modal-box" style="max-width: 480px;">
@@ -1675,6 +1725,14 @@
           <div class="form-group">
             <label class="form-label" for="edit-account-name">Account name</label>
             <input type="text" id="edit-account-name" class="text-input" autocomplete="off" required>
+          </div>
+          <div class="form-group">
+            <label class="form-label">Current API token</label>
+            <div class="flex items-center gap-2">
+              <code class="font-mono text-sm token-reveal" style="overflow-wrap:anywhere;min-width:0;" id="edit-account-token-view">••••••••••••••••</code>
+              <button type="button" class="btn btn-secondary btn-sm" id="btn-reveal-account-token" onclick="revealAccountToken()">Show</button>
+              <button type="button" class="btn btn-secondary btn-sm hidden" id="btn-copy-account-token" onclick="copyAccountToken()">Copy</button>
+            </div>
           </div>
           <div class="form-group">
             <label class="form-label" for="edit-account-token">Replacement API token (optional)</label>
@@ -2027,6 +2085,7 @@ eu.swiftproxy.net:7878:user_country_MY_sid_27369619_time_10:mypassword"></textar
       <!-- Modal Header -->
       <div class="modal-header items-center justify-between pb-3 border-b border-subtle">
         <div class="flex items-center gap-3">
+          <button type="button" class="btn btn-secondary btn-sm" data-close="modal-server-details" id="btn-srvpage-back">&larr; Back</button>
           <div class="server-detail-provider-icon" id="srvmodal-provider-icon"></div>
           <div>
             <div class="flex items-center gap-2">
@@ -2044,11 +2103,11 @@ eu.swiftproxy.net:7878:user_country_MY_sid_27369619_time_10:mypassword"></textar
           <button type="button" class="btn btn-secondary btn-sm" id="btn-srvmodal-refresh" onclick="refreshCurrentServerDetailsModal()" title="Live Refresh">
             Refresh
           </button>
-          <button class="modal-close" data-close="modal-server-details">&times;</button>
         </div>
       </div>
 
       <div class="modal-body py-4">
+        <div class="server-lock-banner hidden" id="srvmodal-lock-banner" role="alert"></div>
         <!-- Quick Stats Grid -->
         <div class="server-stats-grid mb-4">
           <!-- Primary IP -->
@@ -2170,6 +2229,15 @@ sudo ip route replace default via 192.168.168.1 dev &lt;interface&gt; table 101 
               <button type="button" class="btn btn-secondary btn-sm" onclick="switchSrvModalTab('ips')">
                 Manage IPs
               </button>
+            </div>
+          </div>
+                  <!-- Rebuild (Hetzner / Linode / Vultr) -->
+          <div id="srvmodal-rebuild-box" class="card p-4 mt-4 bg-surface border border-danger-subtle hidden mt-4">
+            <h4 class="font-bold text-sm text-danger">Rebuild server (reinstall OS)</h4>
+            <p class="text-xs text-secondary mt-1" id="srvmodal-rebuild-note">Wipes the disk and reinstalls the operating system. All data on this server is lost; the IP stays.</p>
+            <div class="flex items-center gap-2 flex-wrap mt-3">
+              <select id="srvmodal-rebuild-image" class="select-input text-sm" style="min-width: 260px;"></select>
+              <button type="button" class="btn btn-danger btn-sm" id="btn-srvmodal-rebuild" onclick="rebuildServerFromModal()">Rebuild</button>
             </div>
           </div>
         </div>
@@ -2335,6 +2403,9 @@ sudo ip route replace default via 192.168.168.1 dev &lt;interface&gt; table 101 
           <button type="button" class="btn btn-secondary btn-sm" id="btn-srvmodal-reboot" onclick="rebootServerFromModal()">
             Soft Reboot
           </button>
+          <button type="button" class="btn btn-secondary btn-sm hidden" id="btn-srvmodal-rebuild-jump" onclick="document.getElementById('srvmodal-rebuild-box').scrollIntoView({behavior:'smooth',block:'center'})">
+            Rebuild
+          </button>
           <button type="button" class="btn btn-secondary btn-sm" id="btn-srvmodal-power" onclick="togglePowerServerFromModal()">
             Halt / Shutdown
           </button>
@@ -2345,7 +2416,7 @@ sudo ip route replace default via 192.168.168.1 dev &lt;interface&gt; table 101 
             Delete Server
           </button>
           <button type="button" class="btn btn-secondary btn-sm" data-close="modal-server-details">
-            Close
+            Back to list
           </button>
         </div>
       </div>
@@ -2479,8 +2550,8 @@ sudo ip route replace default via 192.168.168.1 dev &lt;interface&gt; table 101 
   <div class="toast-container" id="toast-container"></div>
 
   <!-- JavaScript Application Bundle -->
-  <script src="/ui/api-client.js?v=20261102-ui"></script>
+  <script src="/ui/api-client.js?v=20261122-account-traffic"></script>
   <script src="/ui/sync-manager.js?v=20261102-ui"></script>
-  <script src="/ui/app.js?v=20261106-provider-cards"></script>
+  <script src="/ui/app.js?v=20261123-traffic-clean"></script>
 </body>
 </html>

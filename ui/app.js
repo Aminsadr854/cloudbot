@@ -22,8 +22,8 @@ const state = {
   activeTab: "tab-overview",
   searchQuery: "",
   deploySelectedProvider: "hetzner",
-  providerSelectedAccount: { hetzner: null, vultr: null, linode: null, upcloud: null, cloudferro: null },
-  providerAccountSubTab: { hetzner: "instances", vultr: "instances", linode: "instances", upcloud: "instances", cloudferro: "instances" },
+  providerSelectedAccount: { hetzner: null, vultr: null, linode: null, upcloud: null, cloudferro: null, gcore: null },
+  providerAccountSubTab: { hetzner: "instances", vultr: "instances", linode: "instances", upcloud: "instances", cloudferro: "instances", gcore: "instances" },
   regionsCache: {},
   plansCache: {},
   imagesCache: {},
@@ -83,7 +83,9 @@ const PROVIDERS = {
   vultr: { name: "Vultr", logo: "/ui/assets/vultr.svg", badgeClass: "badge-vultr", color: "#0ea5e9" },
   linode: { name: "Linode / Akamai", logo: "/ui/assets/linode.svg", badgeClass: "badge-linode", color: "#10b981" },
   upcloud: { name: "UpCloud", logo: "/ui/assets/upcloud.svg", badgeClass: "badge-upcloud", color: "#f97316" },
-  cloudferro: { name: "CloudFerro", logo: "/ui/assets/cloudferro.webp", badgeClass: "badge-upcloud", color: "#2563eb" }
+  cloudferro: { name: "CloudFerro", logo: "/ui/assets/cloudferro.webp", badgeClass: "badge-upcloud", color: "#2563eb" },
+  gcore: { name: "Gcore", logo: "/ui/assets/cloud.svg", badgeClass: "badge-upcloud", color: "#ff4c00" },
+  fastly: { name: "Fastly CDN", logo: "/ui/assets/fastly.svg", badgeClass: "badge-upcloud", color: "#ff282d", cdn: true }
 };
 
 const PROVIDER_CAPABILITIES = {
@@ -91,7 +93,9 @@ const PROVIDER_CAPABILITIES = {
   vultr: { server_lifecycle: true, floating_ip: true, networking: true, ssh_key_crud: true, standalone_floating_ip: true },
   linode: { server_lifecycle: true, floating_ip: false, networking: true, ssh_key_crud: true, standalone_floating_ip: false },
   upcloud: { server_lifecycle: true, floating_ip: true, networking: true, ssh_key_crud: false, standalone_floating_ip: false },
-  cloudferro: { server_lifecycle: true, floating_ip: true, networking: true, ssh_key_crud: false, standalone_floating_ip: true }
+  cloudferro: { server_lifecycle: true, floating_ip: true, networking: true, ssh_key_crud: false, standalone_floating_ip: true },
+  gcore: { server_lifecycle: true, floating_ip: false, networking: false, ssh_key_crud: false, standalone_floating_ip: false },
+  fastly: { server_lifecycle: false, floating_ip: false, networking: false, ssh_key_crud: false, standalone_floating_ip: false, cdn_services: true }
 };
 
 function providerSupports(provider, capability) {
@@ -115,6 +119,12 @@ document.addEventListener("DOMContentLoaded", async () => {
   setInterval(() => {
     if (state.authenticated && !document.hidden && !state.inventoryLoads) loadAll();
   }, 60000);
+  // Keep the "synced 5m ago" labels current between refreshes.
+  setInterval(() => {
+    document.querySelectorAll(".account-synced[data-synced-at]").forEach(el => {
+      el.textContent = `synced ${formatRelativeTime(Number(el.dataset.syncedAt))}`;
+    });
+  }, 15000);
 
   const authed = await checkSessionAuth();
   if (authed) {
@@ -276,7 +286,7 @@ const apiClient = window.CloudbotApiClient.create({
 
 async function api(operation, args = {}, options = {}) {
   const result = await apiClient.request(operation, args, options);
-  if (!window.CloudbotApiClient.READ_OPERATIONS.has(operation)) {
+  if (operation !== "account_token" && !window.CloudbotApiClient.READ_OPERATIONS.has(operation)) {
     state.autoSyncReload = true;
   }
   return result;
@@ -757,6 +767,9 @@ function formatAccountProxyLabel(acc) {
   return `Direct Egress`;
 }
 
+const LOCKED_SERVER_HINT = "The provider has locked this server. That is usually an abuse or security hold (or an action still running). Check the provider console and your mail for an abuse notice.";
+const BLOCKED_IP_HINT = "The provider has blocked a public IP on this server. Check the provider console and support notices for the reason.";
+
 function getAccountFailureStatus(accId) {
   const err = (state.accountErrors && (state.accountErrors[accId] || state.accountErrors[String(accId)])) ||
               (state.accountBilling && state.accountBilling[accId] && state.accountBilling[accId].status === "error" && state.accountBilling[accId].error);
@@ -894,12 +907,12 @@ async function performFailedProxyRecovery(generation, account, error) {
 // ==================== DATA LOADER ====================
 function getRefreshScope() {
   const provider = String(state.activeTab || '').replace(/^tab-/, '');
-  if (['hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro'].includes(provider)) {
+  if (['hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro', 'gcore'].includes(provider)) {
     const accountId = state.providerSelectedAccount?.[provider];
     return accountId ? { account_id: Number(accountId) } : { provider };
   }
   const accountId = state.activeTab === 'tab-ips' ? state.ipsAccountFilter : state.activeTab === 'tab-accounts' ? state.activeAccountFilter : null;
-  if (['hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro'].includes(accountId)) return { provider: accountId };
+  if (['hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro', 'gcore'].includes(accountId)) return { provider: accountId };
   return accountId && accountId !== 'all' && Number.isFinite(Number(accountId)) ? { account_id: Number(accountId) } : {};
 }
 
@@ -926,6 +939,7 @@ async function loadAll(forceRefresh = false, scope = null) {
     if (!manager.current(generation)) return;
     renderAllViews();
     updateBadges();
+    loadAccountTraffic(generation, forceRefresh);
     if (forceRefresh) showToast("Live cloud data and balances refreshed successfully!", "success");
   } catch (err) {
     if (manager.current(generation)) showToast("Error loading data: " + err.message, "error");
@@ -1024,7 +1038,8 @@ async function loadAllPhase(generation, forceRefresh, scope = {}) {
           info: item.info,
           identity: item.identity,
           error: item.error,
-          lastChecked: new Date()
+          lastChecked: new Date(),
+          checkedAt: (item.checked_at || data.cached_at) ? Number(item.checked_at || data.cached_at) * 1000 : null
         };
         if (forceRefresh) {
           const id = String(item.account.id);
@@ -1147,6 +1162,7 @@ function updateBadges() {
   const linodeServers = state.servers.filter(s => s.provider === "linode");
   const upcloudServers = state.servers.filter(s => s.provider === "upcloud");
   const cloudferroServers = state.servers.filter(s => s.provider === "cloudferro");
+  const gcoreServers = state.servers.filter(s => s.provider === "gcore");
 
   const bTotal = document.getElementById("badge-total-servers");
   const bAccounts = document.getElementById("badge-accounts-count");
@@ -1156,6 +1172,7 @@ function updateBadges() {
   const bLinode = document.getElementById("badge-linode-count");
   const bUpcloud = document.getElementById("badge-upcloud-count");
   const bCloudferro = document.getElementById("badge-cloudferro-count");
+  const bGcore = document.getElementById("badge-gcore-count");
   const bFips = document.getElementById("badge-fips-count");
   const bSsh = document.getElementById("badge-ssh-count");
 
@@ -1167,6 +1184,7 @@ function updateBadges() {
   if (bLinode) bLinode.textContent = linodeServers.length;
   if (bUpcloud) bUpcloud.textContent = upcloudServers.length;
   if (bCloudferro) bCloudferro.textContent = cloudferroServers.length;
+  if (bGcore) bGcore.textContent = gcoreServers.length;
   if (bFips) bFips.textContent = state.floatingIps.length + state.primaryIps.length;
   if (bSsh) bSsh.textContent = state.sshKeys.length;
 }
@@ -1181,6 +1199,7 @@ function renderAllViews() {
   renderLinodeHub();
   renderUpcloudHub();
   renderCloudferroHub();
+  renderGcoreHub();
   renderAllCompute();
   renderIPManagement();
   renderSSHKeys();
@@ -1277,8 +1296,186 @@ async function refreshSingleAccountBilling(accId, btnEl = null) {
 }
 
 // ==================== TAB: ACCOUNT MANAGEMENT & BILLING ====================
+// ---- Account tags (grouping) -------------------------------------------
+function normalizeTag(raw) {
+  return String(raw || "").trim().toLowerCase().replace(/\s+/g, "-").replace(/^-+|-+$/g, "").slice(0, 24);
+}
+
+function allAccountTags() {
+  const counts = {};
+  state.accounts.forEach(a => (a.tags || []).forEach(t => { counts[t] = (counts[t] || 0) + 1; }));
+  return Object.entries(counts).sort((a, b) => a[0].localeCompare(b[0]));
+}
+
+function tagChipsHtml(tags, clickable) {
+  return (tags || []).map(t => clickable
+    ? `<button type="button" class="tag-chip" onclick="filterAccountsByTag('${escapeHtml(t)}')" title="Show accounts tagged ${escapeHtml(t)}">${escapeHtml(t)}</button>`
+    : `<span class="tag-chip">${escapeHtml(t)}</span>`).join("");
+}
+
+function renderAccountTagBar() {
+  const bar = document.getElementById("account-tag-bar");
+  if (!bar) return;
+  const tags = allAccountTags();
+  if (!tags.length) { bar.hidden = true; bar.innerHTML = ""; return; }
+  bar.hidden = false;
+  const active = state.accountTagFilter || "";
+  bar.innerHTML = `<span class="tag-bar-label">${icon('list')}Groups</span>
+    <button type="button" class="tag-pill${active ? '' : ' active'}" onclick="filterAccountsByTag('')">All</button>
+    ${tags.map(([t, n]) => `<button type="button" class="tag-pill${active === t ? ' active' : ''}" onclick="filterAccountsByTag('${escapeHtml(t)}')">${escapeHtml(t)}<span class="tag-pill-count">${n}</span></button>`).join("")}`;
+}
+
+function filterAccountsByTag(tag) {
+  state.accountTagFilter = tag && state.accountTagFilter !== tag ? tag : "";
+  if (state.accountTagFilter) state.activeAccountFilter = "all";
+  renderAccountsManagement();
+}
+window.filterAccountsByTag = filterAccountsByTag;
+
+// Chip editor shared by the Add account and Edit tags dialogs.
+const tagEditors = {};
+function mountTagEditor(rootId, initial) {
+  const root = document.getElementById(rootId);
+  if (!root) return;
+  const ed = tagEditors[rootId] = { tags: [...(initial || [])] };
+  const draw = () => {
+    const suggestions = allAccountTags().map(([t]) => t).filter(t => !ed.tags.includes(t));
+    root.innerHTML = `<div class="tag-editor-box">
+        ${ed.tags.map((t, i) => `<span class="tag-chip removable">${escapeHtml(t)}<button type="button" data-rm="${i}" aria-label="Remove tag ${escapeHtml(t)}">&times;</button></span>`).join("")}
+        <input type="text" class="tag-editor-input" maxlength="24" placeholder="${ed.tags.length ? 'Add another…' : 'Type a tag and press Enter'}" autocomplete="off" data-lpignore="true" data-1p-ignore ${ed.tags.length >= 8 ? 'disabled' : ''}>
+      </div>
+      ${suggestions.length ? `<div class="tag-suggest"><span>Existing:</span>${suggestions.map(t => `<button type="button" class="tag-chip suggest" data-add="${escapeHtml(t)}">+ ${escapeHtml(t)}</button>`).join("")}</div>` : ''}`;
+    const input = root.querySelector("input");
+    const add = (v) => {
+      const t = normalizeTag(v);
+      if (t && !ed.tags.includes(t) && ed.tags.length < 8) { ed.tags.push(t); draw(); root.querySelector("input")?.focus(); }
+      else if (input) input.value = "";
+    };
+    input?.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === ",") { e.preventDefault(); add(input.value); }
+      else if (e.key === "Backspace" && !input.value && ed.tags.length) { ed.tags.pop(); draw(); root.querySelector("input")?.focus(); }
+    });
+    input?.addEventListener("blur", () => { if (input.value.trim()) add(input.value); });
+    root.querySelectorAll("[data-rm]").forEach(b => b.addEventListener("click", () => { ed.tags.splice(Number(b.dataset.rm), 1); draw(); }));
+    root.querySelectorAll("[data-add]").forEach(b => b.addEventListener("click", () => add(b.dataset.add)));
+  };
+  ed.draw = draw;
+  draw();
+}
+
+function readTagEditor(rootId) {
+  const root = document.getElementById(rootId);
+  const pending = root?.querySelector("input")?.value;
+  const ed = tagEditors[rootId];
+  const tags = ed ? [...ed.tags] : [];
+  const t = normalizeTag(pending);
+  if (t && !tags.includes(t) && tags.length < 8) tags.push(t);
+  return tags;
+}
+
+function openEditTagsModal(accId) {
+  const acc = state.accounts.find(a => a.id === Number(accId));
+  if (!acc) return;
+  document.getElementById("edit-tags-account-id").value = acc.id;
+  document.getElementById("edit-tags-account-label").textContent = `Tags for ${acc.label} (#${acc.id})`;
+  mountTagEditor("edit-tags-editor", acc.tags || []);
+  openModal("modal-edit-tags");
+  setTimeout(() => document.querySelector("#edit-tags-editor input")?.focus(), 60);
+}
+window.openEditTagsModal = openEditTagsModal;
+
+let fastlyLabelsCache = null;
+async function loadFastlyLabels() {
+  if (fastlyLabelsCache) return fastlyLabelsCache;
+  try {
+    const r = await fetch("/ui/fastly-labels.json", { cache: "no-cache" });
+    fastlyLabelsCache = r.ok ? await r.json() : {};
+  } catch (e) { fastlyLabelsCache = {}; }
+  return fastlyLabelsCache;
+}
+
+async function openFastlyServices(accId) {
+  const acc = state.accounts.find(a => a.id === Number(accId));
+  if (!acc) return;
+  const body = document.getElementById("fastly-services-body");
+  document.getElementById("fastly-services-title").textContent = `${acc.label} · Fastly services`;
+  body.innerHTML = `<div class="quiet-state"><p>Loading services through the account route…</p></div>`;
+  openModal("modal-fastly-services");
+  try {
+    const [res, tr, labels] = await Promise.all([
+      api("fastly_services", { account_id: acc.id }),
+      api("account_traffic", { account_id: acc.id }, { retryMode: "read" }).catch(() => null),
+      loadFastlyLabels(),
+    ]);
+    const rows = res.services || [];
+    const t = tr && tr.traffic;
+    if (t) { state.accountTraffic = state.accountTraffic || {}; state.accountTraffic[acc.id] = t; }
+    const perService = {};
+    for (const r of (t && t.servers) || []) perService[r.key] = r;
+    const bytesOf = r => { const x = perService[`fastly:${r.id}`]; return x ? x.out + x.in : 0; };
+    rows.sort((a, b) => bytesOf(b) - bytesOf(a));
+    const max = Math.max(1, ...rows.map(bytesOf));
+    const CLIENT = { flow: ["Flow", "#3b82f6"], lexo: ["Lexo", "#a855f7"], fsl: ["FSL", "#f59e0b"] };
+    const totalLine = t && t.items ? `<div class="fsv-total"><span>Account total</span><strong>${formatBytes(t.total)}</strong>${t.since ? `<span>since ${escapeHtml(t.since)}</span>` : ""}${t.synced_at ? `<span>synced ${escapeHtml(new Date(t.synced_at * 1000).toLocaleString())}</span>` : ""}</div>` : "";
+    const style = `<style>
+      .fsv-total{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:baseline;margin:0 0 14px;font-size:12px;color:var(--text-secondary,#8b93a1)}
+      .fsv-total strong{font-size:18px;color:var(--text-primary,#e6e9ef)}
+      .fsv-check{display:flex;flex-wrap:wrap;gap:8px 12px;align-items:center;margin:0 0 14px}
+      .fsv-list{display:flex;flex-direction:column;gap:8px}
+      .fsv-row{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(0,1.6fr) minmax(0,1fr);gap:16px;align-items:center;padding:12px 14px;border:1px solid var(--border-color,rgba(255,255,255,.08));border-radius:10px;background:rgba(255,255,255,.02)}
+      .fsv-row.off{opacity:.55}
+      .fsv-name{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-weight:600}
+      .fsv-tag{font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:2px 8px;border-radius:999px;border:1px solid}
+      .fsv-sub{font-size:11px;color:var(--text-muted,#6b7280);font-family:var(--font-mono,monospace);margin-top:3px;word-break:break-all}
+      .fsv-loc{font-size:12px;line-height:1.5}
+      .fsv-loc .fsv-sub{margin-top:0}
+      .fsv-bytes{font-family:var(--font-mono,monospace);font-size:13px;text-align:right}
+      .fsv-bar{height:4px;border-radius:2px;background:rgba(255,255,255,.08);margin-top:6px;overflow:hidden}
+      .fsv-bar i{display:block;height:100%;border-radius:2px}
+      @media(max-width:640px){.fsv-row{grid-template-columns:1fr}.fsv-bytes{text-align:left}}
+    </style>`;
+    const check = `<div class="fsv-check"><button class="btn btn-secondary" id="fsv-check-btn" type="button">Check account health</button><span id="fsv-check-result" class="fsv-sub"></span></div>`;
+    body.innerHTML = rows.length ? `${style}${totalLine}${check}<div class="fsv-list">${rows.map(r => {
+      const l = labels[r.name] || null;
+      const [cname, color] = l ? (CLIENT[l.client] || [l.client, "#64748b"]) : ["Unmapped", "#64748b"];
+      const reg = l ? formatRegion(l.country) : null;
+      const bytes = bytesOf(r);
+      const active = r.active_version != null;
+      return `<div class="fsv-row${active ? "" : " off"}">
+        <div>
+          <div class="fsv-name">${escapeHtml(r.name || "—")}<span class="fsv-tag" style="color:${color};border-color:${color}55;background:${color}1a">${escapeHtml(cname)}</span>${active ? `<span class="badge badge-status-running">v${r.active_version}</span>` : `<span class="badge">inactive</span>`}</div>
+          <div class="fsv-sub">${escapeHtml(r.id)}${r.comment ? ` · ${escapeHtml(r.comment)}` : ""}</div>
+        </div>
+        <div class="fsv-loc">${l ? `<div>${reg.flag || ""} <strong>${escapeHtml(l.panel)}</strong> · host #${l.host}</div><div class="fsv-sub">origin ${escapeHtml(l.origin)}</div>` : `<div class="fsv-sub">No config mapped to this service</div>`}</div>
+        <div><div class="fsv-bytes">${bytes ? formatBytes(bytes) : "—"}</div><div class="fsv-bar"><i style="width:${Math.round(bytes / max * 100)}%;background:${color}"></i></div></div>
+      </div>`;
+    }).join("")}</div>`
+      : `${check}<div class="quiet-state"><strong>No services</strong><p>This Fastly account has no CDN services yet.</p></div>`;
+    const btn = document.getElementById("fsv-check-btn");
+    if (btn) btn.onclick = async () => {
+      const out = document.getElementById("fsv-check-result");
+      btn.disabled = true;
+      out.textContent = "Probing the Fastly edge…";
+      try {
+        const r = await api("fastly_edge_check", { account_id: acc.id });
+        const label = { ok: "OK", dead: "DEAD", unconfigured: "Not set up", inconclusive: "Inconclusive" }[r.state] || r.state;
+        const detail = (r.checked || []).map(c => `${c.domain}: ${c.state}${c.http_status ? ` (HTTP ${c.http_status})` : ""}`).join(" · ");
+        out.textContent = `${label} — ${r.message}${detail ? ` ${detail}` : ""}`;
+      } catch (err) {
+        out.textContent = `Check failed: ${err.message}`;
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  } catch (err) {
+    body.innerHTML = `<div class="quiet-state"><strong>Could not load services</strong><p>${escapeHtml(err.message)}</p></div>`;
+  }
+}
+window.openFastlyServices = openFastlyServices;
+
 function filterAccountsByProvider(provider) {
   state.activeAccountFilter = provider;
+  state.accountTagFilter = "";
   state.accountSearchQuery = "";
   const input = document.getElementById("search-accounts-input");
   if (input) input.value = "";
@@ -1291,7 +1488,58 @@ function filterAccountsList() {
   renderAccountsManagement();
 }
 
+// Lifetime traffic per account, read from the traffic ledger on its own so it shows even when the billing check fails.
+const TRAFFIC_PROVIDERS = ["hetzner", "linode", "vultr", "fastly"];
+async function loadAccountTraffic(generation, refresh = false) {
+  state.accountTraffic = state.accountTraffic || {};
+  const accounts = (state.accounts || []).filter(a => TRAFFIC_PROVIDERS.includes(a.provider));
+  await Promise.all(accounts.map(async acc => {
+    try {
+      const res = await api("account_traffic", { account_id: acc.id, refresh }, { retryMode: "read" });
+      if (res && res.traffic) state.accountTraffic[acc.id] = res.traffic;
+    } catch (error) {
+      console.debug("Traffic unavailable for account", acc.id, error);
+    }
+  }));
+  if (syncManager.current(generation)) renderAllViews();
+}
+
+// Short "synced" stamp: time for today, date otherwise.
+function trafficSyncedText(ts) {
+  if (!ts) return "not synced";
+  const d = new Date(ts * 1000);
+  const today = d.toDateString() === new Date().toDateString();
+  return today ? d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+
+// Traffic is just the total and when it was last synced; the detail (out/in, errors) stays in the tooltip.
+function trafficCellHtml(t) {
+  if (!t || !t.items) return "";
+  const tip = `out ${formatBytes(t.out)}${t.in ? `, in ${formatBytes(t.in)}` : ""}${t.since ? ` · since ${t.since}` : ""}${t.error ? ` · ${t.error}` : ""}`;
+  return `<span class="traffic-value" title="${escapeHtml(tip)}">${escapeHtml(formatBytes(t.total))}</span><span class="traffic-synced">synced ${escapeHtml(trafficSyncedText(t.synced_at))}</span>`;
+}
+
+function accountTrafficHtml(accId) {
+  const h = trafficCellHtml(state.accountTraffic && state.accountTraffic[accId]);
+  return h ? `<div class="account-traffic">${h}</div>` : "";
+}
+
+function formatBytes(n) {
+  n = Number(n) || 0;
+  const u = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return `${i ? n.toFixed(n >= 100 ? 0 : 1) : n} ${u[i]}`;
+}
+
+// Billing details plus the lifetime traffic line (deleted servers and Fastly services included).
 function formatAccountBillingDetails(acc, b, fail) {
+  const d = formatAccountBillingDetailsBase(acc, b, fail);
+  const t = (b && b.info && b.info.traffic) || (state.accountTraffic && state.accountTraffic[acc.id]);
+  return t && t.items ? { ...d, trafficDisplay: trafficCellHtml(t) } : d;
+}
+
+function formatAccountBillingDetailsBase(acc, b, fail) {
   if (fail && (fail.kind !== 'suspended' || !b || !b.info)) {
     return {
       balanceDisplay: `<span class="text-danger font-bold text-xs">${escapeHtml(fail.title)}</span>`,
@@ -1418,6 +1666,31 @@ function formatAccountBillingDetails(acc, b, fail) {
     };
   }
 
+  if (acc.provider === "fastly") {
+    const info = b.info || {};
+    const n = info.services_count;
+    const label = n == null ? "Fastly CDN" : `${n} ${n === 1 ? 'service' : 'services'}`;
+    return {
+      balanceDisplay: `<span class="text-primary font-bold">${label}</span>`,
+      usageDisplay: null,
+      balanceText: label,
+      usageText: info.scope ? `Token scope: ${info.scope}` : null,
+      badge: null,
+      isCredit: false,
+    };
+  }
+
+  if (acc.provider === "gcore") {
+    return {
+      balanceDisplay: `<span class="text-primary font-bold">Gcore</span>`,
+      usageDisplay: `<span class="text-secondary font-mono text-xs">Gcore Cloud project</span>`,
+      balanceText: "Gcore",
+      usageText: "Gcore Cloud project",
+      badge: `<span class="badge badge-upcloud font-mono text-xs">Gcore</span>`,
+      isCredit: false,
+    };
+  }
+
   if (acc.provider === "cloudferro") {
     const absolute = (b.limits && b.limits.limits) || {};
     const usage = (b.limits && b.limits.usage) || {};
@@ -1450,7 +1723,8 @@ function formatAccountBillingDetails(acc, b, fail) {
 function renderAccountsManagement() {
   const container = document.getElementById("accounts-master-grid");
   if (!container) return;
-  const showProviders = !state.activeAccountFilter || state.activeAccountFilter === "all";
+  renderAccountTagBar();
+  const showProviders = (!state.activeAccountFilter || state.activeAccountFilter === "all") && !state.accountTagFilter;
   const toolbar = document.getElementById("account-list-toolbar");
   if (toolbar) toolbar.hidden = showProviders;
   if (showProviders) {
@@ -1462,16 +1736,17 @@ function renderAccountsManagement() {
       return `<button class="account-provider-card" style="--provider-color: ${provider.color}" onclick="filterAccountsByProvider('${key}')">
         <span class="account-provider-brand"><span class="account-provider-logo"><img src="${provider.logo}" alt="" width="48" height="48"></span><span class="account-provider-arrow" aria-hidden="true">↗</span></span>
         <strong class="account-provider-name">${provider.name}</strong>
-        <span class="account-provider-counts">${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}<span aria-hidden="true"> · </span>${servers.length} ${servers.length === 1 ? 'server' : 'servers'}</span>
+        <span class="account-provider-counts">${accounts.length} ${accounts.length === 1 ? 'account' : 'accounts'}<span aria-hidden="true"> · </span>${provider.cdn ? 'CDN' : `${servers.length} ${servers.length === 1 ? 'server' : 'servers'}`}</span>
         <span class="account-provider-footer"><span>${issues ? `${issues} ${issues === 1 ? 'account needs' : 'accounts need'} attention` : 'View accounts'}</span><span aria-hidden="true">→</span></span>
       </button>`;
     }).join("")}</div>` : `<div class="quiet-state"><strong>Connect your first provider</strong><p>Add a cloud account to see its provider here.</p><button class="btn btn-primary" onclick="openAddAccountModal()">+ Add account</button></div>`;
     return;
   }
   const title = document.getElementById("account-list-title");
-  if (title) title.textContent = PROVIDERS[state.activeAccountFilter]?.name || "Accounts";
+  if (title) title.textContent = state.accountTagFilter ? `Group: ${state.accountTagFilter}` : (PROVIDERS[state.activeAccountFilter]?.name || "Accounts");
 
   let filtered = state.accounts;
+  if (state.accountTagFilter) filtered = filtered.filter(a => (a.tags || []).includes(state.accountTagFilter));
   if (state.activeAccountFilter && state.activeAccountFilter !== "all") {
     filtered = filtered.filter(a => a.provider === state.activeAccountFilter);
   }
@@ -1482,7 +1757,8 @@ function renderAccountsManagement() {
       String(a.id).includes(q) ||
       (a.region && a.region.toLowerCase().includes(q)) ||
       (a.proxy_masked && a.proxy_masked.toLowerCase().includes(q)) ||
-      (a.note && a.note.toLowerCase().includes(q))
+      (a.note && a.note.toLowerCase().includes(q)) ||
+      (a.tags || []).some(t => t.includes(q))
     );
   }
 
@@ -1516,6 +1792,8 @@ function renderAccountsManagement() {
         ) : "";
 
         let subBillingText = latPill || (isOk ? 'Access verified' : 'Not checked yet');
+        const syncedAgo = b && b.checkedAt ? `<span class="text-tertiary text-xs account-synced" data-synced-at="${b.checkedAt}" title="${escapeHtml(new Date(b.checkedAt).toLocaleString())}">synced ${formatRelativeTime(b.checkedAt)}</span>` : '';
+        if (syncedAgo && !fail) subBillingText = `${subBillingText} ${syncedAgo}`;
         if (fail) {
           subBillingText = `<span class="text-danger font-mono text-xs" title="${escapeHtml(fail.error)}">${escapeHtml(fail.error.length > 40 ? fail.error.substring(0, 38) + '…' : fail.error)}</span>`;
         }
@@ -1549,6 +1827,7 @@ function renderAccountsManagement() {
                 <div class="account-clean-title">
                   <span class="account-clean-label" title="${escapeHtml(acc.label)}">${escapeHtml(acc.label)}</span>
                   ${fail && fail.kind === 'suspended' ? '<span class="badge badge-danger">Suspended</span>' : ''}
+                  ${state.servers?.some(s => String(s.account_id) === String(acc.id) && s.ip_blocked) ? '<span class="badge badge-danger">Provider blocked IPs</span>' : ''}
                   ${hasChecked ? (
                     isOk ? `<span class="status-dot online" title="Verified"></span>` :
                     `<span class="status-dot offline" title="${escapeHtml((fail ? fail.error : b.error) || 'Connection Error')}"></span>`
@@ -1557,6 +1836,7 @@ function renderAccountsManagement() {
                 <div class="account-clean-sub text-xs text-muted font-mono">
                   #${acc.id} · ${p.name}
                 </div>
+                <div class="account-clean-tags">${tagChipsHtml(acc.tags, true)}<button type="button" class="tag-add-btn" onclick="openEditTagsModal(${acc.id})" title="Edit tags">${(acc.tags || []).length ? icon('edit') : '+ Add tag'}</button></div>
                 <button type="button" class="account-clean-note${acc.note ? '' : ' empty'}" onclick="openEditNoteModal(${acc.id})" title="${acc.note ? 'Click to edit note' : 'Add a note'}">${acc.note ? `${icon('edit')}<span>${escapeHtml(acc.note)}</span>` : '+ Add note'}</button>
               </div>
             </div>
@@ -1583,17 +1863,21 @@ function renderAccountsManagement() {
                 <button class="btn-icon-subtle" id="btn-refresh-billing-${acc.id}" onclick="refreshSingleAccountBilling(${acc.id}, this)" title="Refresh account billing & test proxy" aria-label="Refresh account">${icon('refresh')}</button>
               </div>
               <div class="text-xs text-secondary mt-0.5">${subBillingText}</div>
+              ${accountTrafficHtml(acc.id)}
             </div>
 
             <!-- Col 5: Actions -->
             <div class="account-clean-actions">
               <button class="btn btn-secondary btn-sm" onclick="openEditAccountModal(${acc.id})">Edit account</button>
-              <button class="btn btn-secondary btn-sm" onclick="navigateToAccount('${acc.provider}', ${acc.id})">Servers (${state.servers.filter(s => s.account_id === acc.id).length})</button>
+              ${acc.provider === "fastly"
+                ? `<button class="btn btn-secondary btn-sm" onclick="openFastlyServices(${acc.id})">Services</button>`
+                : `<button class="btn btn-secondary btn-sm" onclick="navigateToAccount('${acc.provider}', ${acc.id})">Servers (${state.servers.filter(s => s.account_id === acc.id).length})</button>`}
               <details class="row-more"><summary class="btn btn-secondary btn-sm" aria-label="More actions for ${escapeHtml(acc.label)}">More ▾</summary><div class="row-more-menu">
                 <button class="btn btn-secondary btn-sm" onclick="openEditNoteModal(${acc.id})">${acc.note ? 'Edit note' : 'Add note'}</button>
                 <button class="btn btn-secondary btn-sm" id="btn-test-proxy-${acc.id}" onclick="testSingleAccountProxy(${acc.id}, this)">Check connection</button>
                 ${fail && fail.isProxy && acc.has_proxy ? `<button class="btn btn-warning btn-sm" id="btn-replace-proxy-${acc.id}" onclick="replaceAccountProxy(${acc.id}, this)">Replace failed session</button>` : ''}
-                <button class="btn btn-secondary btn-sm" onclick="openDeployModalForAccount(${acc.id}, '${acc.provider}')">Create server</button>
+                <button class="btn btn-secondary btn-sm" onclick="openEditTagsModal(${acc.id})">Edit tags</button>
+                ${acc.provider === "fastly" ? '' : `<button class="btn btn-secondary btn-sm" onclick="openDeployModalForAccount(${acc.id}, '${acc.provider}')">Create server</button>`}
                 ${acc.provider === "linode" ? `<button class="btn btn-secondary btn-sm" onclick="openLinodePromoModal(${acc.id})">Apply promo code</button>` : ''}
                 <button class="btn btn-danger btn-sm" onclick="deleteAccount(${acc.id}, '${escapeHtml(acc.label)}')">Remove account</button>
               </div></details>
@@ -1823,9 +2107,48 @@ function openEditAccountModal(accId) {
   document.getElementById("edit-account-id").value = acc.id;
   document.getElementById("edit-account-name").value = acc.label;
   document.getElementById("edit-account-token").value = "";
+  resetAccountTokenView();
   openModal("modal-edit-account");
 }
 window.openEditAccountModal = openEditAccountModal;
+
+let revealedAccountToken = "";
+
+function resetAccountTokenView() {
+  revealedAccountToken = "";
+  const view = document.getElementById("edit-account-token-view");
+  if (view) view.textContent = "••••••••••••••••";
+  const show = document.getElementById("btn-reveal-account-token");
+  if (show) { show.textContent = "Show"; show.onclick = revealAccountToken; }
+  document.getElementById("btn-copy-account-token")?.classList.add("hidden");
+}
+
+function revealAccountToken() {
+  const accId = Number(document.getElementById("edit-account-id").value);
+  if (!accId) return;
+  confirmAction("Reveal the stored API token for this account?", "SHOW_TOKEN", async () => {
+    try {
+      const res = await api("account_token", { account_id: accId, confirm: "SHOW_TOKEN" });
+      revealedAccountToken = String(res.token || "");
+      document.getElementById("edit-account-token-view").textContent = revealedAccountToken || "(empty)";
+      const show = document.getElementById("btn-reveal-account-token");
+      show.textContent = "Hide";
+      show.onclick = resetAccountTokenView;
+      document.getElementById("btn-copy-account-token")?.classList.remove("hidden");
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
+}
+window.revealAccountToken = revealAccountToken;
+
+function copyAccountToken() {
+  if (!revealedAccountToken) return;
+  navigator.clipboard.writeText(revealedAccountToken)
+    .then(() => showToast("API token copied.", "info"))
+    .catch(() => showToast("Could not copy the token.", "error"));
+}
+window.copyAccountToken = copyAccountToken;
 
 function openEditNoteModal(accId) {
   const acc = state.accounts.find(a => a.id === Number(accId));
@@ -2309,6 +2632,7 @@ function selectProviderAccount(provider, accountId) {
   else if (provider === "vultr") renderVultrHub();
   else if (provider === "linode") renderLinodeHub();
   else if (provider === "cloudferro") renderCloudferroHub();
+  else if (provider === "gcore") renderGcoreHub();
   else if (provider === "upcloud") renderUpcloudHub();
 }
 
@@ -2482,6 +2806,7 @@ function renderProviderHubView(provider) {
             <tr><td>Proxy:</td><td class="font-mono text-xs">${escapeHtml(proxyLabel)}</td></tr>
             <tr><td>Credit / Balance:</td><td>${bDetails.balanceDisplay}</td></tr>
             ${bDetails.usageDisplay ? `<tr><td>Usage / Pending:</td><td>${bDetails.usageDisplay}</td></tr>` : ''}
+            ${bDetails.trafficDisplay ? `<tr><td>Traffic:</td><td class="traffic-cell">${bDetails.trafficDisplay}</td></tr>` : ''}
             <tr><td>Status:</td><td>${fail ? `<span class="text-danger font-bold text-xs"><span class="status-dot offline"></span> ${escapeHtml(fail.title)}</span>` : `<span class="text-success text-xs"><span class="status-dot online"></span> Connected</span>`}</td></tr>
             ${b && b.latency_ms !== undefined ? `<tr><td>Latency:</td><td class="font-mono text-xs text-secondary">${b.latency_ms}ms</td></tr>` : ''}
             ${fail ? `<tr><td>Details:</td><td class="text-danger font-mono text-xs" style="word-break: break-all;">${escapeHtml(fail.error.length > 70 ? fail.error.substring(0, 68) + '…' : fail.error)}</td></tr>` : ''}
@@ -2560,6 +2885,8 @@ function renderProviderHubView(provider) {
     const attachedCount = allAccountIps.filter(x => x.serverId).length;
     const unassignedCount = totalAccountIps - attachedCount;
 
+    const lockedCount = state.servers.filter(s => String(s.account_id) === String(acc.id) && s.locked).length;
+    const blockedCount = state.servers.filter(s => String(s.account_id) === String(acc.id) && s.ip_blocked).length;
     let html = `
       <div class="account-drilldown-header">
         <div class="flex items-center gap-3">
@@ -2572,6 +2899,8 @@ function renderProviderHubView(provider) {
             <h2 class="text-lg font-bold text-primary">${escapeHtml(acc.label)}</h2>
             <span class="badge ${p.badgeClass}">ID: ${acc.id}</span>
             ${fail ? `<span class="badge badge-danger">${escapeHtml(fail.title)}</span>` : '<span class="badge badge-status-running"><span class="w-1.5 h-1.5 rounded-full bg-success"></span> Connected</span>'}
+            ${lockedCount ? `<span class="badge badge-danger" title="${escapeHtml(LOCKED_SERVER_HINT)}">${lockedCount} locked server${lockedCount > 1 ? 's' : ''}</span>` : ''}
+            ${blockedCount ? `<span class="badge badge-danger" title="${escapeHtml(BLOCKED_IP_HINT)}">Provider blocked IPs on ${blockedCount} server${blockedCount > 1 ? 's' : ''}</span>` : ''}
             ${bDetails.badge ? bDetails.badge : ''}
           </div>
         </div>
@@ -2617,6 +2946,13 @@ function renderProviderHubView(provider) {
           <div class="flex items-center gap-1.5">
             <span class="text-tertiary">Usage / Pending:</span>
             <strong>${bDetails.usageDisplay}</strong>
+          </div>
+        ` : ''}
+        ${bDetails.trafficDisplay ? `
+          <span>•</span>
+          <div class="flex items-center gap-1.5">
+            <span class="text-tertiary">Traffic:</span>
+            <strong class="traffic-cell">${bDetails.trafficDisplay}</strong>
           </div>
         ` : ''}
         ${b && b.latency_ms !== undefined ? `
@@ -2950,6 +3286,7 @@ function renderProviderHubView(provider) {
                                     <span class="copy-hint" title="Copy IP">${icon('copy')}</span>
                                   </span>
                                   ${p.name ? `<span class="badge badge-secondary text-xs">${escapeHtml(p.name)}</span>` : ''}
+                                  ${p.blocked ? '<span class="badge badge-danger">Provider blocked</span>' : ''}
                                 </div>
                               </td>
                               <td><span class="badge text-xs uppercase">${escapeHtml(p.type || 'ipv4')}</span></td>
@@ -3011,12 +3348,27 @@ function renderCloudferroHub() {
   renderProviderHubView("cloudferro");
 }
 
+function renderGcoreHub() {
+  renderProviderHubView("gcore");
+}
+
 // ---- ALL COMPUTE TABLE ----
 function renderAllCompute() {
   const provider = document.getElementById("filter-all-provider").value;
   const query = (document.getElementById("search-servers")?.value || "").trim().toLowerCase();
   const status = document.getElementById("filter-server-status")?.value || "all";
+  const tagSel = document.getElementById("filter-server-tag");
+  if (tagSel) {
+    const tags = allAccountTags();
+    const keep = tags.some(([t]) => t === tagSel.value) ? tagSel.value : "all";
+    tagSel.innerHTML = `<option value="all">All groups</option>` + tags.map(([t, n]) => `<option value="${escapeHtml(t)}">${escapeHtml(t)} (${n})</option>`).join("");
+    tagSel.value = keep;
+    tagSel.hidden = tags.length === 0;
+  }
+  const tagFilter = tagSel && tagSel.value !== "all" ? tagSel.value : "";
+  const tagAccountIds = tagFilter ? new Set(state.accounts.filter(a => (a.tags || []).includes(tagFilter)).map(a => a.id)) : null;
   const servers = state.servers.filter(s => (provider === "all" || s.provider === provider) &&
+    (!tagAccountIds || tagAccountIds.has(s.account_id)) &&
     (status === "all" || (status === "running" ? isServerRunning(s.status) : !isServerRunning(s.status))) &&
     [s.name, s.label, s.ip, s.id, s.account_label, s.region, ...(s.floating_ips || []).map(f => f.ip)].some(value => String(value || "").toLowerCase().includes(query)));
   const summary = document.getElementById("compute-summary");
@@ -3075,6 +3427,8 @@ function renderServerRow(s, showProviderCol = true, showFipsCol = true, showChec
       </td>
       <td class="cell-status">
         <span class="status-text" data-tone="${serverStatusTone(s.status)}">${escapeHtml(serverStatusLabel(s.status))}</span>
+        ${s.locked ? `<span class="badge badge-danger" title="${escapeHtml(LOCKED_SERVER_HINT)}">Locked</span>` : ''}
+        ${s.ip_blocked ? `<span class="badge badge-danger" title="${escapeHtml(BLOCKED_IP_HINT + ' ' + (s.blocked_ips || []).join(', '))}">Provider blocked</span>` : ''}
       </td>
       ${showProviderCol ? `
       <td class="cell-provider">
@@ -3493,7 +3847,7 @@ function renderIPManagement() {
             <td style="width: 38px; text-align: center;" onclick="event.stopPropagation()">
               <input type="checkbox" class="cb-ip-select" data-acc-id="${p.account_id}" data-ip-id="${p.id}" data-ip="${escapeHtml(p.ip)}" data-type="primary" ${isSelected ? 'checked' : ''} onchange="toggleIpSelection(${p.account_id}, '${p.id}', '${escapeHtml(p.ip)}', 'primary', this)">
             </td>
-            <td><code class="font-mono text-sm font-bold text-primary">${escapeHtml(p.ip)}</code></td>
+            <td><code class="font-mono text-sm font-bold text-primary">${escapeHtml(p.ip)}</code> ${p.blocked ? '<span class="badge badge-danger">Provider blocked</span>' : ''}</td>
             <td><span class="badge text-xs uppercase">${p.type}</span></td>
             <td><span class="text-xs text-secondary">${escapeHtml(p.account_label || '')}</span></td>
             <td>${escapeHtml(p.datacenter || '—')}</td>
@@ -3969,6 +4323,7 @@ const ROUTE_MAP = {
   "/linode": "tab-linode",
   "/upcloud": "tab-upcloud",
   "/cloudferro": "tab-cloudferro",
+  "/gcore": "tab-gcore",
   "/compute": "tab-compute",
   "/ips": "tab-ips",
   "/ssh": "tab-ssh",
@@ -3987,6 +4342,7 @@ const TAB_TO_ROUTE = {
   "tab-linode": "/linode",
   "tab-upcloud": "/upcloud",
   "tab-cloudferro": "/cloudferro",
+  "tab-gcore": "/gcore",
   "tab-compute": "/compute",
   "tab-ips": "/ips",
   "tab-ssh": "/ssh",
@@ -4048,7 +4404,8 @@ function initNavigation() {
   // Handle browser back and forward buttons
   window.addEventListener("popstate", (e) => {
     const tabId = (e.state && e.state.tabId) || ROUTE_MAP[window.location.pathname] || "tab-overview";
-    switchTab(tabId, false);
+    if (tabId !== state.activeTab) switchTab(tabId, false);
+    syncServerPageFromHash();
   });
 
   // Switch to initial tab from address bar URL
@@ -4056,9 +4413,13 @@ function initNavigation() {
   if (ROUTE_MAP[initialPath]) {
     switchTab(ROUTE_MAP[initialPath], false);
   }
+  if (SERVER_PAGE_RE.test(window.location.hash)) syncServerPageFromHash();
 }
 
 function switchTab(tabId, pushState = true) {
+  if (document.getElementById("modal-server-details")?.classList.contains("open")) {
+    closeModal("modal-server-details");
+  }
   state.activeTab = tabId;
   const tools = document.querySelector(".nav-disclosure .nav-item[data-tab='" + tabId + "']")?.closest("details");
   if (tools) tools.open = true;
@@ -4086,6 +4447,7 @@ function switchTab(tabId, pushState = true) {
     "tab-linode": "Linode",
     "tab-upcloud": "UpCloud",
     "tab-cloudferro": "CloudFerro",
+    "tab-gcore": "Gcore",
     "tab-compute": "Servers",
     "tab-ips": "IP addresses",
     "tab-ssh": "SSH keys",
@@ -4113,6 +4475,7 @@ function switchTab(tabId, pushState = true) {
   if (tabId === "tab-linode") renderLinodeHub();
   if (tabId === "tab-upcloud") renderUpcloudHub();
   if (tabId === "tab-cloudferro") renderCloudferroHub();
+  if (tabId === "tab-gcore") renderGcoreHub();
   if (tabId === "tab-compute") renderAllCompute();
   if (tabId === "tab-ips") renderIPManagement();
   if (tabId === "tab-ssh") renderSSHKeys();
@@ -4680,7 +5043,7 @@ function updateDeployProviderPicker(prov, preferredAccId = null) {
   });
 
   // Update account count badges
-  ["hetzner", "vultr", "linode", "upcloud", "cloudferro"].forEach(p => {
+  ["hetzner", "vultr", "linode", "upcloud", "cloudferro", "gcore"].forEach(p => {
     const el = document.getElementById(`deploy-prov-count-${p}`);
     if (el) {
       const cnt = (state.accounts || []).filter(a => a.provider === p).length;
@@ -4759,7 +5122,7 @@ function initModals() {
 
   document.querySelectorAll(".modal-backdrop").forEach(backdrop => {
     backdrop.addEventListener("click", (e) => {
-      if (e.target === backdrop) closeModal(backdrop.id);
+      if (e.target === backdrop && backdrop.id !== "modal-server-details") closeModal(backdrop.id);
     });
   });
 
@@ -4769,6 +5132,7 @@ function initModals() {
     else if (state.activeTab === "tab-linode") prov = "linode";
     else if (state.activeTab === "tab-upcloud") prov = "upcloud";
     else if (state.activeTab === "tab-cloudferro") prov = "cloudferro";
+    else if (state.activeTab === "tab-gcore") prov = "gcore";
     else if (state.deploySelectedProvider) prov = state.deploySelectedProvider;
 
     const matching = (state.accounts || []).filter(a => a.provider === prov);
@@ -4860,11 +5224,46 @@ function closeModal(id) {
   if (el) el.classList.remove("open");
   if (id === "modal-edit-account") {
     document.getElementById("edit-account-token").value = "";
+    resetAccountTokenView();
   }
   if (id === "modal-server-details") {
     clearServerModalFipSelection();
+    leaveServerPage();
   }
 }
+
+// The server detail view is a page: #server/<account>/<server> in the address bar.
+const SERVER_PAGE_RE = /^#server\/([^/]+)\/(.+)$/;
+
+function enterServerPage(accId, srvId) {
+  const hash = `#server/${encodeURIComponent(accId)}/${encodeURIComponent(srvId)}`;
+  if (window.location.hash !== hash) {
+    window.history.pushState({ ...(window.history.state || {}), serverPage: true }, "", hash);
+  }
+}
+
+function leaveServerPage() {
+  if (!SERVER_PAGE_RE.test(window.location.hash)) return;
+  window.history.replaceState(window.history.state, "", window.location.pathname + window.location.search);
+}
+
+function syncServerPageFromHash() {
+  const m = SERVER_PAGE_RE.exec(window.location.hash);
+  const page = document.getElementById("modal-server-details");
+  if (!m) {
+    if (page && page.classList.contains("open")) {
+      page.classList.remove("open");
+      clearServerModalFipSelection();
+    }
+    return;
+  }
+  const accId = decodeURIComponent(m[1]);
+  const srvId = decodeURIComponent(m[2]);
+  if (page && page.classList.contains("open") &&
+      String(currentServerModalSrvId) === srvId && String(currentServerModalAccId) === accId) return;
+  openServerDetailsModal(Number(accId) || accId, srvId, !state.servers.length);
+}
+window.addEventListener("hashchange", syncServerPageFromHash);
 
 function openAddAccountModal(prov) {
   openModal("modal-add-account");
@@ -4881,6 +5280,7 @@ function openAddAccountModal(prov) {
   }
   const noteInput = document.getElementById("acc-note");
   if (noteInput) noteInput.value = "";
+  mountTagEditor("acc-tags-editor", []);
   updateCloudCredentialHint();
   populateAddAccProxyProviders();
   const hasPool = (state.proxyProviders || []).some(p => p.enabled);
@@ -4910,7 +5310,11 @@ function updateCloudCredentialHint() {
     input.classList.remove("hidden");
     if (fields) fields.classList.add("hidden");
     input.placeholder = "Paste provider API token";
-    help.textContent = "Your provider API token is encrypted when saved.";
+    help.textContent = provider === "gcore"
+      ? "Gcore permanent API token (Profile → API tokens). Add :PROJECT_ID after it to pick a project; otherwise the default project is used."
+      : provider === "fastly"
+      ? "Fastly API token (Account → Personal profile → API tokens). Read access is enough; it is encrypted when saved."
+      : "Your provider API token is encrypted when saved.";
   }
 }
 window.updateCloudCredentialHint = updateCloudCredentialHint;
@@ -5122,6 +5526,11 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null, upcl
   const badge = document.getElementById("srvmodal-status-badge");
   badge.className = `badge ${isRunning ? 'badge-status-running' : 'badge-status-off'}`;
   badge.innerHTML = `<span class="w-1.5 h-1.5 rounded-full ${isRunning ? 'bg-success' : 'bg-muted'}"></span> ${s.status || (isRunning ? 'running' : 'stopped')}`;
+  const lockBanner = document.getElementById("srvmodal-lock-banner");
+  if (lockBanner) {
+    lockBanner.classList.toggle("hidden", !s.locked && !s.ip_blocked);
+    lockBanner.textContent = [s.locked ? LOCKED_SERVER_HINT : "", s.ip_blocked ? `${BLOCKED_IP_HINT} Blocked: ${(s.blocked_ips || []).join(', ')}` : ""].filter(Boolean).join(" ");
+  }
 
   // Account & Provider
   const accPill = document.getElementById("srvmodal-account-pill");
@@ -5214,6 +5623,8 @@ function populateServerModalData(s, fips = [], pips = [], linodeNet = null, upcl
     pwPreview.textContent = "Not stored in vault";
     pwFull.textContent = "Not stored in vault";
   }
+
+  loadRebuildOptions(s);
 
   // Hetzner Reset Password Box
   const hetzResetBox = document.getElementById("srvmodal-hetzner-reset-box");
@@ -5455,6 +5866,7 @@ async function openServerDetailsModal(accId, srvId, forceRefresh = false) {
 
   switchSrvModalTab("overview");
   openModal("modal-server-details");
+  enterServerPage(accId, srvId);
 
   if (!forceRefresh) {
     if (!cachedSrv) {
@@ -5540,6 +5952,58 @@ async function savePasswordFromModal(e) {
       showToast(err.message, "error");
     }
   }, "Saving...");
+}
+
+const REBUILD_PROVIDERS = ["hetzner", "linode", "vultr"];
+
+async function loadRebuildOptions(s) {
+  const box = document.getElementById("srvmodal-rebuild-box");
+  const sel = document.getElementById("srvmodal-rebuild-image");
+  if (!box || !sel) return;
+  const ok = REBUILD_PROVIDERS.includes(s.provider);
+  box.classList.toggle("hidden", !ok);
+  document.getElementById("btn-srvmodal-rebuild-jump")?.classList.toggle("hidden", !ok);
+  if (!ok) return;
+  const note = document.getElementById("srvmodal-rebuild-note");
+  if (s.provider === "vultr") {
+    sel.classList.add("hidden");
+    note.textContent = "Reinstalls the current operating system and wipes the disk. All data on this server is lost; the IP stays.";
+    return;
+  }
+  sel.classList.remove("hidden");
+  note.textContent = "Wipes the disk and installs the chosen operating system. All data is lost; the IP stays. A new root password is generated and saved to the vault.";
+  const accId = currentServerModalAccId;
+  try {
+    const res = await api("images", { account_id: accId });
+    if (String(currentServerModalAccId) !== String(accId)) return;
+    sel.innerHTML = (res.images || []).map(i => `<option value="${escapeHtml(i.id)}">${escapeHtml(i.label)}</option>`).join("");
+  } catch (err) {
+    sel.innerHTML = "";
+  }
+}
+
+async function rebuildServerFromModal() {
+  if (!currentServerModal || !currentServerModal.server) return;
+  const s = currentServerModal.server;
+  const sel = document.getElementById("srvmodal-rebuild-image");
+  const image = s.provider === "vultr" ? "" : sel.value;
+  if (s.provider !== "vultr" && !image) { showToast("Choose an image first.", "error"); return; }
+  const accId = currentServerModalAccId, srvId = currentServerModalSrvId;
+  confirmAction(`REBUILD ${s.name || s.label || srvId}? The disk is wiped and the OS reinstalled. This cannot be undone.`, "REBUILD", async () => {
+    try {
+      const res = await api("rebuild_server", { account_id: accId, server_id: srvId, image, confirm: "REBUILD" });
+      if (res.password) {
+        currentServerModalPw = res.password;
+        document.getElementById("srvmodal-preview-password").textContent = res.password;
+        document.getElementById("srvmodal-full-password").textContent = res.password;
+      }
+      showToast("Rebuild started. The server will be back in a few minutes.", "success");
+      setTimeout(refreshCurrentServerDetailsModal, 3000);
+      loadAll();
+    } catch (err) {
+      showToast(err.message, "error");
+    }
+  });
 }
 
 async function resetRootPasswordForServer() {
@@ -6560,13 +7024,15 @@ function initForms() {
         if (note) {
           payload.note = note;
         }
+        const newTags = readTagEditor("acc-tags-editor");
+        if (newTags.length) payload.tags = newTags;
         if (proxyType === "custom") {
           payload.proxy = proxy;
         } else if (proxyType === "pool") {
           payload.proxy_provider_id = proxyProviderId;
         }
         const res = await api("add_account", payload);
-        let msg = `Account ${label} added successfully!`;
+        let msg = `Account ${label} connected and verified.`;
         if (res.allocated_proxy) {
           msg += ` Allocated proxy for ${getCountryFlag(res.allocated_proxy.country || region)} ${res.allocated_proxy.country || region}.`;
         }
@@ -6850,6 +7316,29 @@ function initForms() {
           showToast(err.message, "error");
         }
       }, payload.token ? "Checking token..." : "Saving...");
+    });
+  }
+
+  const formEditTags = document.getElementById("form-edit-account-tags");
+  if (formEditTags) {
+    formEditTags.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const accId = Number(document.getElementById("edit-tags-account-id").value);
+      const tags = readTagEditor("edit-tags-editor");
+      await runWithButtonLoading(document.getElementById("btn-save-account-tags"), async () => {
+        try {
+          const res = await api("set_account_tags", { account_id: accId, tags });
+          const idx = state.accounts.findIndex(a => a.id === accId);
+          if (idx >= 0 && res.account) state.accounts[idx] = res.account;
+          closeModal("modal-edit-tags");
+          if (state.accountTagFilter && !allAccountTags().some(([t]) => t === state.accountTagFilter)) state.accountTagFilter = "";
+          renderAccountsManagement();
+          renderAllCompute();
+          showToast(tags.length ? "Tags saved." : "Tags cleared.", "success");
+        } catch (err) {
+          showToast(err.message, "error");
+        }
+      }, "Saving...");
     });
   }
 

@@ -34,6 +34,12 @@ async def list_accounts() -> dict:
 
 
 @mcp.tool()
+async def account_traffic(account_id: int, refresh: bool = False) -> dict:
+    """Bytes moved over the whole life of an account (deleted servers and Fastly services included). refresh=true reads the provider now."""
+    return await _call("account_traffic", account_id=account_id, refresh=refresh)
+
+
+@mcp.tool()
 async def account_info(account_id: int) -> dict:
     """Check a cloud account's access and balance/credit details."""
     return await _call("account_info", account_id=account_id)
@@ -257,6 +263,15 @@ async def update_floating_ip(account_id: int, floating_id: str, ip: str = "",
     return await _call("update_floating_ip", **args)
 
 
+# ---- Gcore firewall ---------------------------------------------------------
+
+@mcp.tool()
+async def gcore_open_firewall(account_id: int, region: str = "") -> dict:
+    """Allow all inbound traffic (IPv4/IPv6, any protocol) on a Gcore account's default
+    security group. Applies to one region id, or every region when region is empty. Idempotent."""
+    return await _call("gcore_open_firewall", account_id=account_id, region=region)
+
+
 # ---- Hetzner Primary IPs ----------------------------------------------------
 
 @mcp.tool()
@@ -332,11 +347,11 @@ async def delete_dns_record(zone_id: str, record_id: str, confirm: str) -> dict:
 async def add_account(label: str, provider: str, token: str, region: str = "",
                       proxy: str = "", proxy_provider_id: str = "",
                       proxy_family: str = "default", auto_backup: str = "disabled",
-                      note: str = "") -> dict:
-    """Add a cloud account (provider: linode, vultr, hetzner, upcloud, cloudferro). region is a country code like ES. Give proxy_provider_id (an id from proxy_pool, or "auto") to bind a pool proxy for that region, or a raw proxy string; note is an optional memo; token is stored encrypted."""
+                      note: str = "", tags: str = "") -> dict:
+    """Add a cloud account (provider: linode, vultr, hetzner, upcloud, cloudferro, gcore, fastly; for gcore the token is an API token, optionally TOKEN:PROJECT_ID; for fastly the token is a Fastly API token). region is a country code like ES. Give proxy_provider_id (an id from proxy_pool, or "auto") to bind a pool proxy for that region, or a raw proxy string; note is an optional memo; tags is a comma-separated list of group labels (e.g. "prod,client-x"); token is stored encrypted."""
     args = {"label": label, "provider": provider, "token": token,
             "proxy_family": proxy_family, "auto_backup": auto_backup}
-    for key, value in (("region", region), ("proxy", proxy), ("proxy_provider_id", proxy_provider_id), ("note", note)):
+    for key, value in (("region", region), ("proxy", proxy), ("proxy_provider_id", proxy_provider_id), ("note", note), ("tags", tags)):
         if value:
             args[key] = value
     return await _call("add_account", **args)
@@ -346,6 +361,30 @@ async def add_account(label: str, provider: str, token: str, region: str = "",
 async def set_account_note(account_id: int, note: str) -> dict:
     """Set or update an account's note/memo."""
     return await _call("set_account_note", account_id=account_id, note=note)
+
+
+@mcp.tool()
+async def set_account_tags(account_id: int, tags: str) -> dict:
+    """Replace an account's tags (group labels). tags is comma-separated, e.g. "prod,client-x"; max 8, lowercase, up to 24 chars each. Empty string clears them. list_accounts returns each account's tags."""
+    return await _call("set_account_tags", account_id=account_id, tags=tags)
+
+
+@mcp.tool()
+async def fastly_ensure_canary(account_id: int) -> dict:
+    """Create the tiny always-active canary service on a Fastly account (add_account does this automatically). Once present, a dead account shows up as suspended in health checks and alerts."""
+    return await _call("fastly_ensure_canary", account_id=account_id)
+
+
+@mcp.tool()
+async def fastly_edge_check(account_id: int) -> dict:
+    """Check whether a Fastly account really serves traffic: probes the Fastly edge for its active services. state is ok, dead (edge says Domain Not Found), unconfigured (no active service) or inconclusive (edge unreachable). A working API token alone does not prove the account is alive."""
+    return await _call("fastly_edge_check", account_id=account_id)
+
+
+@mcp.tool()
+async def fastly_services(account_id: int) -> dict:
+    """List the Fastly CDN services (id, name, active version, version count) of a Fastly account, using the account's bound proxy."""
+    return await _call("fastly_services", account_id=account_id)
 
 
 @mcp.tool()

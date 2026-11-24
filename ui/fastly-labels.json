@@ -1,0 +1,13 @@
+{
+  "_note": "Keyed by Fastly service name (stays the same when a service is rebuilt). Host ids/countries verified against the PasarGuard panels 2026-11-22; origin = backend node ip:port from memory/20-providers/fastly. Update when a host moves.",
+  "taqnz-t81hwhdh": {"client": "flow", "panel": "Flowship", "host": 51,  "country": "DE", "origin": "167.233.251.47:49317"},
+  "2skdb-2vm83t95": {"client": "flow", "panel": "Flowship", "host": 15,  "country": "US", "origin": "66.175.215.81:48930"},
+  "5zo25-mfz39haq": {"client": "flow", "panel": "Flowship", "host": 26,  "country": "DE", "origin": "167.233.96.140:51463"},
+  "plmig-hz3ke6i7": {"client": "flow", "panel": "Flowship", "host": 69,  "country": "DE", "origin": "167.233.96.140:51463"},
+  "6my9u-mrjzp0er": {"client": "flow", "panel": "Flowship", "host": 71,  "country": "GB", "origin": "172.239.115.69:51463"},
+  "yqixv-kodvk4f5": {"client": "flow", "panel": "Flowship", "host": 89,  "country": "NL", "origin": "172.239.236.53:51463"},
+  "mtv74-vzewba3a": {"client": "lexo", "panel": "Lexo",     "host": 160, "country": "FR", "origin": "172.239.18.169:48940"},
+  "xfvm4-wz7a6ut2": {"client": "lexo", "panel": "Lexo",     "host": 176, "country": "US", "origin": "23.239.12.92:48910"},
+  "zdtyb-3m4bj4hg": {"client": "fsl",  "panel": "VSL247",   "host": 201, "country": "DE", "origin": "91.99.212.127:48731"},
+  "9a6ol-11jxo2wy": {"client": "fsl",  "panel": "VSL247",   "host": 199, "country": "US", "origin": "23.239.12.92:48920"}
+}

@@ -6,7 +6,7 @@ const context = { window: {}, state: { accountErrors: {}, accountBilling: {} }, 
 vm.createContext(context);
 vm.runInContext(fs.readFileSync(path.join(__dirname, 'ui/sync-manager.js'), 'utf8'), context);
 const app = fs.readFileSync(path.join(__dirname, 'ui/app.js'), 'utf8');
-for (const name of ['getAccountFailureStatus', 'formatAccountBillingDetails', 'renderAccountsManagement', 'renderProviderHubView']) {
+for (const name of ['getAccountFailureStatus', 'formatAccountBillingDetails', 'formatAccountBillingDetailsBase', 'accountTrafficHtml', 'formatBytes', 'allAccountTags', 'tagChipsHtml', 'renderAccountTagBar', 'renderAccountsManagement', 'renderProviderHubView']) {
   const start = app.indexOf(`function ${name}(`);
   const end = app.indexOf('\nfunction ', start + 1);
   vm.runInContext(app.slice(start, end), context);
@@ -87,6 +87,28 @@ context.state.activeAccountFilter = "linode";
 context.renderAccountsManagement();
 assert.ok(elements['accounts-master-grid'].innerHTML.includes('>Suspended</span>'), 'Main account list shows suspension');
 assert.ok(elements['accounts-master-grid'].innerHTML.includes('$12.00 owed'), 'Main list retains billing');
+context.state.accountBilling[14] = { status: 'ok' };
+context.state.servers = [{ account_id: 14, status: 'running', locked: false, ip_blocked: true }];
+context.renderAccountsManagement();
+assert.ok(elements['accounts-master-grid'].innerHTML.includes('Provider blocked IPs'), 'Running, unlocked servers still mark their account as blocked');
+context.state.servers[0].ip_blocked = false;
+context.renderAccountsManagement();
+assert.ok(!elements['accounts-master-grid'].innerHTML.includes('Provider blocked IPs'), 'Recovered provider blocks clear automatically');
+for (const name of ['LOCKED_SERVER_HINT', 'BLOCKED_IP_HINT']) {
+  vm.runInContext(app.match(new RegExp(`^const ${name} = .*;$`, 'm'))[0], context);
+}
+for (const name of ['serverStatusLabel', 'serverStatusTone', 'renderServerRow']) {
+  const start = app.indexOf(`function ${name}(`);
+  const end = app.indexOf('\nfunction ', start + 1);
+  vm.runInContext(app.slice(start, end), context);
+}
+context.isServerRunning = status => status === 'running';
+const blockedServer = { id: 1, account_id: 14, status: 'running', locked: false,
+  ip_blocked: true, blocked_ips: ['192.0.2.1'], ip: '192.0.2.1' };
+const blockedRow = context.renderServerRow(blockedServer);
+assert.ok(blockedRow.includes('>Provider blocked</span>'), 'Provider IP block is visible independently of locked');
+assert.ok(blockedRow.includes('>running</span>'), 'Power controls retain the real running state');
+assert.ok(!context.renderServerRow({ ...blockedServer, ip_blocked: false }).includes('>Provider blocked</span>'));
 (async () => {
   const manager = context.window.CloudbotSync.createManager({ resourceNames: [] });
   for (const [error, kind] of cases.filter(([, kind]) => kind !== 'proxy')) {

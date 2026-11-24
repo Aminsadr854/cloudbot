@@ -12,6 +12,7 @@ keeps its own short-lived server/IP snapshot for chat lookups.
 """
 import asyncio
 import base64
+from contextlib import suppress
 import ipaddress
 import logging
 import secrets
@@ -19,7 +20,7 @@ import re
 import socket
 import time
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 
 import aiohttp
 from yarl import URL
@@ -35,8 +36,68 @@ log = logging.getLogger("cloudbot.providers")
 RETRYABLE_API_STATUS = {408, 425, 429, 500, 502, 503, 504}
 
 
+def server_warnings(servers):
+    """Provider restrictions, including IP blocks independent of server locks."""
+    warnings = [{"server_id": s.get("id"), "label": s.get("label"), "ip": s.get("ip"),
+             "kind": "locked",
+             "message": "Server is locked by the provider. This is usually an abuse or "
+                        "security hold (or an action still running) - check the provider "
+                        "console and mail for an abuse notice."}
+            for s in servers if s.get("locked")]
+    warnings.extend({"server_id": s.get("id"), "label": s.get("label"),
+                     "ip": s.get("ip"), "kind": "ip_blocked",
+                     "blocked_ips": s.get("blocked_ips", []),
+                     "message": "The provider has blocked a public IP on this server. "
+                                "Check the provider console and support notices for the reason."}
+                    for s in servers if s.get("ip_blocked"))
+    return warnings
+
+
+def hetzner_ip_restrictions(public_net):
+    blocked = [str(net["ip"]) for family in ("ipv4", "ipv6")
+               if (net := public_net.get(family) or {}).get("blocked") and net.get("ip")]
+    return {"ipv4_blocked": bool((public_net.get("ipv4") or {}).get("blocked")),
+            "ipv6_blocked": bool((public_net.get("ipv6") or {}).get("blocked")),
+            "ip_blocked": bool(blocked), "blocked_ips": blocked}
+
+
+FASTLY_EDGE_IP = "146.75.57.111"
+FASTLY_EDGE_SNI = "global.fastly.com"
+
+
+def fastly_edge_probe(domain):
+    """Ask the Fastly edge directly (no account proxy) about one service domain.
+
+    Returns (state, http_status): "ok" when the edge serves the domain, "dead"
+    when Fastly answers 500 "Domain Not Found" (the account/service is gone), and
+    "unknown" on network trouble, which proves nothing about the account.
+    """
+    import socket
+    import ssl
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((FASTLY_EDGE_IP, 443), timeout=10) as sock, \
+             ctx.wrap_socket(sock, server_hostname=FASTLY_EDGE_SNI) as tls:
+            tls.sendall(f"GET / HTTP/1.1\r\nHost: {domain}\r\nConnection: close\r\n\r\n".encode())
+            data = b""
+            while len(data) < 4096:
+                chunk = tls.recv(2048)
+                if not chunk:
+                    break
+                data += chunk
+        status = int(data.split(b" ", 2)[1])
+    except Exception:
+        return "unknown", None
+    return ("dead" if status == 500 and b"Domain Not Found" in data else "ok"), status
+
+
 def account_suspension(servers, info=None):
-    """Promote explicit server suspension, never ordinary power-off or debt."""
+    """Promote explicit server suspension, never ordinary power-off or debt.
+
+    A Fastly account with no active service is not called suspended here: that
+    is also what a fresh, never-configured account looks like. Use
+    Provider.fastly_edge_check() to tell the two apart.
+    """
     suspended = [s for s in servers
                  if str(s.get('status') or '').lower() == 'billing_suspension' or
                  'suspended' in re.split(r'[^a-z]+', str(s.get('status') or '').lower())]
@@ -64,6 +125,8 @@ LINODE = "https://api.linode.com/v4"
 VULTR = "https://api.vultr.com/v2"
 HETZNER = "https://api.hetzner.cloud/v1"
 UPCLOUD = "https://api.upcloud.com/1.3"
+FASTLY = "https://api.fastly.com"
+GCORE = "https://api.gcore.com/cloud"
 CLOUDFERRO_IDENTITY = "https://keystone.cloudferro.com"
 CLOUDFERRO_COMPUTE = "https://api.waw3-1.cloudferro.com:8774/v2.1"
 CLOUDFERRO_IMAGE = "https://api.waw3-1.cloudferro.com:9292"
@@ -73,6 +136,9 @@ CLOUDFERRO_NETWORK = "https://api.waw3-1.cloudferro.com:9696"
 # without branching on provider names.  UpCloud injects keys through the
 # server's login user-data and has no account-level SSH-key CRUD API.
 PROVIDER_CAPABILITIES = {
+    "fastly": {"server_lifecycle": False, "public_ip": False, "floating_ip": False,
+               "primary_ip_inventory": False, "networking": False,
+               "local_ssh_injection": False, "ssh_key_crud": False, "cdn_services": True},
     "linode": {"server_lifecycle": True, "public_ip": True, "floating_ip": False,
                "primary_ip_inventory": False, "networking": True,
                "local_ssh_injection": True, "ssh_key_crud": True},
@@ -85,6 +151,9 @@ PROVIDER_CAPABILITIES = {
     "upcloud": {"server_lifecycle": True, "public_ip": True, "floating_ip": True,
                 "primary_ip_inventory": False, "networking": True,
                 "local_ssh_injection": True, "ssh_key_crud": False},
+    "gcore": {"server_lifecycle": True, "public_ip": True, "floating_ip": False,
+              "primary_ip_inventory": False, "networking": False,
+              "local_ssh_injection": True, "ssh_key_crud": False},
     "cloudferro": {"server_lifecycle": True, "public_ip": True, "floating_ip": True,
                     "primary_ip_inventory": False, "networking": True,
                     "local_ssh_injection": False, "ssh_key_crud": False},
@@ -345,7 +414,8 @@ class Provider:
 
     def _base(self):
         return {"linode": LINODE, "vultr": VULTR, "hetzner": HETZNER,
-                "upcloud": UPCLOUD, "cloudferro": CLOUDFERRO_COMPUTE}[self.provider]
+                "upcloud": UPCLOUD, "cloudferro": CLOUDFERRO_COMPUTE,
+                "gcore": GCORE, "fastly": FASTLY}[self.provider]
 
     def _cloudferro_credentials(self):
         raw = self.token
@@ -446,6 +516,11 @@ class Provider:
         if self.provider == "cloudferro":
             headers = {"X-Auth-Token": await self._cloudferro_auth(),
                        "Content-Type": "application/json"}
+        elif self.provider == "gcore":
+            headers = {"Authorization": f"APIKey {self._gcore_credentials()['token']}",
+                       "Content-Type": "application/json", "Accept": "application/json"}
+        elif self.provider == "fastly":
+            headers = {"Fastly-Key": str(self.token).strip(), "Accept": "application/json"}
         else:
             headers = {"Authorization": f"Bearer {self.token}",
                        "Content-Type": "application/json"}
@@ -551,16 +626,56 @@ class Provider:
             d = await self._req("GET", "/account")
             acc = d.get("account", d)
             return acc.get("username") or acc.get("email") or "UpCloud account"
+        if self.provider == "fastly":
+            d = await self._req("GET", "/tokens/self")
+            cust = {}
+            try:
+                cust = await self._req("GET", "/current_customer")
+            except ProviderError:
+                pass  # scoped tokens may not read customer details
+            return cust.get("name") or d.get("name") or "Fastly account"
         if self.provider == "cloudferro":
             await self._req("GET", "/servers/detail?limit=1")
             return "CloudFerro project"
+        if self.provider == "gcore":
+            project = await self._gcore_project_id()
+            return f"Gcore project {project}"
         # hetzner: token is project-scoped, no account endpoint; a cheap call
         # that any valid token can make doubles as the validation.
         await self._req("GET", "/servers?per_page=1")
         return "Hetzner project"
 
     async def account_info(self):
+        """Account details plus the lifetime traffic read so far (see traffic.py)."""
+        info = await self._account_info_raw()
+        if isinstance(info, dict) and self.provider in ("hetzner", "linode", "vultr", "fastly"):
+            try:
+                import traffic
+                t = traffic.totals(self.account["id"], self.provider)
+                info["traffic"] = {k: t[k] for k in ("out", "in", "total", "items", "since", "synced_at", "error")}
+            except Exception:
+                log.warning("traffic summary unavailable", exc_info=True)
+        return info
+
+    async def _account_info_raw(self):
         """Fetch account details, credit, balance, and charges if supported."""
+        if self.provider == "fastly":
+            tok = await self._req("GET", "/tokens/self")
+            info = {"name": None, "scope": tok.get("scope"), "token_name": tok.get("name"),
+                    "expires_at": tok.get("expires_at"), "balance": 0.0, "credit": 0.0,
+                    "owed": 0.0, "pending_charges": 0.0, "net": 0.0}
+            try:
+                cust = await self._req("GET", "/current_customer")
+                info["name"] = cust.get("name")
+            except ProviderError:
+                pass
+            try:
+                services = await self.fastly_services()
+                info["services_count"] = len(services)
+                info["active_services"] = sum(1 for x in services if x["active_version"] is not None)
+            except ProviderError:
+                pass
+            return info
         if self.provider == "vultr":
             d = await self._req("GET", "/account")
             acc = d.get("account", d)
@@ -647,6 +762,10 @@ class Provider:
                     "email": acc.get("email"), "balance": None,
                     "credit": credits, "owed": None,
                     "pending_charges": None, "net": None}
+        if self.provider == "gcore":
+            return {"name": f"Gcore project {await self._gcore_project_id()}", "currency": "EUR",
+                    "balance": None, "credit": None, "owed": None,
+                    "pending_charges": None, "net": None}
         if self.provider == "cloudferro":
             return {"name": "CloudFerro project", "currency": "EUR", "balance": None,
                     "credit": None, "owed": None, "pending_charges": None, "net": None}
@@ -686,6 +805,145 @@ class Provider:
                 "ip": ipv4 or ipv6, "ips": ips,
                 "ipv4": ipv4, "ipv6": ipv6, "status": server.get("state") or server.get("status"),
                 "plan": plan, "specs": server.get("plan_info") or {}}
+
+    # -- Gcore Cloud ------------------------------------------------------
+    # The token is a Gcore permanent API token, optionally ``token:project_id``
+    # or JSON {"token", "project_id"}. Without a project id the account's first
+    # project is used. The API addresses a server by (project, region, uuid), so
+    # Cloudbot server ids are ``<region_id>:<uuid>``.
+    def _gcore_credentials(self):
+        raw = self.token
+        data = None
+        if isinstance(raw, dict):
+            data = raw
+        else:
+            text = str(raw or "").strip()
+            if text.startswith("{"):
+                try:
+                    data = json.loads(text)
+                except ValueError:
+                    raise ProviderError("Gcore token JSON is invalid")
+            elif ":" in text:
+                tok, _, proj = text.rpartition(":")
+                data = {"token": tok, "project_id": proj}
+            else:
+                data = {"token": text}
+        token = str(data.get("token") or data.get("api_key") or "").strip()
+        project = data.get("project_id") or self.account.get("project_id")
+        if not token:
+            raise ProviderError("Gcore API token is required")
+        if project not in (None, ""):
+            try:
+                project = int(str(project).strip())
+            except ValueError:
+                raise ProviderError("Gcore project_id must be a number")
+        else:
+            project = None
+        return {"token": token, "project_id": project}
+
+    async def _gcore_project_id(self):
+        creds = self._gcore_credentials()
+        if creds["project_id"]:
+            return creds["project_id"]
+        if getattr(self, "_gcore_project", None):
+            return self._gcore_project
+        d = await self._req("GET", "/v1/projects")
+        rows = d.get("results", []) if isinstance(d, dict) else (d or [])
+        rows = [r for r in rows if isinstance(r, dict) and r.get("id") and not r.get("is_deleted")]
+        if not rows:
+            raise ProviderError("Gcore account has no project")
+        default = next((r for r in rows if r.get("is_default")), rows[0])
+        self._gcore_project = int(default["id"])
+        return self._gcore_project
+
+    @staticmethod
+    def _gcore_split_id(server_id):
+        region, sep, sid = str(server_id or "").partition(":")
+        if not sep or not region.isdigit() or not sid:
+            raise ProviderError("Gcore server id must look like <region_id>:<instance_uuid>")
+        return int(region), sid
+
+    async def _gcore_regions_raw(self):
+        d = await self._req("GET", "/v1/regions?limit=100")
+        rows = d.get("results", []) if isinstance(d, dict) else (d or [])
+        return [r for r in rows if isinstance(r, dict) and r.get("id") is not None
+                and str(r.get("state", "ACTIVE")).upper() == "ACTIVE"
+                and r.get("has_basic_vm", True)]
+
+    @staticmethod
+    def _gcore_server_summary(server, region_id, country=None):
+        server = server or {}
+        ips = []
+        addresses = server.get("addresses") or {}
+        for rows in addresses.values() if isinstance(addresses, dict) else []:
+            for row in rows if isinstance(rows, list) else [rows]:
+                addr = row.get("addr") if isinstance(row, dict) else None
+                if addr and str(row.get("type", "fixed")).lower() in ("fixed", "floating") \
+                        and not ipaddress.ip_address(addr).is_private:
+                    ips.append(str(addr))
+        ipv4 = next((x for x in ips if ":" not in x), None)
+        ipv6 = next((x for x in ips if ":" in x), None)
+        flavor = server.get("flavor") or {}
+        specs = {}
+        if isinstance(flavor, dict):
+            specs = {"vcpus": flavor.get("vcpus"), "memory": flavor.get("ram"),
+                     "disk": None}
+        plan = flavor.get("flavor_name") or flavor.get("flavor_id") if isinstance(flavor, dict) else flavor
+        status = server.get("status") or server.get("vm_state")
+        return {"id": f"{region_id}:{server.get('instance_id') or server.get('id')}",
+                "label": server.get("instance_name") or server.get("name"),
+                "region": str(region_id), "country": country,
+                "ip": ipv4 or ipv6 or "(provisioning)", "ips": ips,
+                "ipv4": ipv4, "ipv6": ipv6, "status": status, "plan": plan,
+                "specs": specs}
+
+    async def gcore_open_firewall(self, region_id=None):
+        """Allow all ingress (IPv4+IPv6, any protocol) on the ``default`` security
+        group of one Gcore region, or of every active region. Idempotent."""
+        project = await self._gcore_project_id()
+        if region_id is None:
+            region_ids = [int(r["id"]) for r in await self._gcore_regions_raw()]
+        else:
+            region_ids = [int(region_id)]
+        wanted = (("IPv4", "0.0.0.0/0"), ("IPv6", "::/0"))
+
+        async def one(rid):
+            try:
+                groups = await self._req("GET", f"/v1/securitygroups/{project}/{rid}?limit=100")
+                group = next((g for g in groups.get("results", []) if g.get("name") == "default"), None)
+                if not group:
+                    return {"region": rid, "added": [], "error": "no default group"}
+                have = {(r.get("ethertype"), r.get("remote_ip_prefix"))
+                        for r in group.get("security_group_rules", [])
+                        if r.get("direction") == "ingress" and not r.get("protocol")
+                        and r.get("port_range_min") is None}
+                added = []
+                for ethertype, prefix in wanted:
+                    if (ethertype, prefix) in have:
+                        continue
+                    await self._req("POST", f"/v1/securitygroups/{project}/{rid}/{group['id']}/rules",
+                                    json={"direction": "ingress", "ethertype": ethertype,
+                                          "protocol": "any", "remote_ip_prefix": prefix,
+                                          "description": "allow all"})
+                    added.append(ethertype)
+                return {"region": rid, "group": group["id"], "added": added}
+            except ProviderError as e:
+                return {"region": rid, "added": [], "error": str(e)}
+
+        return {"regions": list(await asyncio.gather(*(one(r) for r in region_ids)))}
+
+    async def _gcore_wait_task(self, task_id, timeout=300):
+        deadline = time.time() + timeout
+        while True:
+            t = await self._req("GET", f"/v1/tasks/{task_id}")
+            state = str(t.get("state", "")).upper()
+            if state == "FINISHED":
+                return t
+            if state == "ERROR":
+                raise ProviderError(f"Gcore task failed: {t.get('error') or 'unknown error'}")
+            if time.time() > deadline:
+                raise ProviderError("Gcore task timed out")
+            await asyncio.sleep(3)
 
     @staticmethod
     def _cloudferro_server_summary(server):
@@ -815,7 +1073,110 @@ class Provider:
         return True
 
     # -- list servers ----------------------------------------------------
+    async def fastly_services(self):
+        """All Fastly CDN services on the account (Fastly has no servers)."""
+        rows, page = [], 1
+        while True:
+            d = await self._req("GET", f"/service?per_page=100&page={page}")
+            current = d if isinstance(d, list) else d.get("data", [])
+            rows.extend(current)
+            if len(current) < 100:
+                break
+            page += 1
+        out = []
+        for r in rows:
+            versions = r.get("versions") or []
+            active = next((v for v in versions if v.get("active")), None)
+            out.append({"id": r.get("id"), "name": r.get("name"), "type": r.get("type"),
+                        "comment": r.get("comment") or "",
+                        "active_version": active.get("number") if active else None,
+                        "version_count": len(versions),
+                        "updated_at": r.get("updated_at")})
+        return sorted(out, key=lambda x: (x["name"] or "").lower())
+
+    async def fastly_edge_check(self, max_services=3):
+        """Tell a dead Fastly account from an unconfigured or healthy one.
+
+        The API token working says nothing about the account: only the edge shows
+        whether an active service is actually served.
+        state: ok | dead | unconfigured | inconclusive
+        """
+        services = await self.fastly_services()
+        active = [s for s in services if s["active_version"] is not None]
+        if not active:
+            return {"state": "unconfigured", "services": len(services), "active": 0, "checked": [],
+                    "message": "No active service on this account: nothing to probe (never set up, or all deactivated)."}
+        checked = []
+        for svc in active[:max_services]:
+            domains = await self._req("GET", f"/service/{svc['id']}/version/{svc['active_version']}/domain")
+            domains = domains if isinstance(domains, list) else domains.get("data", [])
+            if not domains:
+                continue
+            name = domains[0].get("name")
+            state, status = await asyncio.to_thread(fastly_edge_probe, name)
+            checked.append({"service": svc["name"], "domain": name, "state": state, "http_status": status})
+        states = {c["state"] for c in checked}
+        if "ok" in states:
+            state, msg = "ok", "The Fastly edge serves this account's active service(s)."
+        elif states == {"dead"}:
+            state, msg = "dead", "Fastly answers 'Domain Not Found' for every active service: the account or its services are gone."
+        else:
+            state, msg = "inconclusive", "Could not reach the Fastly edge (or no domain to probe); try again."
+        return {"state": state, "services": len(services), "active": len(active), "checked": checked, "message": msg}
+
+    FASTLY_CANARY = "cloudbot-canary"
+
+    async def fastly_ensure_canary(self):
+        """Create (or re-activate) the tiny always-active canary service.
+
+        An account with no active service cannot be probed at the edge, so a dead
+        account looks "unconfigured". The canary gives every account one domain to probe.
+        """
+        services = await self.fastly_services()
+        found = next((s for s in services if s["name"] == self.FASTLY_CANARY), None)
+        if found and found["active_version"] is not None:
+            return {"created": False, "service": found["id"], "active": True}
+        if found:
+            await self._req("PUT", f"/service/{found['id']}/version/{found['version_count']}/activate")
+            return {"created": False, "service": found["id"], "active": True, "reactivated": True}
+        domain = f"cbcanary-{secrets.token_hex(5)}.global.ssl.fastly.net"
+        svc = await self._req("POST", "/service", data={"name": self.FASTLY_CANARY, "type": "vcl"})
+        base = f"/service/{svc['id']}/version/1"
+        try:
+            await self._req("POST", f"{base}/domain", data={"name": domain})
+            await self._req("POST", f"{base}/backend", data={
+                "name": "origin", "address": "1.1.1.1", "port": "80", "use_ssl": "false"})
+            await self._req("PUT", f"{base}/activate")
+        except Exception:
+            with suppress(Exception):
+                await self._req("DELETE", f"/service/{svc['id']}")
+            raise
+        return {"created": True, "service": svc["id"], "domain": domain, "active": True}
+
+    async def fastly_canary_state(self):
+        """Probe only the canary: ok | dead | inconclusive, or None when the account has none."""
+        canary = next((s for s in await self.fastly_services()
+                       if s["name"] == self.FASTLY_CANARY and s["active_version"] is not None), None)
+        if not canary:
+            return None
+        domains = await self._req("GET", f"/service/{canary['id']}/version/{canary['active_version']}/domain")
+        domains = domains if isinstance(domains, list) else domains.get("data", [])
+        if not domains:
+            return None
+        state, status = await asyncio.to_thread(fastly_edge_probe, domains[0].get("name"))
+        if state == "dead":
+            # A fresh activation takes 1-2 minutes to reach the edge; do not call that dead.
+            try:
+                born = datetime.fromisoformat(str(canary["updated_at"]).replace("Z", "+00:00"))
+                if (datetime.now(timezone.utc) - born).total_seconds() < 600:
+                    return "inconclusive", status
+            except (TypeError, ValueError):
+                pass
+        return {"ok": "ok", "dead": "dead"}.get(state, "inconclusive"), status
+
     async def list_servers(self):
+        if self.provider == "fastly":
+            return []
         if self.provider == "linode":
             rows = []
             page = 1
@@ -878,6 +1239,20 @@ class Provider:
         if self.provider == "cloudferro":
             d = await self._req("GET", "/servers/detail?limit=100")
             return [self._cloudferro_server_summary(row) for row in d.get("servers", [])]
+        if self.provider == "gcore":
+            project = await self._gcore_project_id()
+            regions = await self._gcore_regions_raw()
+
+            async def one(region):
+                rid = int(region["id"])
+                d = await self._req("GET", f"/v1/instances/{project}/{rid}?limit=1000")
+                rows = d.get("results", []) if isinstance(d, dict) else (d or [])
+                return [self._gcore_server_summary(row, rid, country_code(region.get("country")))
+                        for row in rows]
+            out = []
+            for batch in await asyncio.gather(*(one(r) for r in regions)):
+                out.extend(batch)
+            return out
         # hetzner
         rows = []
         page = 1
@@ -906,6 +1281,8 @@ class Provider:
                 "ip": ipv4 or ipv6 or "(provisioning)", "ips": ips,
                 "ipv4": ipv4, "ipv6": ipv6,
                 "status": i.get("status"),
+                "locked": bool(i.get("locked")),
+                **hetzner_ip_restrictions(public_net),
                 "plan": (i.get("server_type") or {}).get("name"),
             })
         return out
@@ -939,6 +1316,11 @@ class Provider:
         if self.provider == "cloudferro":
             d = await self._req("GET", f"/servers/{server_id}")
             return self._cloudferro_server_summary(d.get("server") or d)
+        if self.provider == "gcore":
+            rid, sid = self._gcore_split_id(server_id)
+            project = await self._gcore_project_id()
+            d = await self._req("GET", f"/v1/instances/{project}/{rid}/{sid}")
+            return self._gcore_server_summary(d, rid)
         # hetzner
         d = await self._req("GET", f"/servers/{server_id}")
         i = d.get("server", d)
@@ -952,7 +1334,8 @@ class Provider:
                 "country": country_code(location.get("country_iso") or location.get("country"))
                            or region_country(self.provider, location.get("name")),
                 "ip": ipv4 or ipv6, "ips": ips, "ipv4": ipv4, "ipv6": ipv6,
-                "status": i.get("status"),
+                "status": i.get("status"), "locked": bool(i.get("locked")),
+                **hetzner_ip_restrictions(public_net),
                 "plan": (i.get("server_type") or {}).get("name")}
 
     # -- choices for creation --------------------------------------------
@@ -1023,6 +1406,11 @@ class Provider:
                                                 zone.get("country"))))
         elif self.provider == "cloudferro":
             res = [("waw3-1", "🇵🇱 Warsaw (CloudFerro WAW3-1)")]
+        elif self.provider == "gcore":
+            res = [(str(r["id"]), location_text(
+                        self.provider, r.get("display_name") or str(r["id"]),
+                        country_code(r.get("country"))))
+                   for r in await self._gcore_regions_raw()]
         else:
             # Hetzner exposes per-location support and current availability on
             # each Server Type. Locations alone includes places where none of
@@ -1203,6 +1591,20 @@ class Provider:
                 out.append((pid, f"{label}{(' · ' + details) if details else ''}"
                             f"{(' - $' + str(price) + '/mo') if price is not None else ''}"))
             res = out
+        elif self.provider == "gcore":
+            if not region:
+                raise ProviderError("choose a Gcore region first")
+            project = await self._gcore_project_id()
+            d = await self._req("GET", f"/v1/flavors/{project}/{int(region)}?include_prices=false")
+            rows = d.get("results", []) if isinstance(d, dict) else (d or [])
+            res = []
+            for f in sorted(rows, key=lambda x: (x.get("vcpus") or 0, x.get("ram") or 0)):
+                name = f.get("flavor_name") or f.get("flavor_id")
+                if not name or f.get("disabled"):
+                    continue
+                ram = f.get("ram")
+                res.append((str(name), f"{name} · {f.get('vcpus', '?')}vCPU "
+                            f"{int(ram) if ram else '?'}MB"))
         elif self.provider == "cloudferro":
             d = await self._req("GET", "/flavors/detail?limit=100")
             res = []
@@ -1275,6 +1677,19 @@ class Provider:
             res = [(str(s.get("uuid") or s.get("id")),
                     s.get("title") or s.get("name") or str(s.get("uuid") or s.get("id")))
                    for s in chosen[:40] if s.get("uuid") or s.get("id")]
+            _set_cached(cache_key, res, ttl)
+            return res
+        if self.provider == "gcore":
+            if not region:
+                raise ProviderError("choose a Gcore region first")
+            project = await self._gcore_project_id()
+            d = await self._req("GET", f"/v1/images/{project}/{int(region)}?visibility=public&limit=1000")
+            imgs = [i for i in (d.get("results", []) if isinstance(d, dict) else d or [])
+                    if i.get("id") and str(i.get("os_type", "linux")).lower() == "linux"]
+            label = lambda i: f"{i.get('os_distro') or ''} {i.get('os_version') or ''}".strip().lower()
+            pref = [i for i in imgs if label(i) in ("ubuntu 22.04", "ubuntu 24.04", "debian 12", "debian 11")]
+            chosen = pref or imgs
+            res = [(str(i["id"]), i.get("name") or str(i["id"])) for i in chosen[:40]]
             _set_cached(cache_key, res, ttl)
             return res
         if self.provider == "cloudferro":
@@ -1371,6 +1786,37 @@ class Provider:
             if password:
                 normalized["root_password"] = str(password)
             return normalized
+        if self.provider == "gcore":
+            project = await self._gcore_project_id()
+            rid = int(region)
+            # Gcore accepts password or user_data, not both: set both the root
+            # password and the SSH keys through cloud-init.
+            lines = ["#cloud-config", "disable_root: false", "ssh_pwauth: true",
+                     "chpasswd:", "  expire: false", "  list:", f"    - root:{root_password}"]
+            clean_keys = [str(k).strip() for k in (ssh_keys or []) if str(k).strip()]
+            if clean_keys:
+                lines.append("ssh_authorized_keys:")
+                lines.extend(f"  - {k}" for k in clean_keys)
+            imgs = await self._req("GET", f"/v1/images/{project}/{rid}/{image}")
+            size = max(int(imgs.get("min_disk") or 0), 10)
+            body = {"names": [str(label)], "flavor": str(plan),
+                    "interfaces": [{"type": "external", "ip_family": "dual" if enable_ipv6 else "ipv4"}],
+                    "volumes": [{"source": "image", "image_id": str(image), "size": size,
+                                 "type_name": "standard", "boot_index": 0}],
+                    "user_data": base64.b64encode("\n".join(lines).encode()).decode("ascii")}
+            d = await self._req("POST", f"/v2/instances/{project}/{rid}", json=body)
+            tasks = d.get("tasks") or []
+            if not tasks:
+                raise ProviderError("Gcore returned no creation task")
+            task = await self._gcore_wait_task(tasks[0])
+            ids = (task.get("created_resources") or {}).get("instances") or []
+            if not ids:
+                raise ProviderError("Gcore task finished without an instance id")
+            created = await self._req("GET", f"/v1/instances/{project}/{rid}/{ids[0]}")
+            normalized = self._gcore_server_summary(created, rid)
+            normalized["root_password"] = root_password
+            await self.gcore_open_firewall(rid)  # default group is allow-all; best effort
+            return normalized
         if self.provider == "cloudferro":
             networks = await self._req("GET", f"/v2.0/networks?project_id={self._cloudferro_project_id()}")
             project_networks = [n for n in networks.get("networks", [])
@@ -1457,6 +1903,8 @@ class Provider:
         return pw
 
     async def delete_server(self, server_id):
+        import traffic
+        await traffic.sample_before_delete(self, server_id)  # keep the final bytes of a server that is about to vanish
         if self.provider == "linode":
             await self._req("DELETE", f"/linode/instances/{server_id}")
         elif self.provider == "vultr":
@@ -1478,6 +1926,18 @@ class Provider:
             return True
         elif self.provider == "cloudferro":
             await self._req("DELETE", f"/servers/{server_id}")
+            return True
+        elif self.provider == "gcore":
+            rid, sid = self._gcore_split_id(server_id)
+            project = await self._gcore_project_id()
+            # Remove the boot/data volumes and floating IPs with the instance so
+            # nothing billable is left behind.
+            current = await self._req("GET", f"/v1/instances/{project}/{rid}/{sid}")
+            volume_ids = [str(v["id"]) for v in current.get("volumes") or [] if v.get("id")]
+            query = "delete_floatings=true"
+            if volume_ids:
+                query += "&volumes=" + ",".join(volume_ids)
+            await self._req("DELETE", f"/v1/instances/{project}/{rid}/{sid}?{query}")
             return True
         else:
             await self._req("DELETE", f"/servers/{server_id}")
@@ -1970,6 +2430,27 @@ class Provider:
         await self._wait_hetzner_action(await self._req(
             "POST", f"/servers/{int(server_id)}/actions/{action}"))
 
+    async def rebuild_server(self, server_id, image=None, password=None):
+        """Wipe the disk and reinstall the OS. Returns the new root password when the
+        provider sets one (None for Vultr, which reinstalls in place)."""
+        if self.provider == "hetzner":
+            if not image:
+                raise ProviderError("choose an image to rebuild with")
+            res = await self._req("POST", f"/servers/{int(server_id)}/actions/rebuild",
+                                  json={"image": image})
+            await self._wait_hetzner_action(res)
+            return res.get("root_password")
+        if self.provider == "linode":
+            if not image or not password:
+                raise ProviderError("choose an image to rebuild with")
+            await self._req("POST", f"/linode/instances/{server_id}/rebuild",
+                            json={"image": image, "root_pass": password})
+            return password
+        if self.provider == "vultr":
+            await self._req("POST", f"/instances/{server_id}/reinstall", json={})
+            return None
+        raise ProviderError(f"rebuild is not supported for {self.provider}")
+
     async def power_server(self, server_id, action):
         """Unified power action across all supported providers (start, halt/shutdown, reboot)."""
         action = str(action).strip().lower()
@@ -2004,6 +2485,19 @@ class Provider:
                     "stop_type": "soft", "timeout": "60", "timeout_action": "destroy",
                 }}
             await self._req("POST", f"/server/{sid}/{endpoint}", json=payload)
+            return True
+        elif self.provider == "gcore":
+            rid, sid = self._gcore_split_id(server_id)
+            project = await self._gcore_project_id()
+            if action in ("start", "poweron", "boot"):
+                endpoint = "start"
+            elif action in ("halt", "shutdown", "poweroff", "stop"):
+                endpoint = "stop"
+            elif action == "reboot":
+                endpoint = "reboot"
+            else:
+                raise ProviderError(f"unsupported Gcore power action: {action}")
+            await self._req("POST", f"/v1/instances/{project}/{rid}/{sid}/{endpoint}")
             return True
         elif self.provider == "cloudferro":
             if action in ("start", "poweron", "boot"):
@@ -2313,7 +2807,7 @@ class Provider:
                 if public_key:
                     keys.append(public_key)
 
-        elif self.provider == "cloudferro":
+        elif self.provider in ("cloudferro", "gcore"):
             for k in stored_keys:
                 public_key = str(k.get("public_key") or "").strip()
                 if public_key:

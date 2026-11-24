@@ -7,7 +7,7 @@
     "images", "floating_ips", "watch_status", "tunnels", "dns_zones",
     "dns_record", "all_servers", "all_floating_ips", "ssh_keys",
     "check_all_accounts", "hetzner_primary_ips", "dns_records", "proxy_pool",
-    "test_account", "test_proxy", "proxy_providers", "proxy_sessions",
+    "test_account", "test_proxy", "account_traffic", "proxy_providers", "proxy_sessions",
     "upcloud_networking",
     "proxy_availability", "server_password", "parse_proxy_sessions"
   ]);

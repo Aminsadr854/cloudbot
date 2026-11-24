@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     auto_backup  TEXT NOT NULL DEFAULT 'disabled', -- disabled | enabled
     region       TEXT NOT NULL DEFAULT '',        -- ISO country code e.g. 'DE', 'US'
     note         TEXT NOT NULL DEFAULT '',
+    tags         TEXT NOT NULL DEFAULT '',
     created_at INTEGER NOT NULL
 );
 CREATE TABLE IF NOT EXISTS tunnels (
@@ -165,6 +166,9 @@ class Store(ProxyPoolStore):
         if "note" not in columns:
             self.con.execute("ALTER TABLE accounts ADD COLUMN note TEXT NOT NULL DEFAULT ''")
             self.con.commit()
+        if "tags" not in columns:
+            self.con.execute("ALTER TABLE accounts ADD COLUMN tags TEXT NOT NULL DEFAULT ''")
+            self.con.commit()
         self.con.execute("CREATE TABLE IF NOT EXISTS data_cache (k TEXT PRIMARY KEY, v TEXT NOT NULL, updated_at REAL NOT NULL)")
         self.con.commit()
         with self.proxy_transaction():
@@ -179,7 +183,7 @@ class Store(ProxyPoolStore):
             pass
 
     # ---- accounts ------------------------------------------------------
-    def add_account(self, label, provider, token, proxy=None, proxy_family="default", auto_backup="disabled", proxy_request=None, region="", note=""):
+    def add_account(self, label, provider, token, proxy=None, proxy_family="default", auto_backup="disabled", proxy_request=None, region="", note="", tags=None):
         proxy_family = "default"
         with self.proxy_transaction():
             if proxy_request:
@@ -187,11 +191,11 @@ class Store(ProxyPoolStore):
             else:
                 self._guard_proxy(proxy)
             cur = self.con.execute(
-                "INSERT INTO accounts (label, provider, token, proxy, proxy_family, auto_backup, region, note, created_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO accounts (label, provider, token, proxy, proxy_family, auto_backup, region, note, tags, created_at)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (label, provider, self.f.encrypt(token.encode()),
                  self.f.encrypt(proxy.encode()) if proxy else None, proxy_family, auto_backup,
-                 str(region or "").strip().upper(), str(note or "").strip(), int(time.time())))
+                 str(region or "").strip().upper(), str(note or "").strip(), ",".join(tags or []), int(time.time())))
             acc_id = cur.lastrowid
             if proxy_request:
                 self.con.execute('DELETE FROM proxy_claims WHERE request_token=?', (proxy_request,))
@@ -201,6 +205,11 @@ class Store(ProxyPoolStore):
     def set_account_note(self, acc_id, note):
         """Set or update an account's note/memo."""
         self.con.execute("UPDATE accounts SET note = ? WHERE id = ?", (str(note or "").strip(), acc_id))
+        self.con.commit()
+
+    def set_account_tags(self, acc_id, tags):
+        """Replace an account's tags (already normalized by the caller)."""
+        self.con.execute("UPDATE accounts SET tags = ? WHERE id = ?", (",".join(tags or []), acc_id))
         self.con.commit()
 
     def delete_account(self, acc_id):
@@ -259,6 +268,7 @@ class Store(ProxyPoolStore):
             "auto_backup": r["auto_backup"] if "auto_backup" in r.keys() else "disabled",
             "region": (r["region"] if "region" in r.keys() and r["region"] else ""),
             "note": (r["note"] if "note" in r.keys() and r["note"] else ""),
+            "tags": [t for t in (r["tags"] if "tags" in r.keys() and r["tags"] else "").split(",") if t],
             "created_at": r["created_at"],
             "proxy_revision": r["proxy_revision"],
         }

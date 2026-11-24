@@ -14,7 +14,7 @@ import time
 import aiohttp
 from proxy_usage import ProxyUsage, TrafficLimitExceeded
 from cloudflare import Cloudflare
-from providers import Provider, region_country, country_code, country_flag, proxy_url, is_proxy_failure, account_suspension
+from providers import Provider, region_country, country_code, country_flag, proxy_url, is_proxy_failure, account_suspension, server_warnings
 
 log = logging.getLogger("cloudbot.control_service")
 
@@ -58,6 +58,7 @@ OPERATIONS = {
     "sync_status": "Read automatic inventory sync status without calling providers",
     "accounts": "List configured cloud accounts without credentials",
     "account_info": "Read a provider account's billing and access details",
+    "account_traffic": "Read bytes moved over the whole life of an account, including deleted servers and Fastly services (refresh=true reads the provider now)",
     "resource_limits": "Read provider resource limits, quotas, and current usage",
     "servers": "List servers in one cloud account",
     "server": "Read one server and its attached floating IPs",
@@ -102,6 +103,7 @@ OPERATIONS = {
     "delete_dns_record": "Delete a Cloudflare DNS record; confirm DELETE_DNS",
     "proxy_pool": "List proxy pool providers, session claims, and active reservations",
     "set_account_proxy": "Set or clear proxy configuration for a cloud provider account",
+    "account_token": "Reveal the stored API token of an account; confirm SHOW_TOKEN",
     "test_account": "Test account connectivity, proxy route, and retrieve live billing",
     "test_proxy": "Test a raw proxy URL or account proxy connection",
     "proxy_providers": "List configured proxy providers with session status",
@@ -118,24 +120,30 @@ OPERATIONS = {
     "allocate_account_proxy": "Allocate and bind an available proxy from a rotating provider pool for an account",
     "set_account_region": "Set or update an account's geographical region code",
     "set_account_note": "Set or update the note or memo for a cloud provider account",
+    "set_account_tags": "Replace the tags (group labels) of an account; tags is a list or comma-separated string",
+    "fastly_services": "List Fastly CDN services (id, name, active version) for a Fastly account",
+    "fastly_edge_check": "Probe the Fastly edge for a Fastly account's active services: ok, dead, unconfigured or inconclusive",
+    "fastly_ensure_canary": "Create the always-active canary service on a Fastly account (done automatically on add_account) so a dead account is detectable",
     "update_account": "Rename an account and optionally verify and replace its API token",
     "proxy_availability": "Check available unallocated sessions for a provider in a specific country",
     "set_server_password": "Save or update stored root password for a server",
     "reset_server_password": "Reset root password on Hetzner and reboot; confirm RESET_PASSWORD",
+    "rebuild_server": "Wipe and reinstall a server OS (Hetzner/Linode/Vultr); confirm REBUILD",
     "toggle_vultr_backups": "Enable or disable auto-backups for a Vultr server",
+    "gcore_open_firewall": "Allow all inbound traffic (IPv4/IPv6, any protocol) on a Gcore account's default security group, in one region or all",
     "swap_linode_ips": "Swap IPv4 addresses between two Linodes in the same region; confirm SWAP_LINODE_IPS",
     "activity_logs": "List operational activity and audit history (what happened)",
     "system_logs": "Read live system and service journal logs (what is happening)",
 }
 
 READ_OPERATIONS = frozenset({
-    'sync_status', 'accounts', 'account_info', 'resource_limits', 'servers', 'server',
+    'sync_status', 'accounts', 'account_info', 'account_traffic', 'resource_limits', 'servers', 'server',
     'regions', 'plans', 'images', 'floating_ips', 'watch_status', 'tunnels',
-    'dns_zones', 'dns_record', 'all_servers', 'all_floating_ips', 'server_password',
+    'dns_zones', 'dns_record', 'all_servers', 'all_floating_ips', 'server_password', 'account_token',
     'ssh_keys', 'check_all_accounts', 'hetzner_primary_ips', 'dns_records',
     'proxy_pool', 'test_account', 'test_proxy', 'proxy_providers', 'proxy_sessions',
     'parse_proxy_sessions', 'proxy_availability', 'upcloud_networking',
-    'activity_logs', 'system_logs',
+    'activity_logs', 'system_logs', 'fastly_services', 'fastly_edge_check',
 })
 
 
@@ -287,6 +295,32 @@ def _account(store, args):
     return account
 
 
+MAX_TAGS = 8
+MAX_TAG_LEN = 24
+
+
+def _normalize_tags(value):
+    """Accept a list or comma-separated string; return unique lowercase tags."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        value = value.split(",")
+    if not isinstance(value, (list, tuple)):
+        raise InputError("tags must be a list or comma-separated string")
+    out = []
+    for raw in value:
+        tag = re.sub(r"\s+", "-", str(raw or "").strip().lower()).strip("-")
+        if not tag:
+            continue
+        if len(tag) > MAX_TAG_LEN or not re.fullmatch(r"[\w.\-:/]+", tag):
+            raise InputError(f"invalid tag '{str(raw)[:30]}': up to {MAX_TAG_LEN} letters, digits, - _ . : /")
+        if tag not in out:
+            out.append(tag)
+    if len(out) > MAX_TAGS:
+        raise InputError(f"at most {MAX_TAGS} tags per account")
+    return out
+
+
 def _account_public(account, store=None):
     proxy_val = account.get("proxy")
     masked = None
@@ -318,6 +352,7 @@ def _account_public(account, store=None):
         "auto_backup": account.get("auto_backup") or "disabled",
         "region": region,
         "note": account.get("note") or "",
+        "tags": list(account.get("tags") or []),
         "binding": binding_info,
         "created_at": account.get("created_at"),
         "has_proxy": bool(proxy_val),
@@ -406,7 +441,7 @@ def _scope_accounts(store, args):
         accounts = [account]
     if args.get('provider'):
         name = str(args['provider']).lower()
-        if name not in {'hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro'}:
+        if name not in {'hetzner', 'vultr', 'linode', 'upcloud', 'cloudferro', 'gcore', 'fastly'}:
             raise InputError('unknown cloud provider')
         accounts = [a for a in accounts if a['provider'] == name]
     return accounts
@@ -450,6 +485,19 @@ def _safe_error(exc, account=None):
     return message
 
 
+async def _verify_new_account(account):
+    """Live-check token and route; raise InputError saying which one failed."""
+    try:
+        provider = Provider(account)
+        await provider.whoami()
+        await provider.list_servers()
+    except Exception as exc:
+        message = _safe_error(exc, account)
+        if message.lower().startswith("proxy failed") or "proxy" in message.lower():
+            raise InputError(f"Not connected - proxy error: {message}") from None
+        raise InputError(f"Not connected - API token error: {message}") from None
+
+
 async def execute(operation, args, store):
     result = await _execute(operation, args, store)
     if operation not in READ_OPERATIONS and hasattr(store, 'request_sync'):
@@ -480,8 +528,8 @@ async def _execute(operation, args, store):
     if operation == "add_account":
         label = _required(args, "label")
         provider_name = _required(args, "provider").lower()
-        if provider_name not in ("linode", "vultr", "hetzner", "upcloud", "cloudferro"):
-            raise InputError("provider must be linode, vultr, hetzner, upcloud, or cloudferro")
+        if provider_name not in ("linode", "vultr", "hetzner", "upcloud", "cloudferro", "gcore", "fastly"):
+            raise InputError("provider must be linode, vultr, hetzner, upcloud, cloudferro, gcore, or fastly")
         token = _required(args, "token")
         proxy = _normalize_proxy_value(args.get("proxy"))
         proxy_family = args.get("proxy_family") or "default"
@@ -492,12 +540,20 @@ async def _execute(operation, args, store):
         if proxy_provider_id and not region:
             raise InputError("Account country / region is required to allocate from proxy providers")
 
+        if not proxy_provider_id:
+            # Prove the token (and proxy, if any) work before anything is saved.
+            await _verify_new_account(
+                {"provider": provider_name, "token": token, "proxy": proxy,
+                 "proxy_family": proxy_family, "auto_backup": auto_backup})
+
         add_params = store.add_account.__code__.co_varnames if hasattr(store, "add_account") else ()
         kwargs = {"proxy": proxy, "proxy_family": proxy_family, "auto_backup": auto_backup}
         if "region" in add_params:
             kwargs["region"] = region
         if "note" in add_params:
             kwargs["note"] = note
+        if "tags" in add_params:
+            kwargs["tags"] = _normalize_tags(args.get("tags"))
         acc_id = store.add_account(label, provider_name, token, **kwargs)
 
         allocated_info = None
@@ -526,11 +582,21 @@ async def _execute(operation, args, store):
             except Exception as e:
                 store.delete_account(acc_id)
                 raise InputError(f"Failed to allocate proxy from provider: {e}")
+            try:
+                await _verify_new_account(store.account(acc_id))
+            except InputError:
+                store.delete_account(acc_id)
+                raise
 
         _delete_cache(store, "all_servers")
         _delete_cache(store, "all_floating_ips")
         _delete_cache(store, "all_billing")
         resp = {"id": acc_id, "label": label, "provider": provider_name, "region": region, "note": note}
+        if provider_name == "fastly":
+            try:
+                resp["canary"] = await Provider(store.account(acc_id)).fastly_ensure_canary()
+            except Exception as exc:
+                resp["canary"] = {"created": False, "error": _safe_error(exc, store.account(acc_id))}
         if allocated_info:
             resp["allocated_proxy"] = {
                 "country": allocated_info.get("country", region),
@@ -574,7 +640,22 @@ async def _execute(operation, args, store):
                 }
                 if acc["provider"] == "cloudferro":
                     item["limits"] = await p.cloudferro_resource_limits()
-                item.update(account_suspension(await p.list_servers(), info))
+                servers = await p.list_servers()
+                item.update(account_suspension(servers, info))
+                item['server_warnings'] = server_warnings(servers)
+                if acc["provider"] == "fastly":
+                    canary = await p.fastly_canary_state()
+                    if canary is None:
+                        # No canary yet: create it. A token Fastly refuses with "read only" means a locked account.
+                        try:
+                            await p.fastly_ensure_canary()
+                        except Exception as exc:
+                            if "read only" in str(exc).lower():
+                                item.update({"status": "suspended",
+                                             "error": "اکانت Fastly فقط‌خواندنی (read only) شده و نمی‌شود سرویس canary ساخت؛ احتمالاً توسط Fastly قفل یا معلق شده است."})
+                    elif canary[0] == "dead":
+                        item.update({"status": "suspended",
+                                     "error": "لبه Fastly برای سرویس canary پاسخ Domain Not Found می‌دهد؛ اکانت از کار افتاده است."})
                 return item
             except Exception as exc:
                 return {
@@ -587,6 +668,13 @@ async def _execute(operation, args, store):
         res = {"accounts": [r for r in results if isinstance(r, dict)], "cached_at": time.time()}
         return _save_scoped_snapshot(store, 'all_billing', 'accounts', res, accs)
 
+    if operation == "account_token":
+        _confirm(args, "SHOW_TOKEN")
+        account = _account(store, args)
+        _record_activity(store, "SHOW_ACCOUNT_TOKEN", provider=account["provider"],
+                         target=account["label"], status="success", details="API token revealed")
+        return {"account_id": account["id"], "provider": account["provider"], "token": account["token"]}
+
     if operation == "test_account":
         account = _account(store, args)
         p = Provider(account)
@@ -594,7 +682,9 @@ async def _execute(operation, args, store):
         try:
             ident = await p.whoami()
             info = await p.account_info()
-            health = account_suspension(await p.list_servers(), info)
+            servers = await p.list_servers()
+            health = account_suspension(servers, info)
+            health['server_warnings'] = server_warnings(servers)
             latency_ms = round((time.time() - start_t) * 1000, 1)
             return {
                 "status": "ok",
@@ -653,6 +743,43 @@ async def _execute(operation, args, store):
         _delete_cache(store, "all_floating_ips")
         updated = store.account(account["id"])
         return {"updated": True, "account": _account_public(updated, store)}
+
+    if operation == "set_account_tags":
+        account = _account(store, args)
+        tags = _normalize_tags(args.get("tags"))
+        store.set_account_tags(account["id"], tags)
+        _record_activity(store, "SET_ACCOUNT_TAGS", provider=account["provider"], target=account["label"],
+                         status="success", details=", ".join(tags) or "cleared")
+        return {"updated": True, "account": _account_public(store.account(account["id"]), store)}
+
+    if operation == "fastly_services":
+        account = _account(store, args)
+        if account["provider"] != "fastly":
+            raise InputError("fastly_services is only supported for Fastly accounts")
+        try:
+            services = await Provider(account).fastly_services()
+        except Exception as exc:
+            raise InputError(_safe_error(exc, account)) from None
+        return {"account_id": account["id"], "services": services}
+
+    if operation == "fastly_ensure_canary":
+        account = _account(store, args)
+        if account["provider"] != "fastly":
+            raise InputError("fastly_ensure_canary is only supported for Fastly accounts")
+        try:
+            return {"account_id": account["id"], **await Provider(account).fastly_ensure_canary()}
+        except Exception as exc:
+            raise InputError(_safe_error(exc, account)) from None
+
+    if operation == "fastly_edge_check":
+        account = _account(store, args)
+        if account["provider"] != "fastly":
+            raise InputError("fastly_edge_check is only supported for Fastly accounts")
+        try:
+            result = await Provider(account).fastly_edge_check()
+        except Exception as exc:
+            raise InputError(_safe_error(exc, account)) from None
+        return {"account_id": account["id"], **result}
 
     if operation == "allocate_account_proxy":
         account = _account(store, args)
@@ -1501,6 +1628,12 @@ async def _execute(operation, args, store):
     provider = Provider(account)
     account_id = account["id"]
 
+    if operation == "account_traffic":
+        import traffic
+        if args.get("refresh"):
+            await traffic.sample_account(provider)
+        return {"account": _account_public(account), "traffic": traffic.totals(account_id, account["provider"])}
+
     if operation == "account_info":
         result = {"account": _account_public(account), "info": await provider.account_info(),
                   "identity": await provider.whoami()}
@@ -1614,7 +1747,7 @@ async def _execute(operation, args, store):
         region = args.get("region")
         # UpCloud templates may be zone-specific; keep each zone's catalog
         # distinct so the deployment wizard never reuses incompatible images.
-        cache_suffix = (f":{region}" if account["provider"] == "upcloud" else "")
+        cache_suffix = (f":{region}" if account["provider"] in ("upcloud", "gcore") else "")
         cache_key = f"images:{account['provider']}:{account['id']}{cache_suffix}"
         if not force:
             cached = _get_op_cache(cache_key)
@@ -1648,6 +1781,12 @@ async def _execute(operation, args, store):
         res = {"primary_ips": pips, "cached_at": time.time()}
         _set_cache(store, cache_key, res)
         return res
+
+    if operation == "gcore_open_firewall":
+        if account["provider"] != "gcore":
+            raise InputError("gcore_open_firewall is only supported on Gcore")
+        region = args.get("region")
+        return await provider.gcore_open_firewall(int(region) if region not in (None, "") else None)
 
     if operation == "create_hetzner_primary_ip":
         _confirm(args, "CREATE_PRIMARY_IP")
@@ -1899,7 +2038,8 @@ async def _execute(operation, args, store):
         return {"updated": True}
 
     if operation in {"server", "server_password", "set_server_password", "reset_server_password",
-                     "toggle_vultr_backups", "swap_linode_ips", "delete_server", "floating_ips", "power_server"}:
+                     "toggle_vultr_backups", "swap_linode_ips", "delete_server", "floating_ips", "power_server",
+                     "rebuild_server"}:
         server_id = _required(args, "server_id")
     else:
         server_id = args.get("server_id")
@@ -1968,6 +2108,20 @@ async def _execute(operation, args, store):
         new_pw = await provider.reset_root_password(server_id)
         store.set_server_pass(account_id, server_id, new_pw)
         return {"password": new_pw, "server_id": server_id}
+
+    if operation == "rebuild_server":
+        _confirm(args, "REBUILD")
+        if account["provider"] not in {"hetzner", "linode", "vultr"}:
+            raise InputError("rebuild is only supported for Hetzner, Linode and Vultr")
+        pw = secrets.token_urlsafe(24) if account["provider"] == "linode" else None
+        new_pw = await provider.rebuild_server(server_id, args.get("image"), pw)
+        if new_pw:
+            store.set_server_pass(account_id, server_id, new_pw)
+        _delete_cache(store, "all_servers")
+        _record_activity(store, "REBUILD_SERVER", provider=account.get("provider", ""),
+                         target=str(server_id), status="success",
+                         details=f"Rebuilt server {server_id} with {args.get('image') or 'same image'}")
+        return {"accepted": True, "server_id": server_id, "password": new_pw}
 
     if operation == "toggle_vultr_backups":
         if account["provider"] != "vultr":

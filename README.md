@@ -12,16 +12,15 @@ root-only token for the local owner automation API.
 
 **Cloud accounts.** Linode, Vultr, Hetzner, UpCloud, and CloudFerro, each reached through its own
 proxy (`host:port:user:pass`, HTTP or SOCKS). List, create and delete servers.
-API tokens and proxies are encrypted at rest with a key in its own root-only
-file, so the database on its own is inert.
+API tokens and proxies are encrypted with a separate root-only key.
+Hetzner public-IP block flags appear as provider warnings in server and account
+views, independently of power state and server locks; check Hetzner notices
+for the cause.
 
 The server-creation wizard accepts up to 10 names, one per line, and creates
 them sequentially with a separate password for each.
-Hetzner locations and plans are filtered by the API's per-location availability
-and refreshed before provisioning, so unsupported or unavailable plan/location
-combinations are not offered. A last-second capacity change is reported with a
-button to reload the choices. Root passwords are encrypted in the bot database
-and appear only when you open that server's SSH details.
+Hetzner choices use current per-location availability; capacity errors offer a
+reload button. Encrypted root passwords appear in the server's SSH details.
 UpCloud uses zones, plans, and zone-compatible storage templates in the same
 wizard. It accepts selected public keys from the local SSH vault at creation;
 UpCloud has no account-level SSH-key sync. A generated fallback password is not
@@ -203,13 +202,13 @@ that its account API does not provide.
 ## Web Hosting Console & API for automation
 
 The web console and owner API listen on `127.0.0.1:9601`:
-* **Web Hosting Dashboard (`http://127.0.0.1:9601`)**: A responsive single-page console providing full hosting capabilities:
+* **Web Hosting Dashboard (`http://127.0.0.1:9601`)**: A responsive hosting console:
   - Multi-cloud server inventory (Hetzner, Vultr, Linode, UpCloud) with live power controls, root password reveals from the encrypted vault, and instance teardown.
   - Interactive deployment wizard with dynamic region/plan inventory and SSH key injection.
   - Floating IP & Reserved IP management: allocation, attachment to instances, reverse DNS PTR records, and copyable guest OS network configuration commands. UpCloud address actions use server-aware controls and explicit release policy.
   - SSH Key Vault: in-browser Ed25519 keypair generation and public key storage; UpCloud uses selected local vault keys during deployment because it has no account-level SSH-key API.
-  - Accounts opens with connected provider logos and account/server counts; choose a provider to list its accounts, then use All providers to return. Edit account changes the display name or verifies and replaces the API token; leaving the token empty preserves it. More → Add/Edit note edits a plain memo with password autofill suppressed. Proxy pool routing and Cloudflare DNS are also managed here.
-  - The dashboard loads the last known local snapshot; Refresh requests a live sync. A status strip shows whether data is syncing, current, stale, or needs attention; failed resource loads retain their last known values and expose a retry action.
+  - Accounts opens with connected provider logos and account/server counts; choose a provider to list its accounts, then use All providers to return. Edit account renames accounts or replaces API tokens; an empty token preserves it. Current API token → Show reveals it after confirmation, with Copy/Hide controls. More → Add/Edit note edits a plain memo with password autofill suppressed. Proxy pool routing and Cloudflare DNS are also managed here.
+  - The dashboard loads saved snapshots; Refresh requests a live sync. A status strip shows whether data is syncing, current, stale, or needs attention; failed resource loads retain their last known values and expose a retry action.
   - Read requests retry bounded network and transient server failures. Account errors distinguish invalid/expired API tokens, API access restrictions, provider errors, and explicit proxy failures. Only explicit proxy failures offer proxy reconfiguration or automatic session replacement; the console rechecks the route before replacement and verifies the account afterward. Action dialogs explain the effect and offer Yes/No without typing. Destructive actions never retry automatically.
   - Local access via loopback or SSH tunnel: `ssh -L 9601:127.0.0.1:9601 root@YOUR_CLOUDBOT_HOST`.
 * **Automation API & MCP**: JSON operations protected by bearer token for AI clients (Claude, Cursor, Antigravity) and custom tooling. See [AI_API_MCP.md](AI_API_MCP.md) for endpoints, confirmation guardrails, and MCP setup.
